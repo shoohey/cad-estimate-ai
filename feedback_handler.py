@@ -27,10 +27,8 @@ RESEND_ENDPOINT = "https://api.resend.com/emails"
 RESEND_FROM_ADDRESS = "onboarding@resend.dev"
 REQUEST_TIMEOUT_SEC = 10
 
-# Slack Bot Token (claude-dashboard と共通)。環境変数 SLACK_BOT_TOKEN で上書き可能。
+# Slack Bot Token は環境変数または Streamlit secrets から読み込む（ハードコード禁止）。
 SLACK_API_ENDPOINT = "https://slack.com/api/chat.postMessage"
-DEFAULT_SLACK_BOT_TOKEN = "xoxb-1286538197520-10471471607442-C24ersEXnoYxggCwEnT7cST2"
-DEFAULT_SLACK_CHANNEL_ID = "C0ADE3GG4LF"
 
 
 # --- 内部ヘルパー -------------------------------------------------------
@@ -136,10 +134,24 @@ def _build_email_html(record: dict[str, Any]) -> str:
 """.strip()
 
 
+def _get_secret(key: str) -> str:
+    """環境変数 → Streamlit secrets の順で値を取得する。どちらにも無ければ空文字を返す。"""
+    val = os.environ.get(key)
+    if val:
+        return val
+    try:
+        import streamlit as st  # type: ignore
+
+        # st.secrets はファイル未配置時に StreamlitSecretNotFoundError を投げる
+        return str(st.secrets.get(key, "")) if hasattr(st, "secrets") else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _send_slack(record: dict[str, Any], errors: list[str]) -> bool:
     """Slack chat.postMessage API で通知を送信する。成功すると True を返す。"""
-    token = os.environ.get("SLACK_BOT_TOKEN") or DEFAULT_SLACK_BOT_TOKEN
-    channel = os.environ.get("SLACK_CHANNEL_ID") or DEFAULT_SLACK_CHANNEL_ID
+    token = _get_secret("SLACK_BOT_TOKEN")
+    channel = _get_secret("SLACK_CHANNEL_ID")
     if not token or not channel:
         return False
     try:
@@ -171,8 +183,8 @@ def _send_slack(record: dict[str, Any], errors: list[str]) -> bool:
 
 def _send_email(record: dict[str, Any], errors: list[str]) -> bool:
     """Resend API 経由でフィードバックメールを送信する。"""
-    api_key = os.environ.get("RESEND_API_KEY")
-    to_email = os.environ.get("FEEDBACK_TO_EMAIL")
+    api_key = _get_secret("RESEND_API_KEY")
+    to_email = _get_secret("FEEDBACK_TO_EMAIL")
     if not api_key or not to_email:
         return False
     try:
