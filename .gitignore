@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
 .env
+.env.local
 *.bak
 .DS_Store
+feedbacks.json

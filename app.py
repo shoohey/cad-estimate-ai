@@ -15,6 +15,7 @@ from openpyxl.utils import get_column_letter
 from cad_parser import load_cad_from_bytes, load_cad_file, CADData
 from estimate_calculator import calculate_estimate, load_unit_prices, Estimate, EstimateItem
 from andpad_converter import convert_to_andpad, ANDPADBudget
+from feedback_handler import submit_feedback as send_feedback_to_company
 
 # ページ設定
 st.set_page_config(
@@ -932,6 +933,10 @@ def apply_modifications(estimate: Estimate, mods: dict) -> Estimate:
                 item.quantity = ov['quantity']
                 item.estimate_price = ov['estimate_price']
                 item.order_price = ov['order_price']
+                if 'name' in ov:
+                    item.name = ov['name']
+                if 'summary' in ov:
+                    item.summary = ov['summary']
                 item.estimate_amount = int(item.quantity * item.estimate_price)
                 item.order_amount = int(item.quantity * item.order_price)
             items_to_keep.append(item)
@@ -1943,12 +1948,14 @@ def main():
 
                 edited = st.data_editor(
                     df_edit,
-                    disabled=['名称', '摘要', '単位'],
+                    disabled=['単位'],
                     use_container_width=True,
                     hide_index=True,
                     key=f"editor_{base_cat.no}",
                     column_config={
                         '削除': st.column_config.CheckboxColumn("削除", default=False),
+                        '名称': st.column_config.TextColumn("名称", help="項目名を直接編集できます"),
+                        '摘要': st.column_config.TextColumn("摘要", help="摘要を直接編集できます"),
                         '数量': st.column_config.NumberColumn("数量", format="%.2f", min_value=0.0),
                         '見積単価': st.column_config.NumberColumn("見積単価", min_value=0),
                         '発注単価': st.column_config.NumberColumn("発注単価", min_value=0),
@@ -1967,16 +1974,22 @@ def main():
                                 mods['overrides'].pop(key, None)
                             else:
                                 mods['deleted'].discard(key)
+                                new_name = str(row['名称'])
+                                new_summary = str(row['摘要']) if row['摘要'] is not None else ''
                                 changed = (
                                     abs(float(row['数量']) - item.quantity) > 0.001
                                     or int(row['見積単価']) != item.estimate_price
                                     or int(row['発注単価']) != item.order_price
+                                    or new_name != item.name
+                                    or new_summary != (item.summary or '')
                                 )
                                 if changed:
                                     mods['overrides'][key] = {
                                         'quantity': float(row['数量']),
                                         'estimate_price': int(row['見積単価']),
                                         'order_price': int(row['発注単価']),
+                                        'name': new_name,
+                                        'summary': new_summary,
                                     }
                                 else:
                                     mods['overrides'].pop(key, None)
@@ -2495,22 +2508,57 @@ def main():
                 placeholder="例: 山田",
             )
 
-            submitted = st.form_submit_button("フィードバックを送信")
+            fb_email = st.text_input(
+                "メールアドレス（任意）",
+                placeholder="返信が必要な場合のみご入力ください",
+            )
+
+            submitted = st.form_submit_button("フィードバックを送信", type="primary")
             if submitted and fb_body:
                 if not current_pid:
                     st.error("案件が選択されていません。先にCADデータをアップロードしてください。")
                 else:
+                    property_name_for_fb = cad_data.property_name if cad_data else ''
                     feedbacks.append({
                         'category': fb_category,
                         'target': fb_target,
                         'body': fb_body,
                         'priority': fb_priority,
                         'name': fb_name,
+                        'email': fb_email,
                         'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M'),
-                        'property': cad_data.property_name if cad_data else '',
+                        'property': property_name_for_fb,
                         'status': '未対応',
                     })
                     save_project_feedbacks(current_pid, feedbacks)
+
+                    # 弊社のSlackチャンネルへ即時通知（メール併設定時はメールも）
+                    with st.spinner("フィードバックを弊社に送信しています..."):
+                        send_result = send_feedback_to_company(
+                            name=fb_name or "(匿名)",
+                            email=fb_email or "",
+                            category=fb_category,
+                            message=fb_body,
+                            property_name=property_name_for_fb,
+                            priority=fb_priority,
+                            target=fb_target,
+                        )
+
+                    if send_result.get("success"):
+                        channels = "・".join(
+                            {"slack": "Slack", "email": "メール", "local_json": "ローカル"}.get(c, c)
+                            for c in send_result.get("channels_sent", [])
+                        )
+                        st.success(
+                            f"フィードバックを送信しました（通知先: {channels}）。"
+                            f" 受付ID: `{send_result['feedback_id'][:8]}` 担当者が確認後、必要に応じてご連絡いたします。"
+                        )
+                        st.balloons()
+                    else:
+                        errs = "; ".join(send_result.get("errors", [])) or "不明なエラー"
+                        st.warning(
+                            f"案件フォルダへの保存は完了しましたが、弊社への通知に一部失敗しました: {errs}"
+                        )
                     st.rerun()
 
         # 仕組みの説明
