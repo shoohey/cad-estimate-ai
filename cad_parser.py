@@ -2,7 +2,13 @@
 import codecs
 import re
 import io
+import unicodedata
 from dataclasses import dataclass, field
+
+
+def _norm(s: str) -> str:
+    """全角英数字・半角カナを正規化する（ＬＤＫ→LDK、ｱﾙﾐ→アルミ等）"""
+    return unicodedata.normalize('NFKC', s).strip()
 
 
 @dataclass
@@ -146,11 +152,23 @@ NON_LIVING_ROOMS = ["玄関", "ホール", "廊下", "階段室", "階段", "便
                      "浴室", "脱衣室", "脱衣", "洗面所", "洗面", "収納", "押入",
                      "クローゼット", "WIC", "車庫", "インナーガレージ", "ガレージ",
                      "小屋裏", "ロフト", "納戸", "ユーティリティ", "パントリー",
-                     "SIC", "シューズクローク"]
+                     "SIC", "シューズクローク", "物入", "ヌック", "UB"]
 WATER_ROOMS = ["便所", "トイレ", "浴室", "脱衣室", "脱衣", "洗面所", "洗面",
-               "ユーティリティ"]
+               "ユーティリティ", "UB", "ユニットバス"]
 ENTRANCE_ROOMS = ["玄関", "ポーチ"]
 BALCONY_ROOMS = ["バルコニー", "ベランダ", "テラス"]
+# 浴室（ユニットバス）判定
+BATH_ROOMS = ["浴室", "UB", "ユニットバス", "バス"]
+# 土間床の部屋（床組無し・土間断熱の対象）
+DOMA_ROOMS = ["玄関", "SIC", "シューズクローク", "土間", "インナーガレージ",
+              "ガレージ", "車庫"]
+# 床上げ・畳敷きスペース（ヌック・畳コーナー等）
+NOOK_ROOMS = ["ヌック", "畳コーナー", "タタミコーナー", "小上がり"]
+# 収納系の部屋（枕棚・クロス収納追加の対象）
+STORAGE_ROOMS = ["クローゼット", "WIC", "収納", "押入", "シューズクローク",
+                 "SIC", "納戸", "物入"]
+# 水廻り床（クッションフロア系）の対象部屋 ※浴室(UB)は含まない
+MIZUMAWARI_FLOOR_ROOMS = ["洗面", "脱衣", "便所", "トイレ"]
 
 
 def parse_cad_data(content: str) -> CADData:
@@ -164,12 +182,12 @@ def parse_cad_data(content: str) -> CADData:
     # ヘッダー行のパース
     header = parse_csv_line(lines[0])
     if len(header) >= 6:
-        data.property_number = header[0]
-        data.property_name = header[1]
-        data.drawing_name = header[2]
-        data.designer = header[3]
-        data.date = header[4]
-        data.structure = header[5]
+        data.property_number = _norm(header[0])
+        data.property_name = _norm(header[1])
+        data.drawing_name = _norm(header[2])
+        data.designer = _norm(header[3])
+        data.date = _norm(header[4])
+        data.structure = _norm(header[5])
 
     current_section = None
     current_room = None
@@ -203,15 +221,18 @@ def parse_cad_data(content: str) -> CADData:
             i += 1
             continue
 
+        # ヘッダー行判定用（カンマを含まない行のみ、囲みクォートを除去）
+        line_unquoted = line.strip('"') if ',' not in line else line
+
         if current_section == "rooms":
             # 部屋ヘッダーの判定
-            room_match = re.match(r'^"?(\d+階|R階|PH階)-<(.+?)>"?$', line)
+            room_match = re.match(r'^(\d+階|R階|PH階)-<(.+?)>$', line_unquoted)
             if room_match:
                 if current_room:
                     data.rooms.append(current_room)
                 current_room = RoomData(
-                    floor=room_match.group(1),
-                    name=room_match.group(2),
+                    floor=_norm(room_match.group(1)),
+                    name=_norm(room_match.group(2)),
                 )
                 i += 1
                 continue
@@ -228,16 +249,19 @@ def parse_cad_data(content: str) -> CADData:
                         pass
 
         elif current_section == "fittings":
-            # 建具ヘッダーの判定
-            fitting_match = re.match(r'^"?(.+?)/(.+?)/(.+?)-(.+)"?$', line)
+            # 建具ヘッダーの判定（カンマを含まない行のみ）
+            fitting_match = None
+            if ',' not in line:
+                fitting_match = re.match(r'^(.+?)/(.+?)/(.+?)-(.+)$', line_unquoted)
             if fitting_match:
                 if current_fitting:
                     data.fittings.append(current_fitting)
+                tail = _norm(fitting_match.group(4))
                 current_fitting = FittingData(
-                    category=f"{fitting_match.group(1)}/{fitting_match.group(2)}",
-                    type_name=fitting_match.group(4).split('-')[0] if '-' in fitting_match.group(4) else fitting_match.group(4),
-                    material=fitting_match.group(3),
-                    code=fitting_match.group(4),
+                    category=_norm(f"{fitting_match.group(1)}/{fitting_match.group(2)}"),
+                    type_name=tail.split('-')[0] if '-' in tail else tail,
+                    material=_norm(fitting_match.group(3)),
+                    code=tail,
                 )
                 i += 1
                 continue

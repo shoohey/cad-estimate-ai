@@ -1345,6 +1345,9 @@ def persist_project_mods():
     est_no = get_project_state('estimate_no')
     if est_no:
         data['estimate_no'] = est_no
+    inc_adj = get_project_state('include_adjustment')
+    if inc_adj is not None:
+        data['include_adjustment'] = inc_adj
     save_project_data(proj_id, data)
 
 
@@ -1366,6 +1369,8 @@ def restore_project_to_session(proj_id: str):
         st.session_state[f"proj_{proj_id}_location"] = data['location']
     if 'estimate_no' in data:
         st.session_state[f"proj_{proj_id}_estimate_no"] = data['estimate_no']
+    if 'include_adjustment' in data:
+        st.session_state[f"proj_{proj_id}_include_adjustment"] = data['include_adjustment']
     # CADデータ復元
     cad = load_cad_for_project(proj_id)
     if cad:
@@ -1570,8 +1575,12 @@ def main():
 
         st.divider()
         st.markdown("##### オプション")
-        include_adjustment = st.checkbox("調整分（●33）を含める", value=False,
-                                          help="見積全体の調整が必要な場合にチェック")
+        include_adjustment = st.checkbox(
+            "調整分（●33）を含める",
+            value=get_project_state('include_adjustment', True),
+            help="見積調整項目（建材・下地材/大工手間 各475,000円、発注0円）。実績見積では標準的に計上されます。")
+        if st.session_state['current_project']:
+            set_project_state('include_adjustment', include_adjustment)
 
         # 案件保存ボタン
         if st.session_state['current_project']:
@@ -1628,7 +1637,16 @@ def main():
 
     if uploaded_file is not None:
         file_bytes = uploaded_file.read()
-        cad_data = load_cad_from_bytes(file_bytes)
+        try:
+            cad_data = load_cad_from_bytes(file_bytes)
+        except Exception:
+            st.error("ファイルの読み込みに失敗しました。ARCHITREND ZEROから出力された数量データTXTファイルかご確認ください。")
+            st.stop()
+        if not cad_data.rooms:
+            st.error(
+                "部屋データが見つかりませんでした。アップロードされたファイルが【数量データ】のTXTファイルかご確認ください。"
+                "（【積算データ】や他の形式のファイルは読み込めません）")
+            st.stop()
         # ファイル名ベースのプロジェクトID（安全な文字列に変換）
         safe_name = uploaded_file.name.replace(' ', '_').replace('/', '_').replace('\\', '_')
         proj_id = f"upload_{safe_name}"
@@ -1676,6 +1694,7 @@ def main():
         owner_name=owner_name,
         location=location,
         estimate_no=estimate_no,
+        include_adjustment=include_adjustment,
     )
 
     # 修正の初期化と適用
