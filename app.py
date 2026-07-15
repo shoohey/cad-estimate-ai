@@ -14,7 +14,8 @@ from openpyxl.utils import get_column_letter
 
 from cad_parser import load_cad_from_bytes, load_cad_file, CADData
 from estimate_calculator import calculate_estimate, load_unit_prices, Estimate, EstimateItem
-from andpad_converter import convert_to_andpad, ANDPADBudget
+from andpad_converter import (convert_to_andpad, ANDPADBudget,
+                              ANDPADAllocation, vendor_sort_key)
 from feedback_handler import submit_feedback as send_feedback_to_company
 
 # ページ設定
@@ -785,22 +786,27 @@ def create_andpad_excel(budget: ANDPADBudget) -> bytes:
 
     row_num = 2
     for item in budget.items:
-        ws.cell(row=row_num, column=1, value=item.work_category)
-        ws.cell(row=row_num, column=2, value=item.vendor)
-        ws.cell(row=row_num, column=3, value=item.item_name)
-        ws.cell(row=row_num, column=4, value=item.summary)
-        ws.cell(row=row_num, column=5, value=item.quantity)
-        ws.cell(row=row_num, column=5).number_format = '#,##0.00'
-        ws.cell(row=row_num, column=6, value=item.unit)
-        ws.cell(row=row_num, column=7, value=item.material_cost)
-        ws.cell(row=row_num, column=7).number_format = '#,##0'
-        ws.cell(row=row_num, column=8, value=item.labor_cost)
-        ws.cell(row=row_num, column=8).number_format = '#,##0'
-        ws.cell(row=row_num, column=9, value=item.total_cost)
-        ws.cell(row=row_num, column=9).number_format = '#,##0'
-        for col in range(1, 10):
-            ws.cell(row=row_num, column=col).border = thin_border
-        row_num += 1
+        multi = len(item.allocations) > 1
+        for alloc in item.allocations:
+            summary = item.summary
+            if multi and alloc.note:
+                summary = f"{summary}　※{alloc.note}" if summary else f"※{alloc.note}"
+            ws.cell(row=row_num, column=1, value=item.work_category)
+            ws.cell(row=row_num, column=2, value=alloc.vendor)
+            ws.cell(row=row_num, column=3, value=item.item_name)
+            ws.cell(row=row_num, column=4, value=summary)
+            ws.cell(row=row_num, column=5, value=item.quantity)
+            ws.cell(row=row_num, column=5).number_format = '#,##0.00'
+            ws.cell(row=row_num, column=6, value=item.unit)
+            ws.cell(row=row_num, column=7, value=alloc.amount if alloc.kind == '材' else 0)
+            ws.cell(row=row_num, column=7).number_format = '#,##0'
+            ws.cell(row=row_num, column=8, value=alloc.amount if alloc.kind == '工' else 0)
+            ws.cell(row=row_num, column=8).number_format = '#,##0'
+            ws.cell(row=row_num, column=9, value=alloc.amount)
+            ws.cell(row=row_num, column=9).number_format = '#,##0'
+            for col in range(1, 10):
+                ws.cell(row=row_num, column=col).border = thin_border
+            row_num += 1
 
     # 合計
     row_num += 1
@@ -831,7 +837,7 @@ def create_andpad_excel(budget: ANDPADBudget) -> bytes:
 
     by_vendor = budget.by_vendor()
     row_num = 2
-    for vendor, data in sorted(by_vendor.items()):
+    for vendor, data in by_vendor.items():
         ws2.cell(row=row_num, column=1, value=vendor)
         ws2.cell(row=row_num, column=2, value=data['material'])
         ws2.cell(row=row_num, column=2).number_format = '#,##0'
@@ -882,35 +888,60 @@ def create_detail_csv(estimate: Estimate) -> bytes:
 
 
 def create_vendor_csv(budget: ANDPADBudget) -> bytes:
-    """発注先別集計CSVを生成"""
+    """発注先別集計CSVを生成（明細付き・予実管理表の並び順）"""
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(['発注先（細目工種）', '材料費', '施工費', '合計', '明細数'])
     by_vendor = budget.by_vendor()
-    for vendor, data in sorted(by_vendor.items(), key=lambda x: -x[1]['total']):
-        writer.writerow([vendor, data['material'], data['labor'], data['total'], len(data['items'])])
-    writer.writerow(['合計', budget.total_material, budget.total_labor, budget.grand_total, len(budget.items)])
+    for vendor, data in by_vendor.items():
+        writer.writerow([vendor, data['material'], data['labor'], data['total'],
+                         len(data['details'])])
+    writer.writerow(['合計', budget.total_material, budget.total_labor,
+                     budget.grand_total, ''])
+    # 発注先別の明細（ANDPAD発注時のコピー＆ペースト用）
+    writer.writerow([])
+    writer.writerow(['【発注先別明細】'])
+    for vendor, data in by_vendor.items():
+        writer.writerow([])
+        writer.writerow([vendor, '', '', f"合計 {data['total']}", ''])
+        writer.writerow(['工事種別', '名称', '摘要', '数量', '単位', '材料費', '施工費', '金額'])
+        for item, alloc in data['details']:
+            summary = item.summary
+            if len(item.allocations) > 1 and alloc.note:
+                summary = f"{summary}　※{alloc.note}" if summary else f"※{alloc.note}"
+            writer.writerow([
+                item.work_category, item.item_name, summary,
+                f"{item.quantity:.2f}", item.unit,
+                alloc.amount if alloc.kind == '材' else 0,
+                alloc.amount if alloc.kind == '工' else 0,
+                alloc.amount,
+            ])
     return output.getvalue().encode('utf-8-sig')
 
 
 def create_andpad_csv(budget: ANDPADBudget) -> bytes:
-    """ANDPADインポート用CSVを生成"""
+    """ANDPADインポート用CSVを生成（材工分離後の配分単位で1行）"""
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(['工事種別', '細目工種（発注先）', '名称', '摘要',
                      '数量', '単位', '材料費', '施工費', '発注金額'])
     for item in budget.items:
-        writer.writerow([
-            item.work_category,
-            item.vendor,
-            item.item_name,
-            item.summary,
-            f"{item.quantity:.2f}",
-            item.unit,
-            item.material_cost,
-            item.labor_cost,
-            item.total_cost,
-        ])
+        multi = len(item.allocations) > 1
+        for alloc in item.allocations:
+            summary = item.summary
+            if multi and alloc.note:
+                summary = f"{summary}　※{alloc.note}" if summary else f"※{alloc.note}"
+            writer.writerow([
+                item.work_category,
+                alloc.vendor,
+                item.item_name,
+                summary,
+                f"{item.quantity:.2f}",
+                item.unit,
+                alloc.amount if alloc.kind == '材' else 0,
+                alloc.amount if alloc.kind == '工' else 0,
+                alloc.amount,
+            ])
     return output.getvalue().encode('utf-8-sig')
 
 
@@ -1721,15 +1752,44 @@ def main():
     if andpad_mods is None:
         andpad_mods = {}
         set_project_state('andpad_mods', andpad_mods)
-    for idx_str, amod in andpad_mods.items():
-        idx = int(idx_str)
-        if idx < len(andpad_budget.items):
-            item = andpad_budget.items[idx]
-            item.material_cost = amod['material_cost']
-            item.labor_cost = amod['labor_cost']
-            item.total_cost = amod['material_cost'] + amod['labor_cost']
-            if 'vendor' in amod and amod['vendor']:
-                item.vendor = amod['vendor']
+    andpad_items_by_key = {it.stable_key: it for it in andpad_budget.items}
+    for mod_key, amod in list(andpad_mods.items()):
+        item = None
+        if mod_key in andpad_items_by_key:
+            item = andpad_items_by_key[mod_key]
+            # 保存時と明細内容が変わっていたら適用しない（誤適用防止）
+            if amod.get('item_name') and amod['item_name'] != item.item_name:
+                continue
+            if 'base_total' in amod and amod['base_total'] != item.total_cost:
+                continue
+        elif mod_key.isdigit():
+            # 旧・位置インデックスキー（旧バージョンの保存データ）
+            idx = int(mod_key)
+            if idx < len(andpad_budget.items):
+                item = andpad_budget.items[idx]
+        if item is None:
+            continue
+
+        if 'allocs' in amod:
+            item.allocations = [
+                ANDPADAllocation(
+                    vendor=a['vendor'], kind=a['kind'],
+                    amount=int(a['amount']), note=a.get('note', ''),
+                )
+                for a in amod['allocs']
+            ]
+        else:
+            # 旧形式（material_cost/labor_cost/vendor）からの移行。
+            # 旧UIでは明細全体（材・工とも）が指定の発注先に集計されていた
+            vendor = amod.get('vendor') or item.vendor
+            new_allocs = []
+            if amod.get('material_cost', 0) != 0:
+                new_allocs.append(ANDPADAllocation(vendor, '材', int(amod['material_cost'])))
+            if amod.get('labor_cost', 0) != 0:
+                new_allocs.append(ANDPADAllocation(vendor, '工', int(amod['labor_cost'])))
+            if not new_allocs:
+                new_allocs.append(ANDPADAllocation(vendor, '材', 0))
+            item.allocations = new_allocs
 
     # タブ構成（案件一覧を先頭に追加）
     tab_proj, tab1, tab_mod, tab2, tab3, tab4, tab_fb = st.tabs([
@@ -2205,28 +2265,49 @@ def main():
 
         if view_mode == "発注先別集計":
             by_vendor = andpad_budget.by_vendor()
-            vendor_summary = []
-            for vendor, data in sorted(by_vendor.items(),
-                                        key=lambda x: -x[1]['total']):
-                vendor_summary.append({
-                    "発注先（細目工種）": vendor,
-                    "材料費": data['material'],
-                    "施工費": data['labor'],
-                    "合計": data['total'],
-                    "明細数": len(data['items']),
-                })
 
-            df_vendor = pd.DataFrame(vendor_summary)
-            st.dataframe(
-                df_vendor.style.format({
-                    "材料費": "¥{:,.0f}",
-                    "施工費": "¥{:,.0f}",
-                    "合計": "¥{:,.0f}",
-                }),
-                use_container_width=True,
-                hide_index=True,
-                height=600,
+            st.markdown(
+                '<div class="warning-box">発注先をクリックすると明細が開閉します。'
+                'ANDPADでの発注時は、明細を開いてコピー＆ペーストしてください。'
+                '並び順は予実管理表（積算原価⇒工務予算振り分け方法）に合わせています。</div>',
+                unsafe_allow_html=True,
             )
+            st.markdown("")
+
+            for vendor, data in by_vendor.items():
+                exp_label = (
+                    f"{vendor}　—　材料: ¥{data['material']:,} / "
+                    f"施工: ¥{data['labor']:,} / 合計: ¥{data['total']:,}"
+                    f"（{len(data['details'])}件）"
+                )
+                with st.expander(exp_label, expanded=False):
+                    detail_rows = []
+                    for item, alloc in data['details']:
+                        summary = item.summary
+                        if len(item.allocations) > 1 and alloc.note:
+                            summary = (f"{summary}　※{alloc.note}"
+                                       if summary else f"※{alloc.note}")
+                        detail_rows.append({
+                            "工事種別": item.work_category,
+                            "名称": item.item_name,
+                            "摘要": summary,
+                            "数量": item.quantity,
+                            "単位": item.unit,
+                            "材料費": alloc.amount if alloc.kind == '材' else 0,
+                            "施工費": alloc.amount if alloc.kind == '工' else 0,
+                            "金額": alloc.amount,
+                        })
+                    df_detail = pd.DataFrame(detail_rows)
+                    st.dataframe(
+                        df_detail.style.format({
+                            "数量": "{:,.2f}",
+                            "材料費": "¥{:,.0f}",
+                            "施工費": "¥{:,.0f}",
+                            "金額": "¥{:,.0f}",
+                        }),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
         elif view_mode == "工事種別別集計":
             by_cat = andpad_budget.by_work_category()
@@ -2255,13 +2336,15 @@ def main():
 
         else:  # 明細一覧（編集可）
             st.markdown(
-                '<div class="warning-box">材料費・施工費・発注先を編集できます。変更後「変更を適用」ボタンを押してください。発注金額（材料費＋施工費）は自動計算されます。</div>',
+                '<div class="warning-box">材工分離した明細は発注先ごとに1行ずつ表示されます'
+                '（例: 材料費→建材、施工費→大工手間）。発注先・材料費・施工費を編集し、'
+                '「変更を適用」ボタンを押してください。'
+                '施工費の行の発注先を変えると、その発注先の集計に加算されます。</div>',
                 unsafe_allow_html=True,
             )
             st.markdown("")
 
             # 工事種別でグルーピングして表示
-            current_cat = None
             cat_items = {}  # cat_name -> [(global_idx, item)]
             for g_idx, item in enumerate(andpad_budget.items):
                 cat_name = item.work_category
@@ -2273,7 +2356,8 @@ def main():
                 cat_material = sum(it.material_cost for _, it in items_list)
                 cat_labor = sum(it.labor_cost for _, it in items_list)
                 cat_total = sum(it.total_cost for _, it in items_list)
-                mod_count = sum(1 for g_idx, _ in items_list if str(g_idx) in andpad_mods)
+                mod_count = sum(1 for g_idx, it in items_list
+                                if it.stable_key in andpad_mods or str(g_idx) in andpad_mods)
                 mod_badge = f"  [{mod_count}件修正中]" if mod_count > 0 else ""
 
                 exp_label = (
@@ -2283,18 +2367,26 @@ def main():
                 )
 
                 with st.expander(exp_label, expanded=False):
+                    # 配分（材工分離後）単位で1行ずつ
                     edit_rows = []
+                    row_keys = []  # (g_idx, alloc_idx, kind, note)
                     for g_idx, item in items_list:
-                        amod = andpad_mods.get(str(g_idx), {})
-                        edit_rows.append({
-                            '発注先': amod.get('vendor', item.vendor),
-                            '名称': item.item_name,
-                            '摘要': item.summary,
-                            '数量': item.quantity,
-                            '単位': item.unit,
-                            '材料費': amod.get('material_cost', item.material_cost),
-                            '施工費': amod.get('labor_cost', item.labor_cost),
-                        })
+                        multi = len(item.allocations) > 1
+                        for a_idx, alloc in enumerate(item.allocations):
+                            summary = item.summary
+                            if multi and alloc.note:
+                                summary = (f"{summary}　※{alloc.note}"
+                                           if summary else f"※{alloc.note}")
+                            edit_rows.append({
+                                '発注先': alloc.vendor,
+                                '名称': item.item_name,
+                                '摘要': summary,
+                                '数量': item.quantity,
+                                '単位': item.unit,
+                                '材料費': alloc.amount if alloc.kind == '材' else 0,
+                                '施工費': alloc.amount if alloc.kind == '工' else 0,
+                            })
+                            row_keys.append((g_idx, a_idx, alloc.kind, alloc.note))
 
                     df_edit = pd.DataFrame(edit_rows)
                     edited = st.data_editor(
@@ -2317,29 +2409,73 @@ def main():
                     a_col1, a_col2 = st.columns([1, 1])
                     with a_col1:
                         if st.button("変更を適用", key=f"andpad_apply_{cat_name}", type="primary"):
-                            # 元のANDPADデータ（修正前）を取得
+                            # 編集結果から明細ごとの配分リストを再構築
+                            new_allocs_by_item = {}  # g_idx -> [alloc dict]
+                            for row_i, (g_idx, a_idx, kind, note) in enumerate(row_keys):
+                                raw_vendor = edited.iloc[row_i]['発注先']
+                                raw_mat = edited.iloc[row_i]['材料費']
+                                raw_lab = edited.iloc[row_i]['施工費']
+                                vendor = ('' if pd.isna(raw_vendor)
+                                          else str(raw_vendor).strip())
+                                if not vendor:
+                                    vendor = andpad_budget.items[g_idx].vendor
+                                mat = 0 if pd.isna(raw_mat) else int(raw_mat)
+                                lab = 0 if pd.isna(raw_lab) else int(raw_lab)
+                                allocs = new_allocs_by_item.setdefault(g_idx, [])
+                                if mat != 0:
+                                    allocs.append({'vendor': vendor, 'kind': '材',
+                                                   'amount': mat,
+                                                   'note': note if kind == '材' else ''})
+                                if lab != 0:
+                                    allocs.append({'vendor': vendor, 'kind': '工',
+                                                   'amount': lab,
+                                                   'note': note if kind == '工' else ''})
+
+                            # 元のANDPADデータ（修正前）と比較して差分のみ保存
                             orig_budget = convert_to_andpad(estimate)
-                            for row_i, (g_idx, _) in enumerate(items_list):
-                                new_vendor = str(edited.iloc[row_i]['発注先'])
-                                new_mat = int(edited.iloc[row_i]['材料費'])
-                                new_lab = int(edited.iloc[row_i]['施工費'])
-                                orig_item = orig_budget.items[g_idx]
-                                if (new_mat != orig_item.material_cost or
-                                        new_lab != orig_item.labor_cost or
-                                        new_vendor != orig_item.vendor):
-                                    andpad_mods[str(g_idx)] = {
-                                        'material_cost': new_mat,
-                                        'labor_cost': new_lab,
-                                        'vendor': new_vendor,
+                            orig_by_key = {it.stable_key: it
+                                           for it in orig_budget.items}
+                            for g_idx, cur_item in items_list:
+                                mod_key = cur_item.stable_key
+                                orig_item = orig_by_key.get(mod_key)
+                                if orig_item is None:
+                                    continue
+                                new_allocs = new_allocs_by_item.get(g_idx, [])
+                                if not new_allocs:
+                                    # 全て0にされた場合も明細は残す（金額0・元の区分を維持）
+                                    base = (orig_item.allocations[0]
+                                            if orig_item.allocations else None)
+                                    new_allocs = [{
+                                        'vendor': base.vendor if base else orig_item.vendor,
+                                        'kind': base.kind if base else '材',
+                                        'amount': 0, 'note': '',
+                                    }]
+                                # 金額0の配分は比較から除外（幽霊修正の防止）
+                                orig_sig = sorted((a.vendor, a.kind, a.amount)
+                                                  for a in orig_item.allocations
+                                                  if a.amount != 0)
+                                new_sig = sorted((a['vendor'], a['kind'], a['amount'])
+                                                 for a in new_allocs
+                                                 if a['amount'] != 0)
+                                if new_sig != orig_sig:
+                                    andpad_mods[mod_key] = {
+                                        'allocs': new_allocs,
+                                        'item_name': orig_item.item_name,
+                                        'base_total': orig_item.total_cost,
                                     }
-                                elif str(g_idx) in andpad_mods:
-                                    del andpad_mods[str(g_idx)]
+                                else:
+                                    andpad_mods.pop(mod_key, None)
+                                # 旧・位置インデックスキーの残骸は掃除
+                                andpad_mods.pop(str(g_idx), None)
                             st.rerun()
                     with a_col2:
                         if st.button("この工事のリセット", key=f"andpad_reset_{cat_name}", type="secondary"):
-                            for g_idx, _ in items_list:
-                                if str(g_idx) in andpad_mods:
-                                    del andpad_mods[str(g_idx)]
+                            for g_idx, cur_item in items_list:
+                                andpad_mods.pop(cur_item.stable_key, None)
+                                andpad_mods.pop(str(g_idx), None)
+                            key = f"andpad_editor_{cat_name}"
+                            if key in st.session_state:
+                                del st.session_state[key]
                             st.rerun()
 
         # 材工比率サマリ
