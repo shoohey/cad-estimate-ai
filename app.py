@@ -7,6 +7,8 @@ import csv
 import math
 import copy
 import json
+import base64
+import hashlib
 from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill, numbers
@@ -17,6 +19,7 @@ from estimate_calculator import calculate_estimate, load_unit_prices, Estimate, 
 from andpad_converter import (convert_to_andpad, ANDPADBudget,
                               ANDPADAllocation, vendor_sort_key)
 from feedback_handler import submit_feedback as send_feedback_to_company
+import cloud_store
 
 # ページ設定
 st.set_page_config(
@@ -1208,8 +1211,25 @@ PROJECTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "project
 os.makedirs(PROJECTS_DIR, exist_ok=True)
 
 
-def load_project_list() -> dict:
-    """保存済み案件一覧を読み込む"""
+def _warn_cloud_error(exc: Exception):
+    """クラウド接続エラー時: 以降このセッションはローカルのみで動作させ、バナーで通知する。
+
+    サーキットブレーカー: 一度エラーを検知したら _cloud_ok() が False になり、
+    以降のクラウド読み書きを全てスキップする（タイムアウトの連鎖でUIが
+    ブロックするのを防ぎ、古いローカルindexでクラウドを上書きする事故も防ぐ）。
+    バナーは main() 冒頭で毎rerun表示される。
+    """
+    st.session_state['_cloud_degraded'] = True
+    st.session_state['_cloud_error_msg'] = str(exc)
+    st.warning(f"クラウド保存に接続できませんでした。変更はアプリ再起動時に失われる可能性があります。({exc})")
+
+
+def _cloud_ok() -> bool:
+    """クラウド永続化が使用可能か（構成済み かつ このセッションで障害未検知）"""
+    return cloud_store.enabled() and not st.session_state.get('_cloud_degraded')
+
+
+def _load_project_list_local() -> dict:
     index_path = os.path.join(PROJECTS_DIR, "index.json")
     if os.path.exists(index_path):
         with open(index_path, 'r', encoding='utf-8') as f:
@@ -1217,11 +1237,55 @@ def load_project_list() -> dict:
     return {}
 
 
+def _seed_cloud_from_local(local_index: dict):
+    """クラウド初回起動時、リポジトリ同梱のローカルデータを初期投入する"""
+    try:
+        for pid in local_index:
+            dpath = os.path.join(PROJECTS_DIR, f"{pid}_data.json")
+            if os.path.exists(dpath):
+                with open(dpath, 'r', encoding='utf-8') as f:
+                    cloud_store.put(f"proj:{pid}:data", json.load(f))
+            cpath = os.path.join(PROJECTS_DIR, f"{pid}.txt")
+            if os.path.exists(cpath):
+                with open(cpath, 'rb') as f:
+                    cloud_store.put(f"proj:{pid}:cad",
+                                    {"b64": base64.b64encode(f.read()).decode('ascii')})
+            fpath = os.path.join(PROJECTS_DIR, f"{pid}_feedbacks.json")
+            if os.path.exists(fpath):
+                with open(fpath, 'r', encoding='utf-8') as f:
+                    cloud_store.put(f"proj:{pid}:feedbacks", json.load(f))
+        # indexは最後に書く（途中で失敗した場合は次回起動時に再シードされる）
+        cloud_store.put("index", local_index)
+    except cloud_store.CloudStoreError as exc:
+        _warn_cloud_error(exc)
+
+
+def load_project_list() -> dict:
+    """保存済み案件一覧を読み込む（クラウド優先・ローカルフォールバック）"""
+    local = _load_project_list_local()
+    if _cloud_ok():
+        try:
+            cloud = cloud_store.get("index")
+            if cloud is None:
+                _seed_cloud_from_local(local)
+                return local
+            # jsonbはキー順を保持しないため、作成日時順（従来の登録順）に並べ直す
+            return dict(sorted(cloud.items(), key=lambda kv: (kv[1] or {}).get('created', '')))
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
+    return local
+
+
 def save_project_list(projects: dict):
-    """案件一覧をファイルに保存"""
+    """案件一覧を保存（ローカル＋クラウド）"""
     index_path = os.path.join(PROJECTS_DIR, "index.json")
     with open(index_path, 'w', encoding='utf-8') as f:
         json.dump(projects, f, ensure_ascii=False, indent=2)
+    if _cloud_ok():
+        try:
+            cloud_store.put("index", projects)
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
 
 
 def _convert_sets(obj):
@@ -1236,15 +1300,35 @@ def _convert_sets(obj):
 
 
 def save_project_data(proj_id: str, data: dict):
-    """案件の修正データ等をファイルに保存"""
+    """案件の修正データ等を保存（ローカル＋クラウド）"""
     path = os.path.join(PROJECTS_DIR, f"{proj_id}_data.json")
     save_data = _convert_sets(data)
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(save_data, f, ensure_ascii=False, indent=2)
+    if _cloud_ok():
+        # 毎rerunの自動保存で内容が変わっていない時はクラウド送信をスキップする
+        digest = hashlib.sha1(
+            json.dumps(save_data, ensure_ascii=False, sort_keys=True).encode('utf-8')
+        ).hexdigest()
+        cache_key = f'_cloud_saved_{proj_id}'
+        if st.session_state.get(cache_key) == digest:
+            return
+        try:
+            cloud_store.put(f"proj:{proj_id}:data", save_data)
+            st.session_state[cache_key] = digest
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
 
 
 def load_project_data(proj_id: str) -> dict:
-    """案件の修正データ等をファイルから読み込む"""
+    """案件の修正データ等を読み込む（クラウド優先・ローカルフォールバック）"""
+    if _cloud_ok():
+        try:
+            val = cloud_store.get(f"proj:{proj_id}:data")
+            if val is not None:
+                return _restore_sets(val)
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
     path = os.path.join(PROJECTS_DIR, f"{proj_id}_data.json")
     if os.path.exists(path):
         with open(path, 'r', encoding='utf-8') as f:
@@ -1265,37 +1349,69 @@ def _restore_sets(obj):
 
 
 def save_cad_file(proj_id: str, file_bytes: bytes):
-    """CADファイルをプロジェクトフォルダに保存"""
+    """CADファイルを保存（ローカル＋クラウド）"""
     path = os.path.join(PROJECTS_DIR, f"{proj_id}.txt")
     with open(path, 'wb') as f:
         f.write(file_bytes)
+    if _cloud_ok():
+        try:
+            cloud_store.put(f"proj:{proj_id}:cad",
+                            {"b64": base64.b64encode(file_bytes).decode('ascii')})
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
 
 
 def load_project_feedbacks(proj_id: str) -> list:
-    """案件ごとのフィードバックを読み込む"""
-    path = os.path.join(PROJECTS_DIR, f"{proj_id}_feedbacks.json")
-    if os.path.exists(path):
-        with open(path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return []
+    """案件ごとのフィードバックを読み込む（クラウド優先・ローカルフォールバック）
+
+    フィードバックタブは毎rerunで読み直すため、セッション内キャッシュで
+    クラウドへのGET連発を抑える（保存・削除時にキャッシュを更新）。
+    """
+    cache = st.session_state.setdefault('_fb_cache', {})
+    if proj_id in cache:
+        return cache[proj_id]
+    result = None
+    if _cloud_ok():
+        try:
+            val = cloud_store.get(f"proj:{proj_id}:feedbacks")
+            if val is not None:
+                result = val
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
+    if result is None:
+        path = os.path.join(PROJECTS_DIR, f"{proj_id}_feedbacks.json")
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                result = json.load(f)
+        else:
+            result = []
+    cache[proj_id] = result
+    return result
 
 
 def save_project_feedbacks(proj_id: str, fbs: list):
-    """案件ごとのフィードバックを保存"""
+    """案件ごとのフィードバックを保存（ローカル＋クラウド）"""
     path = os.path.join(PROJECTS_DIR, f"{proj_id}_feedbacks.json")
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(fbs, f, ensure_ascii=False, indent=2)
+    st.session_state.setdefault('_fb_cache', {})[proj_id] = fbs
+    if _cloud_ok():
+        try:
+            cloud_store.put(f"proj:{proj_id}:feedbacks", fbs)
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
 
 
 def load_all_feedbacks(projects: dict) -> list:
     """全案件のフィードバックを読み込み、案件IDを付与して返す"""
     all_fbs = []
     for pid in projects:
-        fbs = load_project_feedbacks(pid)
-        for fb in fbs:
-            fb['_proj_id'] = pid
-            fb['_proj_name'] = projects[pid].get('name', pid)
-        all_fbs.extend(fbs)
+        for fb in load_project_feedbacks(pid):
+            # キャッシュ上のdictを汚さないようコピーに表示用キーを付与する
+            fb2 = dict(fb)
+            fb2['_proj_id'] = pid
+            fb2['_proj_name'] = projects[pid].get('name', pid)
+            all_fbs.append(fb2)
     all_fbs.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
     return all_fbs
 
@@ -1326,12 +1442,37 @@ def migrate_global_feedbacks(projects: dict, base_dir: str):
 
 
 def load_cad_for_project(proj_id: str):
-    """保存済みCADファイルを読み込む"""
+    """保存済みCADファイルを読み込む（クラウド優先・ローカルフォールバック）"""
+    if _cloud_ok():
+        try:
+            val = cloud_store.get(f"proj:{proj_id}:cad")
+            if val and val.get("b64"):
+                return load_cad_from_bytes(base64.b64decode(val["b64"]))
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
     path = os.path.join(PROJECTS_DIR, f"{proj_id}.txt")
     if os.path.exists(path):
         with open(path, 'rb') as f:
             return load_cad_from_bytes(f.read())
     return None
+
+
+def delete_project_storage(proj_id: str):
+    """案件のローカルファイルとクラウドデータを削除する"""
+    for suffix in (".txt", "_data.json", "_feedbacks.json"):
+        p = os.path.join(PROJECTS_DIR, f"{proj_id}{suffix}")
+        if os.path.exists(p):
+            os.remove(p)
+    st.session_state.get('_fb_cache', {}).pop(proj_id, None)
+    st.session_state.pop(f'_cloud_saved_{proj_id}', None)
+    if _cloud_ok():
+        try:
+            for key_suffix in ("data", "cad", "feedbacks"):
+                cloud_store.delete(f"proj:{proj_id}:{key_suffix}")
+        except cloud_store.CloudStoreError as exc:
+            # 障害検知時点でサーキットブレーカーが働くため以降の削除は中断。
+            # クラウド側に残ったデータは再起動後に復活し得る（バナーで通知済み）
+            _warn_cloud_error(exc)
 
 
 def get_project_state(key: str, default=None):
@@ -1474,10 +1615,8 @@ def _render_project_list_tab(projects: dict, restore_fn):
                     st.rerun()
         with col_c:
             if st.button("削除", key=f"projlist_del_{pid}", use_container_width=True, type="secondary"):
-                # CADファイル等も削除
-                import glob as glob_mod
-                for f in glob_mod.glob(os.path.join(PROJECTS_DIR, f"{pid}*")):
-                    os.remove(f)
+                # CADファイル等（ローカル＋クラウド）も削除
+                delete_project_storage(pid)
                 for k in list(st.session_state.keys()):
                     if k.startswith(f"proj_{pid}_"):
                         del st.session_state[k]
@@ -1508,6 +1647,14 @@ def main():
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
 
+    # クラウド接続障害時はセッション中ずっとバナーを表示する
+    if st.session_state.get('_cloud_degraded'):
+        st.warning(
+            "クラウド保存に接続できないため、一時的にローカル保存で動作しています。"
+            "この間の変更はアプリ再起動時に失われる可能性があります。"
+            f"（{st.session_state.get('_cloud_error_msg', '')}）"
+        )
+
     # 自動保存：rerunの度に現在の案件データを永続化
     if st.session_state.get('current_project') and st.session_state.get('projects_loaded'):
         persist_project_mods()
@@ -1516,12 +1663,11 @@ def main():
     if 'projects_loaded' not in st.session_state:
         st.session_state['projects'] = load_project_list()
         st.session_state['current_project'] = ''
-        # 最初の案件があればそれを選択してデータを復元
+        # 最初の案件を選択して復元（他案件は切替時に遅延復元し、起動時の通信を抑える）
         if st.session_state['projects']:
             first_id = list(st.session_state['projects'].keys())[0]
             st.session_state['current_project'] = first_id
-            for pid in st.session_state['projects']:
-                restore_project_to_session(pid)
+            restore_project_to_session(first_id)
         # 旧グローバルfeedbacks.jsonがあれば案件別に移行
         migrate_global_feedbacks(st.session_state['projects'], base_dir)
         st.session_state['projects_loaded'] = True
@@ -1568,11 +1714,8 @@ def main():
             # 案件削除
             if st.button("この案件を削除", use_container_width=True, type="secondary"):
                 pid = st.session_state['current_project']
-                # ファイル削除
-                for ext in ['.txt', '_data.json']:
-                    p = os.path.join(PROJECTS_DIR, f"{pid}{ext}")
-                    if os.path.exists(p):
-                        os.remove(p)
+                # ファイル削除（ローカル＋クラウド）
+                delete_project_storage(pid)
                 # session_state削除
                 keys_to_del = [k for k in list(st.session_state.keys()) if k.startswith(f"proj_{pid}_")]
                 for k in keys_to_del:

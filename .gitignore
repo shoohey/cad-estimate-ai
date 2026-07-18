@@ -5,3 +5,13 @@ __pycache__/
 *.bak
 .DS_Store
 feedbacks.json
+.vercel
+.vercelignore
+.streamlit/secrets.toml
+
+# 内部資料（公開リポジトリに含めない）
+CLAUDE.md
+AGENTS.md
+docs/
+index.html
+explanation.html
