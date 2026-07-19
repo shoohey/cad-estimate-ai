@@ -1768,6 +1768,13 @@ def main():
         use_sample = st.button("サンプルデータで試す",
                                 help="古居様邸のデータで動作確認", use_container_width=True)
 
+        # 保存モード表示（クラウド永続化の有効/無効を画面上で確認できるようにする）
+        if _cloud_ok():
+            st.caption("💾 データ保存: クラウド永続化 有効")
+        else:
+            st.caption("⚠️ データ保存: 一時保存（再起動で消える場合があります）")
+        st.caption("build 2026-07-19.2")
+
     # 単価マスタ読み込み
     csv_path = os.path.join(base_dir, "tankamaster_updated.csv")
 
