@@ -9,6 +9,9 @@ import copy
 import json
 import base64
 import hashlib
+import re
+import difflib
+import unicodedata
 from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill, numbers
@@ -20,6 +23,7 @@ from andpad_converter import (convert_to_andpad, ANDPADBudget,
                               ANDPADAllocation, vendor_sort_key)
 from feedback_handler import submit_feedback as send_feedback_to_company
 import cloud_store
+import equipment_db
 
 # ページ設定
 st.set_page_config(
@@ -1005,6 +1009,154 @@ def apply_modifications(estimate: Estimate, mods: dict) -> Estimate:
     return estimate
 
 
+def _flash(message: str, kind: str = "success"):
+    """st.rerun()を跨いで表示するメッセージを積む（main冒頭で表示・消費）"""
+    st.session_state.setdefault('_flash_msgs', []).append((kind, message))
+
+
+def _render_flash():
+    """フラッシュメッセージを表示して消去する"""
+    for kind, message in st.session_state.pop('_flash_msgs', []):
+        getattr(st, kind, st.info)(message)
+
+
+def _parse_amount_jp(text) -> float | None:
+    """『150万』『1,500,000円』『2台』等の文字列から数値を取り出す"""
+    if text is None:
+        return None
+    if isinstance(text, (int, float)):
+        if isinstance(text, float) and math.isnan(text):
+            return None
+        return float(text)
+    s = str(text).replace(',', '').replace('円', '').strip()
+    m = re.search(r'(\d+(?:\.\d+)?)\s*万', s)
+    if m:
+        return float(m.group(1)) * 10000
+    m = re.search(r'\d+(?:\.\d+)?', s)
+    return float(m.group(0)) if m else None
+
+
+def _find_estimate_item(estimate: Estimate, category_name: str, item_name: str):
+    """カテゴリ名・明細名（部分一致）から明細を探し (cat, index, item) を返す。
+
+    キーはベース見積のインデックスに対応させる必要があるため、
+    呼び出し側は estimate_base を渡すこと。
+    """
+    # 商品呼称のゆれ（打合せ用語 ⇔ 見積明細名）を共通トークンに寄せる
+    aliases = [
+        ('ヒートポンプ式給湯器', '給湯器'), ('エコキュート', '給湯器'),
+        ('システムバス', 'ub'), ('ユニットバス', 'ub'),
+        ('キッチンセット', 'キッチン'),
+    ]
+
+    def _norm(s):
+        # 半角カナ・全角英数の表記ゆれをNFKCで吸収する
+        t = unicodedata.normalize('NFKC', (s or '')).replace(' ', '').replace('　', '').lower()
+        for src, dst in aliases:
+            t = t.replace(src.lower(), dst)
+        return t
+    cname, iname = _norm(category_name), _norm(item_name)
+    if not iname:
+        return None
+    candidates = []
+    for cat in estimate.categories:
+        cat_match = bool(cname) and (cname in _norm(cat.name) or _norm(cat.name) in cname)
+        for i, item in enumerate(cat.items):
+            n = _norm(item.name)
+            if not n:
+                continue
+            if iname in n or n in iname:
+                candidates.append((2 if cat_match else 1, cat, i, item))
+    if candidates:
+        candidates.sort(key=lambda t: -t[0])
+        _, cat, i, item = candidates[0]
+        return cat, i, item
+    # 部分一致で見つからない場合は類似度でフォールバック
+    best = None
+    for cat in estimate.categories:
+        cat_match = bool(cname) and (cname in _norm(cat.name) or _norm(cat.name) in cname)
+        for i, item in enumerate(cat.items):
+            n = _norm(item.name)
+            if not n:
+                continue
+            ratio = difflib.SequenceMatcher(None, iname, n).ratio()
+            if ratio >= 0.55:
+                score = ratio + (0.2 if cat_match else 0.0)
+                if best is None or score > best[0]:
+                    best = (score, cat, i, item)
+    if best:
+        return best[1], best[2], best[3]
+    return None
+
+
+def _apply_ai_proposal(estimate_base: Estimate, mods: dict, p: dict) -> str | None:
+    """AI変更案を見積修正データ(mods)に変換して適用する。
+
+    適用できた場合は変更履歴用の説明文を、対象を特定できなかった場合は
+    None を返す。
+    """
+    ctype = p.get('change_type', '')
+    if ctype == 'add':
+        amount = _parse_amount_jp(p.get('proposed'))
+        cat_no = 21  # 特定できなければ雑工事に追加
+        for cat in estimate_base.categories:
+            if p.get('category') and p['category'].replace('工事', '') in cat.name:
+                cat_no = cat.no
+                break
+        mods.setdefault('new_items', []).append({
+            'cat_no': cat_no,
+            'name': p.get('item_name', '追加項目'),
+            'summary': (p.get('reason') or '')[:40],
+            'quantity': 1.0, 'unit': '式',
+            'estimate_price': int(amount or 0),
+            'order_price': 0,
+        })
+        return f"行追加: {p.get('item_name')}（{int(amount or 0):,}円）"
+
+    found = _find_estimate_item(estimate_base, p.get('category', ''), p.get('item_name', ''))
+    if not found:
+        return None
+    cat, idx, item = found
+    key = f"{cat.no}_{idx}"
+    if ctype == 'remove':
+        mods.setdefault('deleted', set()).add(key)
+        return f"削除: {item.name}"
+    ov = dict(mods.get('overrides', {}).get(key, {}))
+    ov.setdefault('quantity', item.quantity)
+    ov.setdefault('estimate_price', item.estimate_price)
+    ov.setdefault('order_price', item.order_price)
+    if ctype == 'quantity':
+        val = _parse_amount_jp(p.get('proposed'))
+        if val is None:
+            return None
+        desc = f"{item.name}: 数量 {ov['quantity']:g} → {val:g}"
+        ov['quantity'] = val
+    elif ctype == 'price':
+        val = _parse_amount_jp(p.get('proposed'))
+        if val is None:
+            return None
+        desc = f"{item.name}: 見積単価 {ov['estimate_price']:,}円 → {int(val):,}円"
+        ov['estimate_price'] = int(val)
+    else:  # spec: 仕様変更は名称・摘要に反映
+        proposed = p.get('proposed') or item.name
+        desc = f"{item.name}: 仕様変更 → {proposed}"
+        ov['name'] = proposed
+        ov['summary'] = (p.get('reason') or '')[:40]
+    mods.setdefault('overrides', {})[key] = ov
+    return desc
+
+
+def _estimate_summary_json(estimate: Estimate) -> str:
+    """AI解析用に現在の見積内容をJSON文字列化する"""
+    data = []
+    for cat in estimate.categories:
+        items = [{'名称': it.name, '摘要': it.summary, '数量': it.quantity,
+                  '単位': it.unit, '見積単価': it.estimate_price}
+                 for it in cat.items if it.name]
+        data.append({'工事種別': f"{cat.no:02d} {cat.name}", '明細': items})
+    return json.dumps(data, ensure_ascii=False)
+
+
 def apply_profit_rate_adjustment(estimate: Estimate, target_rate: float) -> Estimate:
     """目標粗利率に合わせて見積単価を比例調整する。
     元の見積金額の比率を維持しつつ、全体の粗利率が目標値になるよう
@@ -1463,19 +1615,195 @@ def load_cad_for_project(proj_id: str):
 
 def delete_project_storage(proj_id: str):
     """案件のローカルファイルとクラウドデータを削除する"""
-    for suffix in (".txt", "_data.json", "_feedbacks.json"):
+    for suffix in (".txt", "_data.json", "_feedbacks.json",
+                   "_changelog.json", "_actual.json"):
         p = os.path.join(PROJECTS_DIR, f"{proj_id}{suffix}")
         if os.path.exists(p):
             os.remove(p)
     st.session_state.get('_fb_cache', {}).pop(proj_id, None)
+    st.session_state.get('_cl_cache', {}).pop(proj_id, None)
+    st.session_state.get('_actual_cache', {}).pop(proj_id, None)
     st.session_state.pop(f'_cloud_saved_{proj_id}', None)
+    # 同名ファイル再取込時に旧modsとの偽の差分履歴が記録されるのを防ぐ
+    st.session_state.pop(f'_mods_logged_{proj_id}', None)
     if _cloud_ok():
         try:
-            for key_suffix in ("data", "cad", "feedbacks"):
+            for key_suffix in ("data", "cad", "feedbacks", "changelog", "actual"):
                 cloud_store.delete(f"proj:{proj_id}:{key_suffix}")
         except cloud_store.CloudStoreError as exc:
             # 障害検知時点でサーキットブレーカーが働くため以降の削除は中断。
             # クラウド側に残ったデータは再起動後に復活し得る（バナーで通知済み）
+            _warn_cloud_error(exc)
+
+
+# ===== 設備マスター（全案件共通） =====
+
+EQUIPMENT_MASTER_PATH = os.path.join(PROJECTS_DIR, "equipment_master.json")
+
+
+def get_equipment_master(prices: dict) -> dict:
+    """設備マスターを取得する（セッションキャッシュ付き。初回は自動シード）
+
+    標準オプション('std')は取得のたびに単価マスターCSVの現行値へ同期する
+    （tankamaster更新が見積へ反映され続けるようにするため）。
+    """
+    if '_equip_master' in st.session_state:
+        return st.session_state['_equip_master']
+    master = None
+    if _cloud_ok():
+        try:
+            master = cloud_store.get("equipment_master")
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
+    if master is None and os.path.exists(EQUIPMENT_MASTER_PATH):
+        with open(EQUIPMENT_MASTER_PATH, 'r', encoding='utf-8') as f:
+            master = json.load(f)
+    if not master:
+        master = equipment_db.seed_master_from_prices(prices)
+        save_equipment_master(master)
+    equipment_db.refresh_std_options(master, prices)
+    st.session_state['_equip_master'] = master
+    # 編集競合検出用（保存時に他ユーザーの更新と比較する）
+    st.session_state['_equip_master_snapshot'] = json.dumps(
+        master, ensure_ascii=False, sort_keys=True)
+    return master
+
+
+def save_equipment_master(master: dict):
+    """設備マスターを保存（ローカル＋クラウド）"""
+    st.session_state['_equip_master'] = master
+    with open(EQUIPMENT_MASTER_PATH, 'w', encoding='utf-8') as f:
+        json.dump(master, f, ensure_ascii=False, indent=2)
+    if _cloud_ok():
+        try:
+            cloud_store.put("equipment_master", master)
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
+
+
+# ===== 変更履歴ログ =====
+
+def load_project_changelog(proj_id: str) -> list:
+    """案件の変更履歴を読み込む（クラウド優先・セッションキャッシュ付き）"""
+    cache = st.session_state.setdefault('_cl_cache', {})
+    if proj_id in cache:
+        return cache[proj_id]
+    result = None
+    if _cloud_ok():
+        try:
+            result = cloud_store.get(f"proj:{proj_id}:changelog")
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
+    if result is None:
+        path = os.path.join(PROJECTS_DIR, f"{proj_id}_changelog.json")
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                result = json.load(f)
+        else:
+            result = []
+    cache[proj_id] = result
+    return result
+
+
+def append_project_changelog(proj_id: str, source: str, summary: str, detail: str = ""):
+    """変更履歴に1件追記する（直近500件を保持）
+
+    source: 手動修正 / 設備変更 / 音声変更 / 提案書反映 / 実績取込 / 粗利調整 / システム
+    """
+    if not proj_id:
+        return
+    logs = list(load_project_changelog(proj_id))
+    logs.append({
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'source': source,
+        'summary': summary,
+        'detail': detail,
+    })
+    logs = logs[-500:]
+    st.session_state.setdefault('_cl_cache', {})[proj_id] = logs
+    path = os.path.join(PROJECTS_DIR, f"{proj_id}_changelog.json")
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(logs, f, ensure_ascii=False, indent=2)
+    if _cloud_ok():
+        try:
+            cloud_store.put(f"proj:{proj_id}:changelog", logs)
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
+
+
+def _summarize_mods_diff(old: dict, new: dict) -> list:
+    """mods（見積修正データ）の差分を日本語の短い説明リストにする（変更履歴用）"""
+    def _deleted_set(m):
+        d = m.get('deleted')
+        if isinstance(d, dict):
+            return set(d.get('__set__', []))
+        return set(d or [])
+
+    changes = []
+    old_ov = old.get('overrides', {}) or {}
+    new_ov = new.get('overrides', {}) or {}
+    for k, v in new_ov.items():
+        if old_ov.get(k) != v:
+            desc = f"明細{k}"
+            if v.get('name'):
+                desc += f"({v['name']})"
+            changes.append(
+                f"{desc}を修正: 数量{v.get('quantity')} 見積単価{v.get('estimate_price'):,}円")
+    for k in old_ov:
+        if k not in new_ov:
+            changes.append(f"明細{k}の修正を取消")
+    old_del, new_del = _deleted_set(old), _deleted_set(new)
+    for k in sorted(new_del - old_del):
+        changes.append(f"明細{k}を削除")
+    for k in sorted(old_del - new_del):
+        changes.append(f"明細{k}を復元")
+    old_names = [n.get('name', '') for n in old.get('new_items', []) or []]
+    new_names = [n.get('name', '') for n in new.get('new_items', []) or []]
+    for n in new_names:
+        if n not in old_names:
+            changes.append(f"行追加: {n}")
+    for n in old_names:
+        if n not in new_names:
+            changes.append(f"追加行を削除: {n}")
+    return changes
+
+
+# ===== 実績見積（提出見積Excel取込データ） =====
+
+def load_project_actual(proj_id: str):
+    """案件の実績見積（取込済みパース結果）を読み込む
+
+    実績比較タブは毎rerunで参照するため、セッション内キャッシュで
+    クラウドへのGET連発を防ぐ（保存・削除時にキャッシュを更新）。
+    """
+    cache = st.session_state.setdefault('_actual_cache', {})
+    if proj_id in cache:
+        return cache[proj_id]
+    result = None
+    if _cloud_ok():
+        try:
+            result = cloud_store.get(f"proj:{proj_id}:actual")
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
+    if result is None:
+        path = os.path.join(PROJECTS_DIR, f"{proj_id}_actual.json")
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                result = json.load(f)
+    cache[proj_id] = result
+    return result
+
+
+def save_project_actual(proj_id: str, parsed: dict):
+    """案件の実績見積を保存（ローカル＋クラウド）"""
+    path = os.path.join(PROJECTS_DIR, f"{proj_id}_actual.json")
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(parsed, f, ensure_ascii=False, indent=2)
+    st.session_state.setdefault('_actual_cache', {})[proj_id] = parsed
+    if _cloud_ok():
+        try:
+            cloud_store.put(f"proj:{proj_id}:actual", parsed)
+        except cloud_store.CloudStoreError as exc:
             _warn_cloud_error(exc)
 
 
@@ -1524,7 +1852,24 @@ def persist_project_mods():
     inc_adj = get_project_state('include_adjustment')
     if inc_adj is not None:
         data['include_adjustment'] = inc_adj
+    inc_solar = get_project_state('include_solar')
+    if inc_solar is not None:
+        data['include_solar'] = inc_solar
+    equipment = get_project_state('equipment')
+    if equipment:
+        data['equipment'] = equipment
     save_project_data(proj_id, data)
+
+    # 手動修正の変更履歴（前回rerun時とのmods差分を記録）
+    if 'mods' in data:
+        snap_key = f'_mods_logged_{proj_id}'
+        new_snap = json.dumps(_convert_sets(data['mods']), ensure_ascii=False, sort_keys=True)
+        old_snap = st.session_state.get(snap_key)
+        if old_snap is not None and old_snap != new_snap:
+            diff_lines = _summarize_mods_diff(json.loads(old_snap), json.loads(new_snap))
+            if diff_lines:
+                append_project_changelog(proj_id, '手動修正', ' / '.join(diff_lines[:8]))
+        st.session_state[snap_key] = new_snap
 
 
 def restore_project_to_session(proj_id: str):
@@ -1547,6 +1892,10 @@ def restore_project_to_session(proj_id: str):
         st.session_state[f"proj_{proj_id}_estimate_no"] = data['estimate_no']
     if 'include_adjustment' in data:
         st.session_state[f"proj_{proj_id}_include_adjustment"] = data['include_adjustment']
+    if 'include_solar' in data:
+        st.session_state[f"proj_{proj_id}_include_solar"] = data['include_solar']
+    if 'equipment' in data:
+        st.session_state[f"proj_{proj_id}_equipment"] = data['equipment']
     # CADデータ復元
     cad = load_cad_for_project(proj_id)
     if cad:
@@ -1641,6 +1990,20 @@ def _render_project_list_tab(projects: dict, restore_fn):
 
 
 def main():
+    # 簡易アクセス制限（Secretsに APP_PASSCODE を設定した場合のみ有効）
+    passcode = cloud_store._get_secret("APP_PASSCODE")
+    if passcode and not st.session_state.get('_authed'):
+        st.markdown("### 日本住建株式会社　見積AIシステム")
+        code_input = st.text_input("アクセスコードを入力してください",
+                                   type="password", key="passcode_input")
+        if st.button("ログイン", type="primary"):
+            if code_input == passcode:
+                st.session_state['_authed'] = True
+                st.rerun()
+            else:
+                st.error("アクセスコードが正しくありません。")
+        st.stop()
+
     # ヘッダー
     st.markdown("""
     <div class="main-header">
@@ -1650,6 +2013,9 @@ def main():
     """, unsafe_allow_html=True)
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # 直前の操作結果（rerunを跨いだ成功/警告メッセージ）を表示
+    _render_flash()
 
     # クラウド接続障害時はセッション中ずっとバナーを表示する
     if st.session_state.get('_cloud_degraded'):
@@ -1759,6 +2125,12 @@ def main():
             help="見積調整項目（建材・下地材/大工手間 各475,000円、発注0円）。実績見積では標準的に計上されます。")
         if st.session_state['current_project']:
             set_project_state('include_adjustment', include_adjustment)
+        include_solar = st.checkbox(
+            "太陽光発電を含める",
+            value=get_project_state('include_solar', False),
+            help="太陽光本体＋対応分電盤＋HEMS一式を計上します。CADの条件フラグは実仕様と食い違う事例が多いため、採用時に手動でONにしてください（参考: 約100万円〜、機種により約220万円）。")
+        if st.session_state['current_project']:
+            set_project_state('include_solar', include_solar)
 
         # 案件保存ボタン
         if st.session_state['current_project']:
@@ -1777,7 +2149,7 @@ def main():
             st.caption("💾 データ保存: クラウド永続化 有効")
         else:
             st.caption("⚠️ データ保存: 一時保存（再起動で消える場合があります）")
-        st.caption("build 2026-07-20.1")
+        st.caption("build 2026-07-20.2")
 
     # 単価マスタ読み込み
     csv_path = os.path.join(base_dir, "tankamaster_updated.csv")
@@ -1873,13 +2245,19 @@ def main():
             badges.append(f'<span class="{cls}">{pinfo["name"]}</span>')
         st.markdown(f'<div class="project-bar">{"".join(badges)}</div>', unsafe_allow_html=True)
 
+    # 設備マスターの反映（案件の設備選択で単価を上書き）
+    equip_master = get_equipment_master(prices)
+    prices_effective = equipment_db.apply_equipment(
+        prices, equip_master, get_project_state('equipment'))
+
     # 見積計算（ベース）
     estimate_base = calculate_estimate(
-        cad_data, prices,
+        cad_data, prices_effective,
         owner_name=owner_name,
         location=location,
         estimate_no=estimate_no,
         include_adjustment=include_adjustment,
+        include_solar=include_solar,
     )
 
     # 修正の初期化と適用
@@ -1945,9 +2323,13 @@ def main():
                 new_allocs.append(ANDPADAllocation(vendor, '材', 0))
             item.allocations = new_allocs
 
+    current_pid = st.session_state.get('current_project', '')
+
     # タブ構成（案件一覧を先頭に追加）
-    tab_proj, tab1, tab_mod, tab2, tab3, tab4, tab_fb = st.tabs([
-        "案件一覧", "見積概要", "見積修正", "見積明細", "ANDPAD材工分離", "CADデータ確認", "フィードバック"
+    (tab_proj, tab1, tab_mod, tab2, tab3, tab4,
+     tab_actual, tab_meeting, tab_equip, tab_history, tab_fb) = st.tabs([
+        "案件一覧", "見積概要", "見積修正", "見積明細", "ANDPAD材工分離", "CADデータ確認",
+        "実績比較", "打合せ変更", "設備設定", "変更履歴", "フィードバック"
     ])
 
     # ===== 案件一覧タブ =====
@@ -2169,8 +2551,10 @@ def main():
                     ov = mods['overrides'].get(key, {})
                     edit_rows.append({
                         '削除': is_del,
-                        '名称': item.name,
-                        '摘要': item.summary,
+                        # 名称・摘要も上書き値を反映する（AI変更等で名称が
+                        # 変更済みの場合に旧名称で上書き消去されるのを防ぐ）
+                        '名称': ov.get('name', item.name),
+                        '摘要': ov.get('summary', item.summary),
                         '数量': ov.get('quantity', item.quantity),
                         '単位': item.unit,
                         '見積単価': ov.get('estimate_price', item.estimate_price),
@@ -2750,6 +3134,394 @@ def main():
         if fitting_data:
             st.dataframe(pd.DataFrame(fitting_data),
                         use_container_width=True, hide_index=True)
+
+    # ===== 実績比較タブ =====
+    with tab_actual:
+        st.markdown("#### 実績見積との比較")
+        st.markdown(
+            "実際に提出した見積書（Excel）を取り込むと、AI見積との差分を区分別・明細別に表示します。"
+            "差分はフィードバックとして送信でき、見積精度の改善に活用されます。")
+        try:
+            import excel_diff
+        except Exception as exc:
+            excel_diff = None
+            st.warning(f"実績比較モジュールを読み込めませんでした: {exc}")
+        if excel_diff is not None:
+            up_actual = st.file_uploader(
+                "提出見積Excel（.xlsx）をアップロード", type=['xlsx'], key="actual_upload")
+            if up_actual is not None and st.button("実績見積を取り込む", type="primary"):
+                try:
+                    parsed = excel_diff.parse_actual_estimate(up_actual.read())
+                    save_project_actual(current_pid, parsed)
+                    append_project_changelog(
+                        current_pid, '実績取込',
+                        f"実績見積を取込（税抜 {parsed.get('total_excl_tax', 0):,}円 / {up_actual.name}）")
+                    st.success(f"実績見積を取り込みました（税抜 {parsed.get('total_excl_tax', 0):,}円）")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Excelの解析に失敗しました。提出見積の形式（明細書シート）かご確認ください: {exc}")
+
+            actual = load_project_actual(current_pid)
+            if actual is None:
+                st.info("この案件の実績見積はまだ取り込まれていません。")
+            else:
+                diff = excel_diff.diff_estimates(estimate, actual)
+                ai_total = diff['total_ai']
+                act_total = diff['total_actual']
+                rate_pct = (ai_total - act_total) / act_total * 100 if act_total else 0.0
+                c1, c2, c3 = st.columns(3)
+                c1.metric("AI見積（税抜）", f"{ai_total:,}円")
+                c2.metric("実績見積（税抜）", f"{act_total:,}円")
+                c3.metric("差額（AI−実績）", f"{ai_total - act_total:+,}円", f"{rate_pct:+.1f}%")
+
+                st.markdown("##### 工事種別ごとの差分")
+                rows = []
+                for cd in diff['category_diffs']:
+                    rows.append({
+                        '工事種別': cd['name'],
+                        'AI見積': cd['ai_total'],
+                        '実績見積': cd['actual_total'],
+                        '差額(AI−実績)': cd['ai_total'] - cd['actual_total'],
+                    })
+                df_cat = pd.DataFrame(rows)
+                st.dataframe(
+                    df_cat.style.format({'AI見積': '{:,}', '実績見積': '{:,}', '差額(AI−実績)': '{:+,}'}),
+                    use_container_width=True, hide_index=True)
+
+                with st.expander("明細レベルの差分を見る"):
+                    for cat_name, d in diff.get('item_diffs', {}).items():
+                        big = [m for m in d.get('matched', [])
+                               if abs(m['ai_amount'] - m['actual_amount']) >= 10000]
+                        if not (big or d.get('ai_only') or d.get('actual_only')):
+                            continue
+                        st.markdown(f"**{cat_name}**")
+                        for m in big[:15]:
+                            st.markdown(
+                                f"- {m['ai_name']} ⇔ {m['actual_name']}: "
+                                f"AI {m['ai_amount']:,}円 / 実績 {m['actual_amount']:,}円 "
+                                f"（差 {m['ai_amount'] - m['actual_amount']:+,}円）")
+                        for x in d.get('ai_only', [])[:8]:
+                            st.markdown(f"- 🟦 AIのみ: {x['name']}（{x['amount']:,}円）")
+                        for x in d.get('actual_only', [])[:8]:
+                            st.markdown(f"- 🟥 実績のみ: {x['name']}（{x['amount']:,}円）")
+
+                st.markdown("")
+                if st.button("この差分をフィードバックとして送信", key="send_diff_fb"):
+                    summary_text = excel_diff.diff_summary_text(diff)
+                    result = send_feedback_to_company(
+                        name="実績差分レポート（自動）", email="",
+                        category="実績差分レポート", message=summary_text,
+                        property_name=st.session_state['projects'].get(
+                            current_pid, {}).get('name', ''),
+                    )
+                    if result.get('success'):
+                        fbs = load_project_feedbacks(current_pid)
+                        fbs.append({
+                            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M'),
+                            'category': '実績差分レポート', 'name': '自動生成',
+                            'body': summary_text, 'priority': '通常', 'status': '未対応',
+                        })
+                        save_project_feedbacks(current_pid, fbs)
+                        st.success("差分レポートをフィードバックとして送信しました。")
+                    else:
+                        st.error("送信に失敗しました: " + " / ".join(result.get('errors', [])))
+
+    # ===== 打合せ変更タブ =====
+    with tab_meeting:
+        st.markdown("#### 打合せによる変更の反映")
+        st.markdown(
+            "お客様との打合せ音声・提案書・議事録をアップすると、AIが「見積のどこが変わるか」を抽出します。"
+            "内容を確認して承認すると見積に反映され、変更履歴に記録されます。")
+        try:
+            import ai_client
+        except Exception as exc:
+            ai_client = None
+            st.warning(f"AIモジュールを読み込めませんでした: {exc}")
+
+        if ai_client is not None:
+            caps = ai_client.ai_capabilities()
+            if not caps.get('text'):
+                st.info(
+                    "AI機能を使うには ANTHROPIC_API_KEY の設定が必要です"
+                    "（Streamlit CloudのSecretsに追加してください）。")
+            else:
+                src_doc, src_voice = st.tabs(["📄 提案書・議事録から", "🎤 音声から"])
+
+                with src_doc:
+                    up_doc = st.file_uploader(
+                        "提案書・議事録・打合せメモ（PDF / Word / Excel / テキスト）",
+                        type=['pdf', 'docx', 'xlsx', 'txt'], key="meeting_doc")
+                    if up_doc is not None and st.button("この書類から変更点を抽出", key="btn_doc_analyze"):
+                        try:
+                            with st.spinner("書類を解析中..."):
+                                doc_text = ai_client.extract_text_from_upload(up_doc.read(), up_doc.name)
+                                proposals = ai_client.analyze_document_changes(
+                                    doc_text, _estimate_summary_json(estimate))
+                            if not proposals:
+                                _flash("この書類から見積の変更点は見つかりませんでした。", "info")
+                            set_project_state('ai_proposals', proposals)
+                            set_project_state('ai_proposals_src', f"提案書反映（{up_doc.name}）")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"解析に失敗しました: {exc}")
+
+                with src_voice:
+                    if not caps.get('transcribe'):
+                        st.info("音声機能には OPENAI_API_KEY の設定が必要です。")
+                    else:
+                        audio_bytes = None
+                        audio_name = ""
+                        up_audio = st.file_uploader(
+                            "打合せ音声ファイル（mp3 / m4a / wav）",
+                            type=['mp3', 'm4a', 'wav'], key="meeting_audio")
+                        if up_audio is not None:
+                            audio_bytes, audio_name = up_audio.read(), up_audio.name
+                        if hasattr(st, 'audio_input'):
+                            mic = st.audio_input(
+                                "またはマイクで指示を録音（例:「システムバスを1616に変更して」）",
+                                key="meeting_mic")
+                            if mic is not None:
+                                audio_bytes, audio_name = mic.read(), "mic.wav"
+                        if audio_bytes and st.button("文字起こしする", key="btn_transcribe"):
+                            if len(audio_bytes) > 25 * 1024 * 1024:
+                                st.error(
+                                    f"音声ファイルが大きすぎます（{len(audio_bytes) / 1024 / 1024:.0f}MB）。"
+                                    "文字起こしは25MBまでです。長い打合せ音声は分割してアップしてください。")
+                            else:
+                                try:
+                                    with st.spinner("文字起こし中..."):
+                                        transcript = ai_client.transcribe_audio(audio_bytes, audio_name)
+                                    set_project_state('ai_transcript', transcript)
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error(f"文字起こしに失敗しました: {exc}")
+                        transcript = get_project_state('ai_transcript', '')
+                        if transcript:
+                            edited_transcript = st.text_area(
+                                "文字起こし結果（修正可）", value=transcript, height=120,
+                                key="transcript_edit")
+                            if st.button("この内容から変更点を抽出", key="btn_voice_analyze"):
+                                try:
+                                    with st.spinner("変更指示を解析中..."):
+                                        proposals = ai_client.parse_voice_command(
+                                            edited_transcript, _estimate_summary_json(estimate))
+                                    if not proposals:
+                                        _flash("この指示から見積の変更点を特定できませんでした。言い方を変えてお試しください。", "info")
+                                    set_project_state('ai_proposals', proposals)
+                                    set_project_state('ai_proposals_src', '音声変更')
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error(f"解析に失敗しました: {exc}")
+
+                # --- 変更案の確認・承認 ---
+                proposals = get_project_state('ai_proposals')
+                if proposals:
+                    st.markdown("---")
+                    st.markdown(f"##### 抽出された変更案（{len(proposals)}件）— 反映するものにチェック")
+                    conf_mark = {'high': '🟢', 'medium': '🟡', 'low': '🔴'}
+                    # 提案書由来の変更案は内容の偽装リスクがあるため初期チェックを
+                    # 付けない（音声指示のみ高確度を初期チェック）
+                    src_now = get_project_state('ai_proposals_src', '')
+                    default_check_ok = src_now.startswith('音声')
+                    if not default_check_ok:
+                        st.caption("⚠️ 書類から抽出した変更案です。内容をご確認のうえ、反映するものにチェックしてください。")
+                    checked = []
+                    for i, p in enumerate(proposals):
+                        label = (
+                            f"{conf_mark.get(p.get('confidence'), '⚪')} "
+                            f"【{p.get('category', '?')}】{p.get('item_name', '?')}: "
+                            f"{p.get('current', '')} → {p.get('proposed', '')}")
+                        c = st.checkbox(
+                            label,
+                            value=(default_check_ok and p.get('confidence') == 'high'),
+                            key=f"prop_chk_{i}")
+                        if p.get('reason'):
+                            st.caption(f"　根拠: {p['reason']}")
+                        if c:
+                            checked.append(p)
+                    col_a, col_b = st.columns([1, 1])
+                    with col_a:
+                        if st.button(f"選択した{len(checked)}件を見積に反映", type="primary",
+                                     disabled=not checked, key="btn_apply_props"):
+                            src = get_project_state('ai_proposals_src', 'AI変更')
+                            applied, failed = [], []
+                            for p in checked:
+                                desc = _apply_ai_proposal(estimate_base, mods, p)
+                                if desc:
+                                    applied.append(desc)
+                                else:
+                                    failed.append(f"{p.get('category', '')}/{p.get('item_name', '')}")
+                            if applied:
+                                set_project_state('mods', mods)
+                                # 変更履歴フックのスナップショットを先に更新し、
+                                # 「手動修正」としての二重記録を防いだうえで
+                                # 正しい種別（音声変更/提案書反映）で記録する
+                                snap = json.dumps(_convert_sets({
+                                    'overrides': mods.get('overrides', {}),
+                                    'deleted': mods.get('deleted', set()),
+                                    'new_items': mods.get('new_items', []),
+                                }), ensure_ascii=False, sort_keys=True)
+                                st.session_state[f'_mods_logged_{current_pid}'] = snap
+                                persist_project_mods()
+                                append_project_changelog(
+                                    current_pid, src.split('（')[0], ' / '.join(applied[:10]))
+                            set_project_state('ai_proposals', None)
+                            set_project_state('ai_transcript', '')
+                            if failed:
+                                _flash("対象を特定できず反映できなかった変更: " + " / ".join(failed), "warning")
+                            if applied:
+                                _flash(f"{len(applied)}件を見積に反映しました（変更履歴に記録済み）。")
+                            st.rerun()
+                    with col_b:
+                        if st.button("変更案をクリア", key="btn_clear_props"):
+                            set_project_state('ai_proposals', None)
+                            st.rerun()
+
+    # ===== 設備設定タブ =====
+    with tab_equip:
+        st.markdown("#### 住宅設備の設定")
+        sub_sel, sub_master = st.tabs(["この案件の設備選択", "設備マスター編集（全案件共通）"])
+
+        with sub_sel:
+            st.markdown("案件の初期設定として、採用する住宅設備を選択します。選択内容は見積の住設項目に反映されます。")
+            current_sel = dict(get_project_state('equipment') or {})
+            eff = equipment_db.effective_selection(equip_master, current_sel)
+            new_sel = {}
+            for code_str in sorted(equip_master.keys()):
+                entry = equip_master[code_str]
+                opts = entry.get('options', [])
+                if not opts:
+                    continue
+                ids = [o['id'] for o in opts]
+                names = {o['id']: (f"{o['name']}（標準・単価マスター連動 {o['estimate_price']:,}円）"
+                                   if o['id'] == 'std'
+                                   else f"{o['name']}（見積 {o['estimate_price']:,}円）")
+                         for o in opts}
+                cur = eff.get(code_str, ids[0])
+                idx = ids.index(cur) if cur in ids else 0
+                new_sel[code_str] = st.selectbox(
+                    entry.get('label', code_str), ids, index=idx,
+                    format_func=lambda i, names_=names: names_.get(i, i),
+                    key=f"equip_sel_{code_str}")
+            if st.button("この案件の設備選択を保存", type="primary", key="btn_save_equip_sel"):
+                changes = equipment_db.selection_changes(equip_master, current_sel, new_sel)
+                set_project_state('equipment', new_sel)
+                persist_project_mods()
+                if changes:
+                    append_project_changelog(current_pid, '設備変更', ' / '.join(changes))
+                _flash("設備選択を保存しました。見積に反映されています。")
+                st.rerun()
+
+        with sub_master:
+            st.markdown(
+                "設備の選択肢（メーカー・型番・単価）を編集します。行を追加すると新しい選択肢になります。"
+                "**ここでの変更は全案件に共通で適用されます。**")
+            st.caption(
+                "「標準（単価マスター連動）」は単価マスターCSVの現行値と常に連動するため、"
+                "この画面では編集できません。単価を変えたい場合は行を追加してください。")
+            edited_master = {}
+            for code_str in sorted(equip_master.keys()):
+                entry = equip_master[code_str]
+                options = entry.get('options', [])
+                std_opt = next((o for o in options if o.get('id') == 'std'), None)
+                user_opts = [o for o in options if o.get('id') != 'std']
+                with st.expander(f"{entry.get('label', code_str)}（選択肢 {len(options)}件）"):
+                    if std_opt:
+                        st.caption(
+                            f"標準（単価マスター連動）: {std_opt['name']}"
+                            f"（見積 {std_opt['estimate_price']:,}円）")
+                    df_opts = pd.DataFrame([
+                        {'ID': o.get('id', ''), '名称': o.get('name', ''),
+                         '摘要': o.get('summary', ''),
+                         '見積単価': o.get('estimate_price', 0),
+                         '発注単価': o.get('order_price', 0)}
+                        for o in user_opts],
+                        columns=['ID', '名称', '摘要', '見積単価', '発注単価'])
+                    edited_df = st.data_editor(
+                        df_opts, num_rows="dynamic", use_container_width=True,
+                        column_config={'ID': st.column_config.TextColumn(disabled=True)},
+                        key=f"equip_ed_{code_str}")
+                    names_list = ['標準（単価マスター連動）'] + [
+                        str(n) for n in edited_df['名称'].tolist() if str(n).strip()]
+                    default_opt = equipment_db.get_option(
+                        equip_master, code_str, entry.get('default_id', 'std'))
+                    default_name = (default_opt or {}).get('name', '')
+                    d_idx = names_list.index(default_name) if default_name in names_list else 0
+                    default_choice = st.selectbox(
+                        "標準（初期設定）にする選択肢", names_list,
+                        index=d_idx, key=f"equip_def_{code_str}")
+                    edited_master[code_str] = (entry, edited_df, default_choice)
+            if st.button("設備マスターを保存（全案件共通）", type="primary", key="btn_save_equip_master"):
+                # 編集競合の検出: 他ユーザーが保存済みなら上書きせず再読込を促す
+                conflict = False
+                if _cloud_ok():
+                    try:
+                        current_cloud = cloud_store.get("equipment_master")
+                        if current_cloud is not None:
+                            equipment_db.refresh_std_options(current_cloud, prices)
+                            if json.dumps(current_cloud, ensure_ascii=False, sort_keys=True) \
+                                    != st.session_state.get('_equip_master_snapshot'):
+                                conflict = True
+                    except cloud_store.CloudStoreError as exc:
+                        _warn_cloud_error(exc)
+                if conflict:
+                    st.session_state.pop('_equip_master', None)
+                    _flash("他のユーザーが設備マスターを更新しています。最新の内容を再読込しました。"
+                           "内容を確認のうえ、必要な変更を再度行ってください。", "error")
+                    st.rerun()
+                import uuid as uuid_mod
+                new_master = {}
+                for code_str, (entry, edited_df, default_choice) in edited_master.items():
+                    std_opt = next((o for o in entry.get('options', [])
+                                    if o.get('id') == 'std'), None)
+                    options = [std_opt] if std_opt else []
+                    default_id = 'std' if default_choice == '標準（単価マスター連動）' else None
+                    for _, row in edited_df.iterrows():
+                        name = str(row.get('名称', '') or '').strip()
+                        if not name or name == 'nan':
+                            continue
+                        # 既存行はIDを維持し、新規行のみ新しいIDを採番する
+                        # （位置ベースの再採番は案件の選択を別商品にすり替えるため禁止）
+                        oid = str(row.get('ID', '') or '').strip()
+                        if not oid or oid == 'nan':
+                            oid = f"opt_{uuid_mod.uuid4().hex[:8]}"
+                        options.append({
+                            'id': oid, 'name': name,
+                            'summary': str(row.get('摘要', '') or '').replace('nan', ''),
+                            'estimate_price': int(_parse_amount_jp(row.get('見積単価')) or 0),
+                            'order_price': int(_parse_amount_jp(row.get('発注単価')) or 0),
+                        })
+                        if default_id is None and name == default_choice:
+                            default_id = oid
+                    if options:
+                        new_master[code_str] = {
+                            'label': entry.get('label', code_str),
+                            'default_id': default_id or 'std',
+                            'options': options,
+                        }
+                save_equipment_master(new_master)
+                st.session_state['_equip_master_snapshot'] = json.dumps(
+                    new_master, ensure_ascii=False, sort_keys=True)
+                append_project_changelog(current_pid, 'システム', "設備マスターを更新（全案件共通）")
+                _flash("設備マスターを保存しました。")
+                st.rerun()
+
+    # ===== 変更履歴タブ =====
+    with tab_history:
+        st.markdown("#### 変更履歴")
+        logs = load_project_changelog(current_pid)
+        if not logs:
+            st.info("この案件の変更履歴はまだありません。見積修正・設備変更・AI変更・実績取込を行うと記録されます。")
+        else:
+            st.markdown(f"全 **{len(logs)}** 件（新しい順）")
+            df_logs = pd.DataFrame([
+                {'日時': l.get('timestamp', ''), '種別': l.get('source', ''),
+                 '内容': l.get('summary', ''), '詳細': l.get('detail', '')}
+                for l in reversed(logs)])
+            st.dataframe(df_logs, use_container_width=True, hide_index=True, height=420)
+            csv_data = df_logs.to_csv(index=False).encode('utf-8-sig')
+            st.download_button("変更履歴をCSVダウンロード", data=csv_data,
+                               file_name=f"changelog_{current_pid}.csv", mime="text/csv")
 
     # ===== フィードバックタブ =====
     with tab_fb:
