@@ -15,3 +15,10 @@ AGENTS.md
 docs/
 index.html
 explanation.html
+calibration/
+
+# 実行時生成データ（クラウドが正・ローカルはキャッシュ）
+projects/equipment_master.json
+projects/*_feedbacks.json
+projects/*_changelog.json
+projects/*_actual.json

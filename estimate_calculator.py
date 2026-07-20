@@ -158,12 +158,16 @@ def load_unit_prices(csv_path: str) -> dict:
 def calculate_estimate(cad_data: CADData, prices: dict,
                        owner_name: str = "", location: str = "",
                        estimate_no: str = "",
-                       include_adjustment: bool = True) -> Estimate:
+                       include_adjustment: bool = True,
+                       include_solar: bool = False) -> Estimate:
     """CADデータから概算見積を算出
 
     Args:
         include_adjustment: ●33調整分（見積のみ計上・発注0円の調整項目）を
             含めるかどうか。実績見積では標準的に計上されるためデフォルトTrue。
+        include_solar: 太陽光発電システムを計上するか。CAD条件04は実仕様と
+            食い違う実例が多い（8物件検証で採用可否とフラグが一致しない）ため
+            自動判定せず、明示的な指定のみで計上する。デフォルトFalse。
     """
     estimate = Estimate(
         property_name=cad_data.property_name,
@@ -173,9 +177,12 @@ def calculate_estimate(cad_data: CADData, prices: dict,
         total_floor_area_m2=cad_data.total_floor_area(),
         total_floor_area_tsubo=cad_data.total_floor_area_tsubo(),
     )
+    # CADパース時の警告（部屋の復元・取り込み漏れ等）を引き継ぐ
+    estimate.warnings.extend(getattr(cad_data, 'parse_warnings', []))
 
     # ===== 基本面積 =====
-    total_area = cad_data.total_floor_area()          # 延床（部屋面積計）
+    # 延床はCAD内の面積表実測値（H000403等）を優先（cad_parser.total_floor_area）
+    total_area = cad_data.total_floor_area()
     total_tsubo = total_area / TSUBO
     floor1_area = cad_data.floor_area("1階")
     floor2_area = cad_data.floor_area("2階")
@@ -190,25 +197,38 @@ def calculate_estimate(cad_data: CADData, prices: dict,
     is_gable = (cad_data.get_condition("R000031")
                 + cad_data.get_condition("R000036")) >= 1  # 切妻屋根
 
-    # ===== 建物外形（間口・奥行から概算） =====
+    # ===== 建物外形 =====
+    # CAD実測値（外周長B000581・建築面積H000402）を最優先し、
+    # 無い場合は間口・奥行 → 1階床面積の順で概算する
     maguchi = cad_data.get_condition("R000081")   # 建物間口
     okuyuki = cad_data.get_condition("R000082")   # 建物奥行
-    if maguchi > 0 and okuyuki > 0:
-        perimeter = 2 * (maguchi + okuyuki)       # 建物外周長
-        footprint = maguchi * okuyuki             # 建築面積（矩形近似）
+    agg_perimeter = cad_data.agg("B000581")       # 部屋線(全階) 外部長
+    agg_footprint = cad_data.agg("H000402")       # 建築面積[トータル面積表]
+    if agg_perimeter > 0:
+        perimeter = agg_perimeter
+    elif maguchi > 0 and okuyuki > 0:
+        perimeter = 2 * (maguchi + okuyuki)
     else:
         perimeter = math.sqrt(max(floor1_area, 1.0)) * 4
+    if agg_footprint > 0:
+        footprint = agg_footprint
+    elif maguchi > 0 and okuyuki > 0:
+        footprint = maguchi * okuyuki
+    else:
         footprint = floor1_area
+    if agg_perimeter <= 0 and not (maguchi > 0 and okuyuki > 0):
         estimate.warnings.append(
-            "建物間口・奥行データが無いため、外周長・屋根面積を1階床面積から概算しています。精度が低下する可能性があります。")
+            "外周長・建築面積のCAD実測値が無いため、1階床面積から概算しています。精度が低下する可能性があります。")
 
     # ===== 部屋タイプ別面積 =====
     genkan_area = cad_data.room_area_by_type("全階", ["玄関"])
     porch_area = cad_data.room_area_by_type("全階", ["ポーチ"])
     if porch_area == 0 and genkan_area > 0:
-        porch_area = round(genkan_area * 1.25, 2)
+        # 8物件の実績タイル数量との突合で、旧係数1.25では実績の約半分に
+        # なることが判明したため2.5に較正（玄関土間＋ポーチ＋立上り相当）
+        porch_area = round(genkan_area * 2.5, 2)
         estimate.warnings.append(
-            f"ポーチがCADデータに無いため、玄関面積×1.25＝{porch_area}㎡で概算計上しています。実際のポーチ面積と異なる場合は「見積修正」タブで調整してください。")
+            f"ポーチがCADデータに無いため、玄関面積×2.5＝{porch_area}㎡で概算計上しています（実績較正済みの係数）。実際のポーチ面積と異なる場合は「見積修正」タブで調整してください。")
     balcony_area = cad_data.room_area_by_type("全階", BALCONY_ROOMS)
     has_balcony = balcony_area > 0
     doma_area = cad_data.room_area_by_type("全階", DOMA_ROOMS)   # 玄関・SIC等の土間床
@@ -229,8 +249,11 @@ def calculate_estimate(cad_data: CADData, prices: dict,
              + cad_data.room_area_by_type("2階", DOMA_ROOMS))
     floor2_flooring = max(0.0, floor2_area - excl2)
 
-    # 施工床面積（部屋＋バルコニー＋ポーチ）
-    sekou_area = total_area + balcony_area + porch_area
+    # 施工床面積: CAD面積表の実測値（H000405）を優先し、
+    # 無い場合は 延床＋バルコニー＋ポーチ で概算する
+    sekou_area = cad_data.construction_floor_area()
+    if sekou_area <= 0:
+        sekou_area = total_area + balcony_area + porch_area
     sekou_tsubo = sekou_area / TSUBO
 
     # ===== 部屋数カウント =====
@@ -262,25 +285,42 @@ def calculate_estimate(cad_data: CADData, prices: dict,
     daidokoro_count = max(cad_data.room_count("全階", ["台所", "キッチン"]),
                           ldk_count)
 
-    # ===== 外皮の概算 =====
-    # 外壁面積（開口含む）: 各階外周 × 階高2.9m。2階外周は床面積比の平方根で縮小
-    if is_two_story and floor1_area > 0:
-        upper_perimeter = min(perimeter,
-                              perimeter * math.sqrt(floor2_area / floor1_area))
-        ext_wall_area = (perimeter + upper_perimeter) * 2.9
-    else:
-        ext_wall_area = perimeter * 3.0
+    # ===== 外皮 =====
+    # CADの平面図・屋根伏図実測値を最優先し、無い場合のみ概算式を使う
+
+    # 外壁面積: F000140「外壁 面積(軒天考慮)」（積算データと一致する実測値）
+    ext_wall_area = cad_data.agg("F000140")
+    if ext_wall_area <= 0:
+        # 概算: 各階外周 × 階高2.9m。2階外周は床面積比の平方根で縮小
+        if is_two_story and floor1_area > 0:
+            upper_perimeter = min(perimeter,
+                                  perimeter * math.sqrt(floor2_area / floor1_area))
+            ext_wall_area = (perimeter + upper_perimeter) * 2.9
+        else:
+            ext_wall_area = perimeter * 3.0
     # 妻壁面積（切妻の場合、勾配4寸想定）
     gable_area = (maguchi ** 2) * 0.2 if (is_gable and maguchi > 0) else 0.0
 
-    # 屋根面積 = 建築面積 × 1.3（軒の出・勾配伸び分）
-    roof_area = footprint * 1.3
+    # 屋根面積: Y000181（屋根伏図実測）→ 建築面積×1.3 の順
+    roof_area = cad_data.agg("Y000181")
+    if roof_area <= 0:
+        roof_area = footprint * 1.3
 
-    # 軒先・ケラバ長さ（屋根伏図データが無いため外周から概算）
-    eaves_length = perimeter * 0.86                # 軒先（軒樋）長さ
-    keraba_length = perimeter * (0.75 if is_gable else 0.15)
+    # 軒先・軒樋・ケラバ長さ: 屋根伏図実測（Y000151軒先長・Y000540軒樋長）を優先
+    eaves_length = cad_data.agg("Y000151")
+    if eaves_length <= 0:
+        eaves_length = perimeter * 0.86
+    gutter_length = cad_data.agg("Y000540")        # 軒樋 長（実測）
+    if gutter_length <= 0:
+        gutter_length = eaves_length
+    keraba_length = cad_data.agg("Y000152")        # 屋根線(けらば) 長
+    if keraba_length <= 0:
+        keraba_length = perimeter * (0.75 if is_gable else 0.15)
     roof_edge_length = eaves_length + keraba_length  # 軒＋ケラバ
-    soffit_area = roof_edge_length * 0.56          # 軒天面積
+    # 軒天面積: Y000191実測 → 軒長×0.56 概算
+    soffit_area = cad_data.agg("Y000191")
+    if soffit_area <= 0:
+        soffit_area = roof_edge_length * 0.56
 
     # ===== 入隅・巾木 =====
     dezumi_sum = cad_data.sum_quantity("N000081")  # 部屋出隅の合計
@@ -312,12 +352,13 @@ def calculate_estimate(cad_data: CADData, prices: dict,
     else:
         estimate.warnings.append(
             "瓦屋根（条件01=0）で計算しています。実際が鋼板屋根の場合は「見積修正」タブで屋根工事を修正してください。")
-    if cond04 == 1:
+    if include_solar:
         estimate.warnings.append(
-            "太陽光発電システム工事を参考単価（長州産業5.09kw相当）で計上しています。パネル枚数・kW数により変動するため、確定見積で必ず調整してください。")
+            "太陽光発電システム工事を参考単価（長州産業5.09kw相当・約98万円）で計上しています。パネル枚数・kW数・リース方式（建て得）により変動するため、確定見積で必ず調整してください。")
     else:
         estimate.warnings.append(
-            "条件04=0のため太陽光発電システム工事・太陽光対応分電盤・HEMSは未計上です。採用する場合は「見積修正」タブで追加してください。")
+            "太陽光発電は未計上です（採用時はサイドバーの「太陽光発電を含める」をON。参考: 本体+分電盤で約100万円、実績では機種により約220万円の事例あり）。"
+            + ("※CAD条件04=1（太陽光あり）が設定されています。採用有無をご確認ください。" if cond04 == 1 else ""))
     if cond03 == 1:
         estimate.warnings.append(
             "IH採用（条件03=1）のためガス工事は未計上です。ガス併用の場合は「見積修正」タブの23.屋外付帯工事から追加してください。")
@@ -484,6 +525,10 @@ def calculate_estimate(cad_data: CADData, prices: dict,
         estimate.warnings.append(
             "●33調整分（建材・下地材/大工手間 各475,000円・発注0円）を計上しています。除外する場合はサイドバーのオプションを外してください。")
 
+    # 打合せ造作の概算含み: CADに現れない造作（下がり天井・ニッチ・垂れ壁・
+    # 造作枠等）が8物件全てで発生しており、実績中央値ベースで概算計上する
+    add_item(cat03, 30099, prices, 1, category="大工手間")
+
     estimate.categories.append(cat03)
 
     # ===== 04 断熱工事 =====
@@ -524,7 +569,7 @@ def calculate_estimate(cad_data: CADData, prices: dict,
     # ===== 06 板金・樋工事 =====
     cat06 = WorkCategory(no=6, name="板金・樋工事")
 
-    add_item(cat06, 60001, prices, eaves_length)               # 軒樋
+    add_item(cat06, 60001, prices, gutter_length)              # 軒樋
     catcher_count = math.ceil(roof_area / 45) + 2              # 集水器（下屋・バルコニー分含む）
     add_item(cat06, 60002, prices, catcher_count)
     downspout_length = catcher_count * (6 if is_two_story else 3.5)
@@ -581,8 +626,16 @@ def calculate_estimate(cad_data: CADData, prices: dict,
         add_item(cat08, 80023, prices, 2)
         add_item(cat08, 80024, prices, 2)
 
+    # 建具グレードアップ差額（概算）: 8物件の実績検証で全物件がラフィス等の
+    # 上位グレードを採用しており、標準グレード計上との差額中央値が
+    # 約15,000円/セットだったため、建具本数分を概算で上乗せする
+    int_fitting_sets = sum(int(f.quantities.get("T100001", 1) or 1)
+                           for f in int_fittings)
+    if int_fitting_sets > 0:
+        add_item(cat08, 80035, prices, int_fitting_sets)
+
     estimate.warnings.append(
-        "内部建具は標準グレード（LIXIL ラシッサS）で計上しています。ラフィス等の上位グレード採用時は差額が発生します（1本あたり+3〜7万円程度）。")
+        "内部建具は標準グレード＋グレードアップ差額（概算・実績中央値ベース）で計上しています。採用グレード確定時に「見積修正」タブで調整してください。")
 
     estimate.categories.append(cat08)
 
@@ -748,14 +801,17 @@ def calculate_estimate(cad_data: CADData, prices: dict,
     add_item(cat16, 160022, prices, 1)   # インターホン取付費
     add_item(cat16, 160023, prices, 1)   # 幹線引込・分電盤
 
-    # 太陽光対応（条件04）
-    if cond04 == 1:
+    # 太陽光対応（明示指定時のみ。CAD条件04は実仕様と不一致の実例が多い）
+    if include_solar:
         add_item(cat16, 160024, prices, 1)  # 太陽光対応分電盤変更
         add_item(cat16, 160025, prices, 1)  # スマートコスモ分電盤変更
         add_item(cat16, 160026, prices, 1)  # HEMS本体
         add_item(cat16, 160027, prices, 1)  # HEMS設定
 
     add_item(cat16, 160028, prices, 1)   # 電力会社申請
+    # 電気仕様追加分の概算含み: 照明・E付専用回路・コンセント追加等の
+    # 実績差（8物件中央値ベース）を概算計上する
+    add_item(cat16, 160030, prices, 1)
 
     estimate.categories.append(cat16)
 
@@ -795,6 +851,8 @@ def calculate_estimate(cad_data: CADData, prices: dict,
     estimate.categories.append(cat17)
 
     # ===== 18 エアコン工事 =====
+    # 実績見積の標準構成は「LDK用＋主寝室用の2台」（8物件検証で全居室分の
+    # 計上は実績より2〜3割過大だった）。追加台数は見積修正タブで加算する
     cat18 = WorkCategory(no=18, name="エアコン工事")
 
     ac_count = 0
@@ -806,16 +864,19 @@ def calculate_estimate(cad_data: CADData, prices: dict,
             add_item(cat18, 180002, prices, 1)  # 4.0kw
         ac_count += 1
 
-    # 寝室・子供室用（部屋ごとに面積でサイズ選定）
+    # 主寝室用1台（面積でサイズ選定。主寝室が無ければ最大の洋室系1室）
     bedroom_types = ["主寝室", "寝室", "子供室", "洋室", "書斎", "趣味室"]
-    for room in cad_data.rooms:
-        if any(bt in room.name for bt in bedroom_types):
-            room_area = room.quantities.get("N000001", 0.0)
-            if room_area >= 10:
-                add_item(cat18, 180003, prices, 1)  # 2.8kw
-            else:
-                add_item(cat18, 180004, prices, 1)  # 2.2kw
-            ac_count += 1
+    bedrooms = [r for r in cad_data.rooms
+                if any(bt in r.name for bt in bedroom_types)]
+    if bedrooms:
+        main_br = max(bedrooms, key=lambda r: (
+            "主寝室" in r.name or "寝室" in r.name,
+            r.quantities.get("N000001", 0.0)))
+        if main_br.quantities.get("N000001", 0.0) >= 10:
+            add_item(cat18, 180003, prices, 1)  # 2.8kw
+        else:
+            add_item(cat18, 180004, prices, 1)  # 2.2kw
+        ac_count += 1
 
     if ac_count > 0:
         add_item(cat18, 180006, prices, ac_count)   # 無線LANアダプター
@@ -823,19 +884,25 @@ def calculate_estimate(cad_data: CADData, prices: dict,
         add_item(cat18, 180007, prices, 1)          # 延長配管（2階→1階）
 
     estimate.warnings.append(
-        "エアコンは全居室分を計上しています（LDK＋寝室・子供室等）。設置台数は施主様のご意向により変動します。")
+        "エアコンは標準構成（LDK用＋主寝室用の2台）で計上しています。子供室等の追加台数は「見積修正」タブで加算してください。")
 
     estimate.categories.append(cat18)
 
     # ===== 19 太陽光発電システム工事 =====
     cat19 = WorkCategory(no=19, name="太陽光発電システム工事")
-    if cond04 == 1:
+    if include_solar:
         add_item(cat19, 190001, prices, 1)
     estimate.categories.append(cat19)
 
     # ===== 20 造作家具工事 =====
     cat20 = WorkCategory(no=20, name="造作家具工事")
     add_item(cat20, 200001, prices, 1)  # ユーティリティカウンター
+    # 造作収納・カウンター類の概算含み: CADに現れない打合せ造作
+    # （脱衣カウンター・トイレ収納等）が8物件全てで発生しており、
+    # 実績中央値ベースで概算計上する（内訳確定時に見積修正で調整）
+    add_item(cat20, 200010, prices, 1)
+    estimate.warnings.append(
+        "造作家具は「造作収納・カウンター類（概算含み）」を実績中央値ベースで計上しています。TVボード・大型造作等の採用時は追加費用が発生します。")
     estimate.categories.append(cat20)
 
     # ===== 21 雑工事 =====
