@@ -1435,6 +1435,10 @@ def migrate_global_feedbacks(projects: dict, base_dir: str):
         prop = fb.get('property', '')
         target_pid = proj_by_prop.get(prop, first_pid)
         if target_pid:
+            # 旧グローバル形式は本文キーが 'message'。表示側の 'body' に正規化する
+            if 'body' not in fb and 'message' in fb:
+                fb = dict(fb)
+                fb['body'] = fb.pop('message')
             existing = load_project_feedbacks(target_pid)
             existing.append(fb)
             save_project_feedbacks(target_pid, existing)
@@ -1773,7 +1777,7 @@ def main():
             st.caption("💾 データ保存: クラウド永続化 有効")
         else:
             st.caption("⚠️ データ保存: 一時保存（再起動で消える場合があります）")
-        st.caption("build 2026-07-19.2")
+        st.caption("build 2026-07-20.1")
 
     # 単価マスタ読み込み
     csv_path = os.path.join(base_dir, "tankamaster_updated.csv")
@@ -2934,15 +2938,15 @@ def main():
                     f'<div class="feedback-card">'
                     f'<div class="fb-meta">'
                     f'{proj_label}'
-                    f'<span class="fb-category">{fb["category"]}</span>'
+                    f'<span class="fb-category">{fb.get("category", "未分類")}</span>'
                     f'{status_html} {priority_mark} '
-                    f'{fb["timestamp"]}'
+                    f'{fb.get("timestamp", "")}'
                     f'{" / " + fb["name"] if fb.get("name") else ""}'
                     f'{" / " + fb["property"] if fb.get("property") else ""}'
                     f'</div>'
                     f'<div class="fb-body">'
                     f'{"<b>対象:</b> " + fb["target"] + "<br>" if fb.get("target") else ""}'
-                    f'{fb["body"]}'
+                    f'{fb.get("body") or fb.get("message", "")}'
                     f'</div>'
                     f'</div>',
                     unsafe_allow_html=True,
@@ -2983,12 +2987,12 @@ def main():
                 csv_fbs = display_fbs
                 fb_csv_data = "日時,案件名,カテゴリ,対象,内容,優先度,送信者,物件名,ステータス\n"
                 for fb in csv_fbs:
-                    body_escaped = fb['body'].replace('"', '""').replace('\n', ' ')
+                    body_escaped = (fb.get('body') or fb.get('message', '')).replace('"', '""').replace('\n', ' ')
                     target_escaped = fb.get('target', '').replace('"', '""')
                     pname = fb.get('_proj_name', current_pname).replace('"', '""')
                     fb_csv_data += (
-                        f'"{fb["timestamp"]}","{pname}","{fb["category"]}","{target_escaped}",'
-                        f'"{body_escaped}","{fb["priority"]}","{fb.get("name", "")}",'
+                        f'"{fb.get("timestamp", "")}","{pname}","{fb.get("category", "未分類")}","{target_escaped}",'
+                        f'"{body_escaped}","{fb.get("priority", "通常")}","{fb.get("name", "")}",'
                         f'"{fb.get("property", "")}","{fb.get("status", "未対応")}"\n'
                     )
                 st.download_button(
