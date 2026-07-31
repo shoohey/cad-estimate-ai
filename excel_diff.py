@@ -17,9 +17,17 @@ AIが生成した概算見積 (estimate_calculator.Estimate) と、実際に顧�
       * レベル1明細行 … 項目№='N-M'（例 '1-1'）・金額あり ← 種別合計と一致
       * レベル2内訳行 … 項目№='N-M-K'（例 '1-1-1'）… レベル1の内訳。
         サブヘッダ行（'N-M'・金額なし）に続いて現れ、集計すると
-        レベル1と二重計上になるためパース対象から除外する
+        レベル1と二重計上になるため通常は集計しない。ただし内訳を展開した
+        出力（レベル1に金額が無い）では、この行から小計を積み上げて復元する
       * 「合計」行・注記行（※〜）はスキップ
   - 22管理費はサマリ行のみで明細ブロックを持たない
+
+読み取り時の耐性（0円問題への対策）:
+  - 列位置は見出し行のラベルから検出する（列構成が違うファイルにも追随）
+  - 金額欄は数式（=ROUNDDOWN(数量*単価,0)）で、Excelが保存した計算結果の
+    キャッシュを読んでいる。Excel以外のツールを経由してキャッシュを失った
+    ファイルは金額が全て空になるため、数量×単価から再計算して復元する
+  - それでも合計が0円になる場合は取り込まず、原因を添えて ValueError を送出する
 
 依存: openpyxl + 標準ライブラリのみ
 """
@@ -38,7 +46,22 @@ import openpyxl
 
 DETAIL_SHEET_NAME = "明細書"          # 明細を読むシート名
 COVER_SHEET_NAME = "表紙"             # 物件名を読むシート名
-HEADER_SEARCH_ROWS = 10               # ヘッダ行を探す最大行数
+HEADER_SEARCH_ROWS = 30               # ヘッダ行を探す最大行数
+HEADER_SEARCH_COLS = 8                # ヘッダ行を探す最大列数
+
+# 列見出しラベル → 内部キー。見出し行から実際の列位置を検出するために使う
+# （内訳を展開した出力など、列構成が標準と異なるファイルへの耐性）
+_COLUMN_LABELS = {
+    "名称": "name",
+    "摘要": "summary", "備考": "summary",
+    "見積数量": "quantity", "数量": "quantity",
+    "単位": "unit",
+    "見積単価": "price", "単価": "price",
+    "見積金額": "amount", "金額": "amount",
+}
+# 見出しが読めなかった場合の既定列（標準の提出見積フォーマット A〜G列）
+_DEFAULT_COLUMNS = {"no": 1, "name": 2, "summary": 3,
+                    "quantity": 4, "unit": 5, "price": 6, "amount": 7}
 
 # 明細マッチングのしきい値（過剰マッチより未マッチのほうが良い＝保守的に設定）
 ITEM_MATCH_RATIO = 0.80               # difflib類似度の下限
@@ -46,6 +69,7 @@ ITEM_CONTAIN_MIN_LEN = 4              # 部分一致を認める正規化後の�
 ITEM_CONTAIN_MIN_COVER = 0.6          # 部分一致で短い側が長い側を覆う最低比率
                                       # （「大工手間」⊂「●33調整分（大工手間）」の
                                       #   ような別項目への過剰マッチを防ぐ）
+_FLOAT_EPS = 1e-6                     # 数量×単価の再計算時に許容する二進小数の誤差
 CATEGORY_MATCH_RATIO = 0.85           # 工事種別名のfuzzyマッチ下限
                                       # （外部建具/内部建具の誤マッチ0.83を弾く）
 
@@ -116,6 +140,91 @@ def _extract_property_name(wb: openpyxl.Workbook) -> str:
     return ""
 
 
+def _detect_layout(ws) -> dict:
+    """明細シートの見出し行と各列の位置を検出する。
+
+    「項目№」ラベルのあるセルを起点に、同じ行の見出し文字列
+    （名称/摘要/見積数量/単位/見積単価/見積金額）から列位置を割り出す。
+    見出しが読めない列は標準フォーマットの既定列で補う。
+
+    Returns:
+        dict: {'header_row': int, 'no': int, 'name': int, ...} の列番号マップ。
+
+    Raises:
+        ValueError: 「項目№」見出し行が見つからない場合。
+    """
+    header_row = 0
+    no_col = 0
+    for r in range(1, HEADER_SEARCH_ROWS + 1):
+        for c in range(1, HEADER_SEARCH_COLS + 1):
+            if _normalize_name(ws.cell(row=r, column=c).value).startswith("項目"):
+                header_row, no_col = r, c
+                break
+        if header_row:
+            break
+    if not header_row:
+        raise ValueError(
+            f"「{DETAIL_SHEET_NAME}」シートに項目№の見出し行が見つかりません"
+            f"（{HEADER_SEARCH_ROWS}行×{HEADER_SEARCH_COLS}列まで探索）")
+
+    layout = dict(_DEFAULT_COLUMNS)
+    layout["no"] = no_col
+    found: dict[str, int] = {}
+    for c in range(1, ws.max_column + 1):
+        label = _cell_str(ws.cell(row=header_row, column=c).value)
+        key = _COLUMN_LABELS.get(label)
+        # 同じ意味の見出しが複数あるときは最初の1つを採用する
+        if key and key not in found:
+            found[key] = c
+    layout.update(found)
+    layout["header_row"] = header_row
+    return layout
+
+
+def _has_formula_amounts(file_bytes: bytes, amount_col: int) -> bool:
+    """金額列に「計算結果が保存されていない数式」が入っているかを判定する。
+
+    openpyxl は data_only=True のとき Excel が保存したキャッシュ値を読む。
+    Excel以外のツールが書き出したブックはキャッシュを持たないため、数式セルが
+    すべて None として読まれ、結果として金額が全て0になる。その識別に使う。
+    """
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=False)
+        if DETAIL_SHEET_NAME not in wb.sheetnames:
+            return False
+        ws = wb[DETAIL_SHEET_NAME]
+        for row in ws.iter_rows(min_col=amount_col, max_col=amount_col):
+            for cell in row:
+                if isinstance(cell.value, str) and cell.value.startswith("="):
+                    return True
+    except Exception:  # noqa: BLE001 - 診断用のため失敗しても致命ではない
+        return False
+    return False
+
+
+def _zero_amount_reason(file_bytes: bytes, ws, layout: dict,
+                        n_summary: int, n_item_cats: int) -> str:
+    """税抜合計が0円になった原因を推定し、利用者向けの説明文を組み立てる。"""
+    col_letter = openpyxl.utils.get_column_letter(layout["amount"])
+    head = (f"実績見積の金額を1件も読み取れませんでした（税抜合計が0円）。"
+            f"見出し行={layout['header_row']}行目 / 金額列={col_letter}列 / "
+            f"サマリ行{n_summary}件・明細のある種別{n_item_cats}件。")
+    if _has_formula_amounts(file_bytes, layout["amount"]):
+        return (head + " 金額欄が計算式のままで計算結果がファイルに保存されていません。"
+                "Excelで開いて上書き保存（または値貼り付け）してから、"
+                "もう一度取り込んでください。")
+    # 金額列に数値が1つも無い場合は列の取り違えを疑う
+    for row in ws.iter_rows(min_row=layout["header_row"] + 1,
+                            min_col=layout["amount"], max_col=layout["amount"]):
+        for cell in row:
+            if isinstance(cell.value, (int, float)) and not isinstance(cell.value, bool):
+                return (head + " 金額の数値はありますが、項目№の並びが想定と異なるため"
+                        "集計できませんでした。お手数ですがこのファイルをご共有ください。")
+    return (head + f" 金額列（{col_letter}列）に数値が見つかりません。"
+            "列構成が標準の提出見積と異なる可能性があります。"
+            "お手数ですがこのファイルをご共有ください。")
+
+
 def _similarity(a: str, b: str) -> float:
     """正規化済み文字列同士の類似度スコアを返す。
 
@@ -160,88 +269,164 @@ def parse_actual_estimate(file_bytes: bytes) -> dict:
             }
 
     Raises:
-        ValueError: 「明細書」シートが存在しない、またはヘッダ行が見つからない場合。
+        ValueError: 「明細書」シートが存在しない／見出し行が見つからない場合、
+            または金額を1件も読み取れず税抜合計が0円になった場合
+            （原因の推定を含むメッセージを添える）。
     """
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
     if DETAIL_SHEET_NAME not in wb.sheetnames:
         raise ValueError(f"シート「{DETAIL_SHEET_NAME}」が見つかりません: {wb.sheetnames}")
     ws = wb[DETAIL_SHEET_NAME]
 
-    # --- ヘッダ行（項目№/名称/...）を探す ---
-    header_row = 0
-    for r in range(1, HEADER_SEARCH_ROWS + 1):
-        label = _normalize_name(ws.cell(row=r, column=1).value)
-        if label.startswith("項目"):
-            header_row = r
-            break
-    if header_row == 0:
-        raise ValueError("「明細書」シートに項目№ヘッダ行が見つかりません")
+    # --- ヘッダ行と列位置を検出する ---
+    layout = _detect_layout(ws)
+    header_row = layout["header_row"]
+    col_no, col_name, col_amount = layout["no"], layout["name"], layout["amount"]
 
     warnings: list[str] = []
     summary: dict[int, dict[str, Any]] = {}   # {種別no: {'name','total'}}
-    items_by_cat: dict[int, list[dict]] = {}  # {種別no: [明細dict]}
+    items_by_cat: dict[int, list[dict]] = {}  # {種別no: [明細dict]}（レベル1・金額あり）
+    # 内訳を展開した出力（レベル1に金額が無くレベル2にのみ金額がある形式）への対応。
+    # レベル1が金額を持つ通常形式では未使用のまま捨てられる。
+    sub_names: dict[str, str] = {}            # {'N-M': サブヘッダ行の名称}
+    subitems: dict[str, list[dict]] = {}      # {'N-M': [レベル2明細dict]}
+    level1_with_amount: set[str] = set()      # 金額を持つレベル1の項目№
+    cat_names: dict[int, str] = {}            # {種別no: 明細部ヘッダ行の名称}
     rounding_adjustment = 0
     tax = 0
     total_incl_tax = 0
     in_detail = False  # False=サマリ部 / True=明細部
 
+    recomputed = 0  # 数量×単価から金額を再計算した行数
+
+    def _amount_of(row: int) -> tuple[int, bool]:
+        """行の金額と「金額として使えるか」を返す。
+
+        提出見積の金額欄は数式（=ROUNDDOWN(数量*単価,0)）で、Excelが保存した
+        計算結果のキャッシュを読んでいる。Excel以外のツールを経由したファイルは
+        このキャッシュを持たず全額が空になるため、数量と単価が数値で読めるときは
+        そこから金額を再計算する（見出し行・小計行は数量も単価も空なので対象外）。
+        """
+        nonlocal recomputed
+        raw = ws.cell(row=row, column=col_amount).value
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            return int(round(raw)), True
+        qty = ws.cell(row=row, column=layout["quantity"]).value
+        price = ws.cell(row=row, column=layout["price"]).value
+        if (isinstance(qty, (int, float)) and not isinstance(qty, bool)
+                and isinstance(price, (int, float)) and not isinstance(price, bool)):
+            value = qty * price
+            # ExcelのROUNDDOWNは0方向への切り捨て。
+            # 62.02*28200 が 1748963.9999… になるような二進小数の誤差で
+            # 1円ずれるのを防ぐため、微小な許容差を入れてから切り捨てる。
+            recomputed += 1
+            adjusted = value + _FLOAT_EPS if value >= 0 else value - _FLOAT_EPS
+            return int(adjusted), True
+        return 0, False
+
+    def _read_item(row: int, name: str, amount: int) -> dict:
+        """明細行を辞書化する（列位置は検出済みレイアウトに従う）。"""
+        return {
+            "name": name,
+            "summary": _cell_str(ws.cell(row=row, column=layout["summary"]).value),
+            "quantity": _to_float(ws.cell(row=row, column=layout["quantity"]).value),
+            "unit": _cell_str(ws.cell(row=row, column=layout["unit"]).value),
+            "price": _to_int(ws.cell(row=row, column=layout["price"]).value),
+            "amount": amount,
+        }
+
     for r in range(header_row + 1, ws.max_row + 1):
-        no_raw = _cell_str(ws.cell(row=r, column=1).value)
-        name = _cell_str(ws.cell(row=r, column=2).value)
-        amount_raw = ws.cell(row=r, column=7).value
-        has_amount = isinstance(amount_raw, (int, float)) and not isinstance(amount_raw, bool)
+        no_raw = _cell_str(ws.cell(row=r, column=col_no).value)
+        name = _cell_str(ws.cell(row=r, column=col_name).value)
 
         if not no_raw and not name:
             continue  # 空行
 
+        amount, has_amount = _amount_of(r)
+
         # 項目№なし行: 消費税等・総合計・注記など
         if not no_raw:
             if "消費税" in name:
-                tax = _to_int(amount_raw)
+                tax = amount
             elif name == "総合計":
-                total_incl_tax = _to_int(amount_raw)
+                total_incl_tax = amount
                 in_detail = True  # 総合計以降が明細部
             # 「合計」行・「※〜」注記行はスキップ
             continue
 
         if _RE_CAT_NO.fullmatch(no_raw):
-            if has_amount:
-                # サマリ行（金額あり）。「端数値引き」等の調整行は種別から分離する
+            # サマリ部（総合計より前）の種別行だけを合計として採用する。
+            # 明細部の種別ヘッダをサマリとして拾うと、金額を再計算したときに
+            # 正しい合計を0円で上書きしてしまうため。
+            if has_amount and not in_detail:
+                # 「端数値引き」等の調整行は種別から分離する
                 if "値引" in name or "端数" in name:
-                    rounding_adjustment += _to_int(amount_raw)
+                    rounding_adjustment += amount
                 else:
-                    summary[int(no_raw)] = {"name": name, "total": _to_int(amount_raw)}
+                    summary[int(no_raw)] = {"name": name, "total": amount}
             else:
-                # 明細部の種別ヘッダ行（金額なし）
+                # 明細部の種別ヘッダ行
                 in_detail = True
+                cat_names.setdefault(int(no_raw), name)
             continue
 
         if in_detail and _RE_ITEM_NO.fullmatch(no_raw):
             if not has_amount:
-                continue  # レベル2内訳のサブヘッダ行（'N-M'・金額なし）
+                # レベル2内訳のサブヘッダ行（'N-M'・金額なし）。
+                # 展開形式ではここが唯一の名称の出どころになるため控えておく
+                sub_names.setdefault(no_raw, name)
+                continue
             cat_no = int(no_raw.split("-")[0])
-            items_by_cat.setdefault(cat_no, []).append({
-                "name": name,
-                "summary": _cell_str(ws.cell(row=r, column=3).value),
-                "quantity": _to_float(ws.cell(row=r, column=4).value),
-                "unit": _cell_str(ws.cell(row=r, column=5).value),
-                "price": _to_int(ws.cell(row=r, column=6).value),
-                "amount": _to_int(amount_raw),
-            })
+            items_by_cat.setdefault(cat_no, []).append(_read_item(r, name, amount))
+            level1_with_amount.add(no_raw)
             continue
 
-        # レベル2内訳行（'N-M-K'）は二重計上になるため集計しない
+        # レベル2内訳行（'N-M-K'）。通常形式ではレベル1と二重計上になるため
+        # 集計しないが、親のレベル1に金額が無い場合の復元用に保持する
         if _RE_SUBITEM_NO.fullmatch(no_raw):
+            if has_amount:
+                parent = "-".join(no_raw.split("-")[:2])
+                subitems.setdefault(parent, []).append(_read_item(r, name, amount))
             continue
+
+    # --- 展開形式の復元: レベル1に金額が無い親をレベル2の合計で補う ---
+    rolled_up = 0
+    for parent, children in subitems.items():
+        cat_no = int(parent.split("-")[0])
+        # 同じ項目№のレベル1明細が金額付きで存在するなら二重計上になるため使わない
+        # （通常形式では全ての親が該当するので、この復元は一切動かない）
+        if parent in level1_with_amount:
+            continue
+        items_by_cat.setdefault(cat_no, []).append({
+            "name": sub_names.get(parent, "") or (children[0]["name"] if children else parent),
+            "summary": "",
+            "quantity": 1.0,
+            "unit": "式",
+            "price": sum(c["amount"] for c in children),
+            "amount": sum(c["amount"] for c in children),
+        })
+        rolled_up += 1
+    if rolled_up:
+        warnings.append(
+            f"内訳を展開した形式と判断し、{rolled_up}件の小計を内訳から積み上げて復元しました")
+
+    if recomputed:
+        warnings.append(
+            f"金額欄の計算結果がファイルに保存されていないため、"
+            f"数量×単価から{recomputed}件を再計算しました"
+            f"（端数処理の都合で数円の差が出る場合があります）")
 
     # --- 種別リストを構築（サマリ部を正とし、明細を紐付ける）---
+    # 種別名は明細部の種別ヘッダ行からも拾えるようにする（サマリ部が読めない
+    # ファイルでも「種別1」のような仮名称にならないようにするため）
     categories: list[dict] = []
     for cat_no in sorted(set(summary) | set(items_by_cat)):
         info = summary.get(cat_no, {})
         items = items_by_cat.get(cat_no, [])
         total = _to_int(info.get("total", 0)) if info else sum(i["amount"] for i in items)
-        name = info.get("name", "") or (f"種別{cat_no}")
-        if not info:
+        name = info.get("name", "") or cat_names.get(cat_no, "") or f"種別{cat_no}"
+        if not info and summary:
+            # サマリ部そのものが読めていない場合は種別ごとに警告を出さない
             warnings.append(f"種別{cat_no}「{name}」はサマリ部に存在しません（明細のみ）")
         # 整合チェック: レベル1明細の合計 = サマリ金額
         if items and info:
@@ -253,6 +438,14 @@ def parse_actual_estimate(file_bytes: bytes) -> dict:
                 )
         categories.append({"no": cat_no, "name": name, "total": total, "items": items})
 
+    # 金額0円の種別は読み取り漏れの可能性が高い（実際の見積で0円の種別は稀）
+    zero_cats = [c["name"] for c in categories if c["total"] == 0]
+    if zero_cats:
+        warnings.append(
+            "金額が0円として読み取られた工事種別があります: "
+            + " / ".join(zero_cats[:8])
+            + "（実際に0円でない場合は、Excelで開いて上書き保存してからお試しください）")
+
     # --- 総額の確定と整合チェック ---
     category_sum = sum(c["total"] for c in categories)
     total_excl_tax = category_sum + rounding_adjustment  # 提出値（端数値引き込み）
@@ -263,6 +456,13 @@ def parse_actual_estimate(file_bytes: bytes) -> dict:
         )
     if not total_incl_tax:
         total_incl_tax = total_excl_tax + tax
+
+    # --- 0円ガード ---
+    # 金額が1円も読めなかったファイルを「0円の実績見積」として取り込むと、
+    # 差分画面が丸ごと誤った数字になる。取り込まずに原因を伝えて中断する。
+    if total_excl_tax <= 0:
+        raise ValueError(_zero_amount_reason(file_bytes, ws, layout,
+                                             len(summary), len(items_by_cat)))
 
     return {
         "property_name": _extract_property_name(wb),
@@ -328,43 +528,130 @@ def _match_categories(ai_cats: list, actual_cats: list) -> list[tuple]:
     return pairs
 
 
-def _match_items(ai_items: list, actual_items: list) -> dict:
+def _ai_items_to_dicts(ai_items: list) -> list[dict]:
+    """AI見積の明細オブジェクトを比較用の辞書に揃える。"""
+    return [{
+        "name": it.name,
+        "summary": _cell_str(getattr(it, "summary", "")),
+        "quantity": _to_float(getattr(it, "quantity", 0)),
+        "unit": _cell_str(getattr(it, "unit", "")),
+        "amount": int(it.estimate_amount),
+    } for it in ai_items]
+
+
+def _match_keys(item: dict) -> tuple[str, str]:
+    """明細の照合キー（名称のみ／名称＋摘要）を正規化して返す。"""
+    name = _cell_str(item.get("name"))
+    summary = _cell_str(item.get("summary"))
+    return _normalize_name(name), _normalize_name(name + summary)
+
+
+def _item_similarity(ai: dict, ac: dict) -> float:
+    """名称・摘要の組み合わせで最も高い類似度を返す。
+
+    実績見積は「名称=鋼板屋根 / 摘要=荷揚げ費」と列を分けて書くのに対し、
+    AI側は「鋼板屋根　荷揚げ費」と名称に含めることがある。名称だけで比べると
+    同じ項目が別物として扱われるため、摘要を連結した表記どうしも突き合わせる。
+    """
+    ai_name, ai_full = _match_keys(ai)
+    ac_name, ac_full = _match_keys(ac)
+    return max(
+        _similarity(ai_name, ac_name),
+        _similarity(ai_full, ac_full),
+        _similarity(ai_name, ac_full),
+        _similarity(ai_full, ac_name),
+    )
+
+
+def _rollup_items(items: list[dict]) -> list[dict]:
+    """同一名称・同一単位の明細を1行に集約する。
+
+    CADの建具リストは同じ製品でも1本ずつ別行で出てくるため、そのまま並べると
+    実績見積（同じ製品を1行にまとめて数量で表す）と1対1に対応せず、
+    同じ品名が何行も並んで重複計上のように見えてしまう。
+    比較の粒度を実績側に合わせるため、数量・金額を合算して1行にまとめる。
+    金額の合計は変わらないので、総額・種別合計には影響しない。
+    """
+    merged: dict[tuple, dict] = {}
+    order: list[tuple] = []
+    for it in items:
+        # 摘要までキーに含める（同じ名称でも摘要が違えば別の項目として扱う）
+        key = (_match_keys(it)[1], _cell_str(it.get("unit", "")))
+        cur = merged.get(key)
+        if cur is None:
+            merged[key] = {
+                "name": it["name"],
+                "summary": _cell_str(it.get("summary", "")),
+                "quantity": _to_float(it.get("quantity", 0)),
+                "unit": _cell_str(it.get("unit", "")),
+                "amount": int(it["amount"]),
+                "rows": 1,
+            }
+            order.append(key)
+        else:
+            cur["quantity"] += _to_float(it.get("quantity", 0))
+            cur["amount"] += int(it["amount"])
+            cur["rows"] += 1
+    return [merged[k] for k in order]
+
+
+def _match_items(ai_items: list[dict], actual_items: list[dict]) -> dict:
     """種別内の明細同士を名称類似度で対応付ける。
 
+    引数はいずれも _rollup_items() で集約済みの辞書リスト。
     完全一致 → 部分一致（正規化後4文字以上）→ difflib類似度0.80以上の順で
     スコアリングし、スコア降順の貪欲法で1対1に確定する。
     しきい値未満は無理にマッチさせない（保守的）。
     """
     scored = []
     for i, ai in enumerate(ai_items):
-        norm_ai = _normalize_name(ai.name)
         for j, ac in enumerate(actual_items):
-            score = _similarity(norm_ai, _normalize_name(ac["name"]))
-            if score >= ITEM_MATCH_RATIO:
-                scored.append((score, i, j))
+            score = _item_similarity(ai, ac)
+            if score < ITEM_MATCH_RATIO:
+                continue
+            # 同名でも単位・数量が揃う組を優先する（換気システムのように
+            # 同じ品名が単位違いで並ぶ種別で、並び順任せの対応付けを避ける）。
+            # 加点は順位付けだけに使い、マッチ可否の判定には使わない。
+            rank = score
+            if _cell_str(ai.get("unit")) == _cell_str(ac.get("unit")):
+                rank += 0.002
+            if abs(_to_float(ai.get("quantity")) - _to_float(ac.get("quantity"))) < 1e-6:
+                rank += 0.001
+            scored.append((rank, i, j))
 
     matched = []
     used_ai: set[int] = set()
     used_actual: set[int] = set()
-    for score, i, j in sorted(scored, key=lambda t: -t[0]):
+    for _rank, i, j in sorted(scored, key=lambda t: -t[0]):
         if i in used_ai or j in used_actual:
             continue
         ai, ac = ai_items[i], actual_items[j]
         matched.append({
-            "ai_name": ai.name,
+            "ai_name": ai["name"],
             "actual_name": ac["name"],
-            "ai_amount": int(ai.estimate_amount),
+            "ai_summary": ai.get("summary", ""),
+            "actual_summary": ac.get("summary", ""),
+            "ai_amount": int(ai["amount"]),
             "actual_amount": int(ac["amount"]),
-            "diff": int(ai.estimate_amount) - int(ac["amount"]),
+            "diff": int(ai["amount"]) - int(ac["amount"]),
+            "ai_quantity": ai["quantity"],
+            "actual_quantity": ac["quantity"],
+            "unit": ai.get("unit") or ac.get("unit", ""),
+            "ai_rows": ai.get("rows", 1),
         })
         used_ai.add(i)
         used_actual.add(j)
 
-    ai_only = [{"name": ai.name, "amount": int(ai.estimate_amount)}
-               for i, ai in enumerate(ai_items) if i not in used_ai]
-    actual_only = [{"name": ac["name"], "amount": int(ac["amount"])}
-                   for j, ac in enumerate(actual_items) if j not in used_actual]
-    return {"matched": matched, "ai_only": ai_only, "actual_only": actual_only}
+    def _side(items: list[dict], used: set[int]) -> list[dict]:
+        return [{"name": it["name"], "amount": int(it["amount"]),
+                 "summary": it.get("summary", ""),
+                 "quantity": it["quantity"], "unit": it.get("unit", ""),
+                 "rows": it.get("rows", 1)}
+                for k, it in enumerate(items) if k not in used]
+
+    return {"matched": matched,
+            "ai_only": _side(ai_items, used_ai),
+            "actual_only": _side(actual_items, used_actual)}
 
 
 # --- 公開 API: 差分計算 ---------------------------------------------------
@@ -417,8 +704,11 @@ def diff_estimates(estimate, actual: dict) -> dict:
             "rate": cat_diff / actual_total if actual_total else 0.0,
         })
         # 明細差分（どちらか一方しか無い種別も ai_only / actual_only で表現）
-        ai_items = list(ai_cat.items) if ai_cat is not None else []
-        actual_items = list(actual_cat["items"]) if actual_cat is not None else []
+        # 双方とも同一名称の明細を1行に集約してから突合する（粒度合わせ）
+        ai_items = _rollup_items(
+            _ai_items_to_dicts(ai_cat.items)) if ai_cat is not None else []
+        actual_items = _rollup_items(
+            list(actual_cat["items"])) if actual_cat is not None else []
         if ai_items or actual_items:
             item_diffs[cat_name] = _match_items(ai_items, actual_items)
 

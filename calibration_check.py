@@ -24,6 +24,9 @@ import excel_diff
 
 CALIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibration")
 
+# app.py の DEFAULT_SAFETY_RATE_PCT と揃えること（本番の既定値）
+DEFAULT_SAFETY_RATE = 0.05
+
 
 def iter_pairs():
     """(pid, 物件名, 数量TXTパス, 提出見積xlsxパス) を列挙する"""
@@ -41,8 +44,9 @@ def run_all(save_path: str | None = None) -> dict:
     prices = load_unit_prices(
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "tankamaster_updated.csv"))
     report = {}
-    print(f"{'物件':<14} {'坪数':>6} {'AI見積':>12} {'実績':>12} {'乖離':>7}")
+    print(f"{'物件':<14} {'坪数':>6} {'AI見積':>12} {'実績':>12} {'安全率なし':>8} {'既定(+5%)':>8}")
     rates = []
+    raw_rates = []
     for pid, pname, sf, xlsx in iter_pairs():
         try:
             cad = load_cad_file(sf)
@@ -51,16 +55,25 @@ def run_all(save_path: str | None = None) -> dict:
             # 合わせて include_solar=True 側で比較する
             solar = any('太陽光' in c['name'] and c['total'] > 0
                         for c in actual['categories'])
-            est = calculate_estimate(cad, prices, include_solar=solar)
+            # 本番の既定設定（造作家具の概算含みOFF・概算安全率+5%）で測る。
+            # 素のエンジン精度も併記して、安全率の寄与を分けて見られるようにする。
+            est_raw = calculate_estimate(cad, prices, include_solar=solar)
+            est = calculate_estimate(cad, prices, include_solar=solar,
+                                     safety_rate=DEFAULT_SAFETY_RATE)
             diff = excel_diff.diff_estimates(est, actual)
+            raw_rate = ((est_raw.total_estimate_excl_tax - diff['total_actual'])
+                        / diff['total_actual'] * 100)
             rate = (diff['total_ai'] - diff['total_actual']) / diff['total_actual'] * 100
             rates.append(rate)
+            raw_rates.append(raw_rate)
             print(f"{pid}-{pname[:9]:<11} {est.total_floor_area_tsubo:>5.1f} "
-                  f"{diff['total_ai']:>12,} {diff['total_actual']:>12,} {rate:>+6.1f}%")
+                  f"{diff['total_ai']:>12,} {diff['total_actual']:>12,} "
+                  f"{raw_rate:>+7.1f}% {rate:>+7.1f}%")
             report[f"{pid}-{pname}"] = {
                 'tsubo': est.total_floor_area_tsubo,
                 'total_ai': diff['total_ai'], 'total_actual': diff['total_actual'],
                 'rate_pct': round(rate, 2),
+                'rate_pct_without_safety': round(raw_rate, 2),
                 'category_diffs': diff['category_diffs'],
             }
         except Exception as exc:  # noqa: BLE001 - 1物件の失敗で全体を止めない
@@ -68,7 +81,11 @@ def run_all(save_path: str | None = None) -> dict:
     if rates:
         mean_abs = sum(abs(r) for r in rates) / len(rates)
         worst = max(rates, key=abs)
-        print(f"\n平均絶対乖離: {mean_abs:.2f}% / 最大乖離: {worst:+.1f}% / 対象 {len(rates)}物件")
+        raw_mean_abs = sum(abs(r) for r in raw_rates) / len(raw_rates)
+        under = sum(1 for r in rates if r < 0)
+        print(f"\n安全率なし: 平均絶対乖離 {raw_mean_abs:.2f}%")
+        print(f"既定(+{DEFAULT_SAFETY_RATE * 100:g}%): 平均絶対乖離 {mean_abs:.2f}% / "
+              f"最大乖離 {worst:+.1f}% / 実績を下回った物件 {under}件 / 対象 {len(rates)}物件")
     if save_path:
         with open(save_path, 'w', encoding='utf-8') as f:
             json.dump(report, f, ensure_ascii=False, indent=1)

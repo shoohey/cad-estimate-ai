@@ -12,7 +12,7 @@ import hashlib
 import re
 import difflib
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill, numbers
 from openpyxl.utils import get_column_letter
@@ -601,7 +601,7 @@ def create_excel_estimate(estimate: Estimate) -> bytes:
     ws_cover['B4'] = '見積番号'
     ws_cover['C4'] = estimate.estimate_no or ''
     ws_cover['B5'] = '提出日'
-    ws_cover['C5'] = datetime.now().strftime('%Y年%m月%d日')
+    ws_cover['C5'] = now_jst().strftime('%Y年%m月%d日')
     ws_cover['B7'] = '施主名'
     ws_cover['C7'] = f'{estimate.owner_name} 様' if estimate.owner_name else ''
     ws_cover['B8'] = '工事名'
@@ -1233,7 +1233,7 @@ def create_client_excel(estimate: Estimate) -> bytes:
     ws_cover['B4'] = '見積番号'
     ws_cover['C4'] = estimate.estimate_no or ''
     ws_cover['B5'] = '提出日'
-    ws_cover['C5'] = datetime.now().strftime('%Y年%m月%d日')
+    ws_cover['C5'] = now_jst().strftime('%Y年%m月%d日')
     ws_cover['B7'] = '施主名'
     ws_cover['C7'] = f'{estimate.owner_name} 様' if estimate.owner_name else ''
     ws_cover['B8'] = '工事名'
@@ -1359,7 +1359,23 @@ def create_client_excel(estimate: Estimate) -> bytes:
     return output.getvalue()
 
 
+# 表示・記録用のタイムスタンプは日本時間で統一する。
+# Streamlit Community Cloud のサーバー時刻はUTCのため、datetime.now() のままでは
+# 履歴やフィードバックの日時が9時間ずれる（顧客からの指摘による修正）。
+JST = timezone(timedelta(hours=9))
+
+
+def now_jst() -> datetime:
+    """現在時刻（日本時間）"""
+    return datetime.now(JST)
+
+
 PROJECTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "projects")
+
+# 概算安全率の既定値（%）。実績8物件の検証で全物件が実績以上になる最小値。
+# 概算は実績より安く出る傾向（安全率0%で平均-2.2%・8物件すべてマイナス）があり、
+# 受注後に足が出るより、概算段階で少し高めに出したいという運用方針による。
+DEFAULT_SAFETY_RATE_PCT = 5.0
 os.makedirs(PROJECTS_DIR, exist_ok=True)
 
 
@@ -1513,6 +1529,27 @@ def save_cad_file(proj_id: str, file_bytes: bytes):
             _warn_cloud_error(exc)
 
 
+def dedupe_feedbacks(fbs: list) -> list:
+    """同じ内容が二重に登録されたフィードバックを1件にまとめる。
+
+    送信ログ(feedbacks.json)を起動時の移行処理が取り込んでいた不具合により、
+    「アプリが記録したもの」と「送信モジュールが記録したもの」が同日に
+    重複して残っている。日付＋カテゴリ＋本文が同じものは同一とみなし、
+    対応状況(status)を持つ側（アプリが記録した方）を残す。
+    """
+    picked: dict[tuple, dict] = {}
+    order: list[tuple] = []
+    for fb in fbs or []:
+        body = (fb.get('body') or fb.get('message') or '').strip()
+        key = ((fb.get('timestamp') or '')[:10], fb.get('category', ''), body)
+        if key not in picked:
+            picked[key] = fb
+            order.append(key)
+        elif 'status' in fb and 'status' not in picked[key]:
+            picked[key] = fb   # 対応状況を持つ側を優先して残す
+    return [picked[k] for k in order]
+
+
 def load_project_feedbacks(proj_id: str) -> list:
     """案件ごとのフィードバックを読み込む（クラウド優先・ローカルフォールバック）
 
@@ -1537,6 +1574,7 @@ def load_project_feedbacks(proj_id: str) -> list:
                 result = json.load(f)
         else:
             result = []
+    result = dedupe_feedbacks(result)
     cache[proj_id] = result
     return result
 
@@ -1552,6 +1590,65 @@ def save_project_feedbacks(proj_id: str, fbs: list):
             cloud_store.put(f"proj:{proj_id}:feedbacks", fbs)
         except cloud_store.CloudStoreError as exc:
             _warn_cloud_error(exc)
+
+
+FEEDBACK_FILE_MAX_CLOUD_BYTES = 5 * 1024 * 1024  # クラウド保存する1ファイルの上限
+
+
+def save_feedback_files(proj_id: str, feedback_id: str, uploads: list) -> list:
+    """フィードバック添付をローカル＋クラウドへ保存し、メタ情報を返す。
+
+    クラウド（Supabase）に置くことで、同じURLを開く全員が後から
+    ダウンロードできる。上限を超えるファイルは保存せず、その旨を残す。
+    """
+    saved = []
+    for idx, up in enumerate(uploads or []):
+        data = up.get('data') or b''
+        meta = {'name': up.get('name', ''), 'size': len(data), 'index': idx}
+        if not data:
+            meta['error'] = 'ファイルの中身を取得できませんでした'
+            saved.append(meta)
+            continue
+        fname = f"{proj_id}_fb_{feedback_id[:8]}_{idx}_{up.get('name', 'file')}"
+        try:
+            with open(os.path.join(PROJECTS_DIR, fname), 'wb') as f:
+                f.write(data)
+            meta['local'] = fname
+        except OSError as exc:
+            meta['error'] = f'ローカル保存に失敗: {exc}'
+        if len(data) > FEEDBACK_FILE_MAX_CLOUD_BYTES:
+            meta['error'] = (f'{FEEDBACK_FILE_MAX_CLOUD_BYTES // (1024 * 1024)}MB超のため'
+                             'クラウド保存は行いません（弊社へのメール添付は送信済み）')
+        elif _cloud_ok():
+            try:
+                cloud_store.put(
+                    f"proj:{proj_id}:fbfile:{feedback_id[:8]}:{idx}",
+                    {'name': up.get('name', ''),
+                     'b64': base64.b64encode(data).decode('ascii')})
+                meta['cloud'] = True
+            except cloud_store.CloudStoreError as exc:
+                _warn_cloud_error(exc)
+        saved.append(meta)
+    return saved
+
+
+def load_feedback_file(proj_id: str, feedback_id: str, meta: dict):
+    """保存済みのフィードバック添付を取り出す（無ければ None）"""
+    local = meta.get('local')
+    if local:
+        path = os.path.join(PROJECTS_DIR, local)
+        if os.path.exists(path):
+            with open(path, 'rb') as f:
+                return f.read()
+    if meta.get('cloud') and _cloud_ok():
+        try:
+            val = cloud_store.get(
+                f"proj:{proj_id}:fbfile:{(feedback_id or '')[:8]}:{meta.get('index', 0)}")
+            if val and val.get('b64'):
+                return base64.b64decode(val['b64'])
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
+    return None
 
 
 def load_all_feedbacks(projects: dict) -> list:
@@ -1593,7 +1690,8 @@ def migrate_global_feedbacks(projects: dict, base_dir: str):
                 fb['body'] = fb.pop('message')
             existing = load_project_feedbacks(target_pid)
             existing.append(fb)
-            save_project_feedbacks(target_pid, existing)
+            # 同じ内容の取り込みを繰り返さないよう、保存前に重複を落とす
+            save_project_feedbacks(target_pid, dedupe_feedbacks(existing))
     os.rename(fb_file, fb_file + ".bak")
 
 
@@ -1714,7 +1812,7 @@ def append_project_changelog(proj_id: str, source: str, summary: str, detail: st
         return
     logs = list(load_project_changelog(proj_id))
     logs.append({
-        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'timestamp': now_jst().strftime('%Y-%m-%d %H:%M:%S'),
         'source': source,
         'summary': summary,
         'detail': detail,
@@ -1807,6 +1905,131 @@ def save_project_actual(proj_id: str, parsed: dict):
             _warn_cloud_error(exc)
 
 
+# ===== 差異理由（実績との差をなぜ生んだかの記録＝学習データ） =====
+
+DIFF_REASON_CATEGORIES = [
+    "",
+    "仕様・グレード差",
+    "数量拾いの差",
+    "AIの計上漏れ",
+    "AIの過大計上",
+    "単価差",
+    "現場条件・特殊要因",
+    "実績側の値引き・調整",
+    "その他",
+]
+DIFF_LIBRARY_KEY = "diff_reason_library"   # 全案件横断の学習ライブラリ
+DIFF_LIBRARY_MAX_ENTRIES = 20              # 1項目あたりの保持件数
+
+
+def diff_note_key(cat_name: str, item_name: str) -> str:
+    """差異理由を項目に紐付けるキー（工事種別＋品名）"""
+    return f"{cat_name}|{item_name}"
+
+
+def load_project_diff_notes(proj_id: str) -> dict:
+    """案件の差異理由を読み込む（クラウド優先・セッションキャッシュ付き）"""
+    cache = st.session_state.setdefault('_diffnote_cache', {})
+    if proj_id in cache:
+        return cache[proj_id]
+    result = None
+    if _cloud_ok():
+        try:
+            result = cloud_store.get(f"proj:{proj_id}:diff_notes")
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
+    if result is None:
+        path = os.path.join(PROJECTS_DIR, f"{proj_id}_diff_notes.json")
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                result = json.load(f)
+        else:
+            result = {}
+    cache[proj_id] = result
+    return result
+
+
+def save_project_diff_notes(proj_id: str, notes: dict):
+    """案件の差異理由を保存（ローカル＋クラウド）"""
+    path = os.path.join(PROJECTS_DIR, f"{proj_id}_diff_notes.json")
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(notes, f, ensure_ascii=False, indent=2)
+    st.session_state.setdefault('_diffnote_cache', {})[proj_id] = notes
+    if _cloud_ok():
+        try:
+            cloud_store.put(f"proj:{proj_id}:diff_notes", notes)
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
+
+
+def load_diff_reason_library() -> dict:
+    """全案件横断の差異理由ライブラリを読み込む（同じ品名の過去の理由を再利用する）"""
+    if '_diff_lib' in st.session_state:
+        return st.session_state['_diff_lib']
+    result = None
+    if _cloud_ok():
+        try:
+            result = cloud_store.get(DIFF_LIBRARY_KEY)
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
+    if result is None:
+        path = os.path.join(PROJECTS_DIR, "diff_reason_library.json")
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                result = json.load(f)
+        else:
+            result = {}
+    st.session_state['_diff_lib'] = result
+    return result
+
+
+def update_diff_reason_library(entries: list):
+    """差異理由をライブラリへ蓄積する（同一項目は新しいものを先頭に最大20件）
+
+    entries: [{'key','item','category','reason','property','diff'}]
+    """
+    if not entries:
+        return
+    lib = dict(load_diff_reason_library())
+    for e in entries:
+        rec = lib.get(e['key']) or {"item": e['item'], "entries": []}
+        rec['item'] = e['item']
+        # 同じ案件・同じ理由の重複は置き換える
+        rec['entries'] = [x for x in rec['entries']
+                          if not (x.get('property') == e['property'])]
+        rec['entries'].insert(0, {
+            'property': e['property'],
+            'category': e['category'],
+            'reason': e['reason'],
+            'diff': e['diff'],
+            'date': now_jst().strftime('%Y-%m-%d'),
+        })
+        rec['entries'] = rec['entries'][:DIFF_LIBRARY_MAX_ENTRIES]
+        lib[e['key']] = rec
+    st.session_state['_diff_lib'] = lib
+    path = os.path.join(PROJECTS_DIR, "diff_reason_library.json")
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(lib, f, ensure_ascii=False, indent=2)
+    if _cloud_ok():
+        try:
+            cloud_store.put(DIFF_LIBRARY_KEY, lib)
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
+
+
+def past_reason_hint(lib: dict, key: str, current_property: str) -> str:
+    """他案件で登録済みの理由を1行に要約する（入力の参考として表示）"""
+    rec = lib.get(key)
+    if not rec:
+        return ""
+    others = [e for e in rec.get('entries', [])
+              if e.get('property') != current_property and e.get('reason')]
+    if not others:
+        return ""
+    return " / ".join(
+        f"{e['reason']}（{e.get('property', '')}）" for e in others[:2])
+
+
 def get_project_state(key: str, default=None):
     """現在の案件のsession_state値を取得"""
     proj_id = st.session_state.get('current_project', '')
@@ -1855,6 +2078,10 @@ def persist_project_mods():
     inc_solar = get_project_state('include_solar')
     if inc_solar is not None:
         data['include_solar'] = inc_solar
+    for opt_key in ('include_custom_furniture', 'miraie_count', 'safety_rate_pct'):
+        opt_val = get_project_state(opt_key)
+        if opt_val is not None:
+            data[opt_key] = opt_val
     equipment = get_project_state('equipment')
     if equipment:
         data['equipment'] = equipment
@@ -1870,6 +2097,93 @@ def persist_project_mods():
             if diff_lines:
                 append_project_changelog(proj_id, '手動修正', ' / '.join(diff_lines[:8]))
         st.session_state[snap_key] = new_snap
+
+
+# ===== 案件のツリー管理（お施主様 > プラン） =====
+
+UNGROUPED_LABEL = "未分類"
+
+
+def project_group(pinfo: dict) -> str:
+    """案件が属するお施主様（グループ）名。未設定なら案件名から推定する。
+
+    「古居徹朗様・古居百恵様邸新築工事」→「古居徹朗様・古居百恵様邸」のように
+    “邸”まで、無ければ“様”までを施主の区切りとみなす。
+    """
+    grp = (pinfo.get('group') or '').strip()
+    if grp:
+        return grp
+    name = (pinfo.get('name') or '').strip()
+    if not name:
+        return UNGROUPED_LABEL
+    for sep in ('邸', '様'):
+        idx = name.rfind(sep)
+        if idx > 0:
+            return name[:idx + len(sep)]
+    return name
+
+
+def project_plan(pinfo: dict) -> str:
+    """案件のプラン名（仕様違いの識別名）。未設定なら空文字。"""
+    return (pinfo.get('plan') or '').strip()
+
+
+def project_tree(projects: dict) -> dict:
+    """{お施主様: [(pid, pinfo), ...]} の形にまとめる（登録順を維持）"""
+    tree: dict[str, list] = {}
+    for pid, pinfo in projects.items():
+        tree.setdefault(project_group(pinfo), []).append((pid, pinfo))
+    return tree
+
+
+def project_label(pinfo: dict) -> str:
+    """一覧・選択欄に出す表示名（プラン名があれば併記）"""
+    plan = project_plan(pinfo)
+    return f"{pinfo.get('name', '')}（{plan}）" if plan else pinfo.get('name', '')
+
+
+def duplicate_project(src_pid: str, projects: dict, plan_name: str) -> str:
+    """案件を複製して別プランを作る（CAD・修正内容・設備選択を引き継ぐ）
+
+    仕様違いの見積を並べて比較するための機能。複製先は同じお施主様に属する。
+    """
+    base = projects.get(src_pid, {})
+    n = 2
+    while f"{src_pid}__plan{n}" in projects:
+        n += 1
+    new_pid = f"{src_pid}__plan{n}"
+
+    # 修正データ（mods・設備選択など）をそのままコピー
+    save_project_data(new_pid, _convert_sets(load_project_data(src_pid)))
+    # CADファイルをコピー
+    cad_bytes = None
+    src_path = os.path.join(PROJECTS_DIR, f"{src_pid}.txt")
+    if os.path.exists(src_path):
+        with open(src_path, 'rb') as f:
+            cad_bytes = f.read()
+    elif _cloud_ok():
+        try:
+            val = cloud_store.get(f"proj:{src_pid}:cad")
+            if val and val.get('b64'):
+                cad_bytes = base64.b64decode(val['b64'])
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
+    if cad_bytes:
+        save_cad_file(new_pid, cad_bytes)
+
+    projects[new_pid] = {
+        'name': base.get('name', ''),
+        'file_name': base.get('file_name', ''),
+        'created': now_jst().strftime('%Y-%m-%d %H:%M'),
+        'group': project_group(base),
+        'plan': plan_name or f"プラン{n}",
+        'copied_from': src_pid,
+    }
+    save_project_list(projects)
+    append_project_changelog(
+        new_pid, 'システム',
+        f"「{project_label(base)}」を複製して作成（プラン: {projects[new_pid]['plan']}）")
+    return new_pid
 
 
 def restore_project_to_session(proj_id: str):
@@ -1894,6 +2208,9 @@ def restore_project_to_session(proj_id: str):
         st.session_state[f"proj_{proj_id}_include_adjustment"] = data['include_adjustment']
     if 'include_solar' in data:
         st.session_state[f"proj_{proj_id}_include_solar"] = data['include_solar']
+    for opt_key in ('include_custom_furniture', 'miraie_count', 'safety_rate_pct'):
+        if opt_key in data:
+            st.session_state[f"proj_{proj_id}_{opt_key}"] = data[opt_key]
     if 'equipment' in data:
         st.session_state[f"proj_{proj_id}_equipment"] = data['equipment']
     # CADデータ復元
@@ -1938,48 +2255,90 @@ def _render_project_list_tab(projects: dict, restore_fn):
         return
 
     current_pid = st.session_state.get('current_project', '')
-    st.markdown(f"登録済み **{len(projects)}** 件")
+    tree = project_tree(projects)
+    st.markdown(f"お施主様 **{len(tree)}** 件 ／ 案件（プラン） **{len(projects)}** 件")
+    st.caption(
+        "同じお施主様の仕様違い（A案・B案など）は「プランを複製」で増やせます。"
+        "案件名・お施主様名・プラン名はいつでも変更できます。")
     st.markdown("")
 
-    for pid, pinfo in projects.items():
-        is_current = (pid == current_pid)
-        border_color = "#2563eb" if is_current else "#e2e8f0"
-        bg = "#eff6ff" if is_current else "#ffffff"
-        badge = '<span style="background:#2563eb;color:#fff;font-size:0.72rem;font-weight:700;padding:2px 10px;border-radius:4px;margin-left:0.5rem;">表示中</span>' if is_current else ''
+    for group_name, members in tree.items():
+        has_current = any(pid == current_pid for pid, _ in members)
+        with st.expander(f"🏠 {group_name}（{len(members)}プラン）", expanded=has_current):
+            for pid, pinfo in members:
+                is_current = (pid == current_pid)
+                border_color = "#2563eb" if is_current else "#e2e8f0"
+                bg = "#eff6ff" if is_current else "#ffffff"
+                badge = ('<span style="background:#2563eb;color:#fff;font-size:0.72rem;'
+                         'font-weight:700;padding:2px 10px;border-radius:4px;margin-left:0.5rem;">'
+                         '表示中</span>') if is_current else ''
+                plan = project_plan(pinfo)
+                plan_badge = (f'<span style="background:#e0f2fe;color:#0c4a6e;font-size:0.72rem;'
+                              f'font-weight:700;padding:2px 10px;border-radius:4px;'
+                              f'margin-left:0.5rem;">{plan}</span>') if plan else ''
+                st.markdown(
+                    f'<div style="background:{bg};border:1.5px solid {border_color};border-radius:10px;'
+                    f'padding:0.8rem 1.2rem;margin-bottom:0.5rem;box-shadow:0 1px 3px rgba(0,0,0,0.04);">'
+                    f'<span style="font-weight:700;font-size:1rem;color:#1e3a5f;">{pinfo["name"]}</span>'
+                    f'{plan_badge}{badge}<br>'
+                    f'<span style="font-size:0.8rem;color:#64748b;">登録: {pinfo.get("created", "-")}'
+                    f'　ファイル: {pinfo.get("file_name", "-")}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+                col_a, col_b, col_c, col_d = st.columns([2, 1.4, 1.4, 1])
+                with col_b:
+                    if not is_current:
+                        if st.button("この案件を開く", key=f"projlist_open_{pid}",
+                                     use_container_width=True, type="primary"):
+                            st.session_state['current_project'] = pid
+                            if get_project_state('cad_data') is None:
+                                restore_fn(pid)
+                            st.rerun()
+                with col_c:
+                    if st.button("プランを複製", key=f"projlist_dup_{pid}",
+                                 use_container_width=True,
+                                 help="同じCADデータ・修正内容のまま、仕様違いの見積を作ります"):
+                        new_pid = duplicate_project(pid, st.session_state['projects'], "")
+                        st.session_state['current_project'] = new_pid
+                        restore_fn(new_pid)
+                        _flash("プランを複製しました。仕様を変更して比較できます。")
+                        st.rerun()
+                with col_d:
+                    if st.button("削除", key=f"projlist_del_{pid}",
+                                 use_container_width=True, type="secondary"):
+                        # CADファイル等（ローカル＋クラウド）も削除
+                        delete_project_storage(pid)
+                        for k in list(st.session_state.keys()):
+                            if k.startswith(f"proj_{pid}_"):
+                                del st.session_state[k]
+                        del st.session_state['projects'][pid]
+                        save_project_list(st.session_state['projects'])
+                        remaining = list(st.session_state['projects'].keys())
+                        st.session_state['current_project'] = remaining[0] if remaining else ''
+                        if st.session_state['current_project']:
+                            restore_fn(st.session_state['current_project'])
+                        st.rerun()
 
-        st.markdown(
-            f'<div style="background:{bg};border:1.5px solid {border_color};border-radius:10px;'
-            f'padding:0.8rem 1.2rem;margin-bottom:0.5rem;box-shadow:0 1px 3px rgba(0,0,0,0.04);">'
-            f'<div style="display:flex;align-items:center;justify-content:space-between;">'
-            f'<div>'
-            f'<span style="font-weight:700;font-size:1rem;color:#1e3a5f;">{pinfo["name"]}</span>{badge}<br>'
-            f'<span style="font-size:0.8rem;color:#64748b;">登録: {pinfo.get("created", "-")}　ファイル: {pinfo.get("file_name", "-")}</span>'
-            f'</div>'
-            f'</div></div>',
-            unsafe_allow_html=True,
-        )
-        col_a, col_b, col_c = st.columns([2, 1, 1])
-        with col_b:
-            if not is_current:
-                if st.button("この案件を開く", key=f"projlist_open_{pid}", use_container_width=True, type="primary"):
-                    st.session_state['current_project'] = pid
-                    if get_project_state('cad_data') is None:
-                        restore_fn(pid)
-                    st.rerun()
-        with col_c:
-            if st.button("削除", key=f"projlist_del_{pid}", use_container_width=True, type="secondary"):
-                # CADファイル等（ローカル＋クラウド）も削除
-                delete_project_storage(pid)
-                for k in list(st.session_state.keys()):
-                    if k.startswith(f"proj_{pid}_"):
-                        del st.session_state[k]
-                del st.session_state['projects'][pid]
-                save_project_list(st.session_state['projects'])
-                remaining = list(st.session_state['projects'].keys())
-                st.session_state['current_project'] = remaining[0] if remaining else ''
-                if st.session_state['current_project']:
-                    restore_fn(st.session_state['current_project'])
-                st.rerun()
+                with st.expander("名前を変更", expanded=False):
+                    with st.form(f"rename_form_{pid}"):
+                        rn_c1, rn_c2, rn_c3 = st.columns(3)
+                        new_name = rn_c1.text_input("案件名", value=pinfo.get('name', ''),
+                                                    key=f"rn_name_{pid}")
+                        new_group = rn_c2.text_input("お施主様（グループ）",
+                                                     value=project_group(pinfo),
+                                                     key=f"rn_grp_{pid}",
+                                                     help="同じ名前にした案件が1つのツリーにまとまります")
+                        new_plan = rn_c3.text_input("プラン名", value=plan,
+                                                    key=f"rn_plan_{pid}",
+                                                    placeholder="例: A-1 標準仕様")
+                        if st.form_submit_button("保存", type="primary"):
+                            pinfo['name'] = new_name.strip() or pinfo.get('name', '')
+                            pinfo['group'] = new_group.strip()
+                            pinfo['plan'] = new_plan.strip()
+                            save_project_list(st.session_state['projects'])
+                            _flash("案件名を変更しました。")
+                            st.rerun()
 
     st.markdown("")
     st.markdown(
@@ -2061,16 +2420,26 @@ def main():
         projects = st.session_state['projects']
 
         if projects:
-            proj_options = list(projects.keys())
-            current_idx = 0
-            if st.session_state['current_project'] in proj_options:
-                current_idx = proj_options.index(st.session_state['current_project'])
+            # お施主様 → プラン の2段で選ぶ（仕様違いを並行して持てるようにするため）
+            tree = project_tree(projects)
+            group_names = list(tree.keys())
+            cur_pid = st.session_state['current_project']
+            cur_group = project_group(projects.get(cur_pid, {})) if cur_pid in projects else group_names[0]
+            selected_group = st.selectbox(
+                "お施主様を選択",
+                group_names,
+                index=group_names.index(cur_group) if cur_group in group_names else 0,
+                key="project_group_selector",
+            )
+            proj_options = [pid for pid, _ in tree.get(selected_group, [])]
+            current_idx = proj_options.index(cur_pid) if cur_pid in proj_options else 0
             selected_proj = st.selectbox(
-                "案件を選択",
+                "案件（プラン）を選択",
                 proj_options,
                 index=current_idx,
-                format_func=lambda x: projects[x]['name'],
+                format_func=lambda x: project_label(projects[x]),
                 key="project_selector",
+                help="同じお施主様で仕様違いの見積を持てます。追加は案件一覧タブの「プランを複製」から。",
             )
             if selected_proj != st.session_state['current_project']:
                 # 現在の案件を保存してから切り替え
@@ -2131,6 +2500,30 @@ def main():
             help="太陽光本体＋対応分電盤＋HEMS一式を計上します。CADの条件フラグは実仕様と食い違う事例が多いため、採用時に手動でONにしてください（参考: 約100万円〜、機種により約220万円）。")
         if st.session_state['current_project']:
             set_project_state('include_solar', include_solar)
+        include_custom_furniture = st.checkbox(
+            "造作家具の概算含みを計上する",
+            value=bool(get_project_state('include_custom_furniture', False)),
+            help="造作収納・カウンター類（脱衣カウンター・トイレ収納等）の概算です。"
+                 "大工・建具屋の手作り特殊品で図面から拾えないため既定はOFFです。"
+                 "採用が決まっている場合のみONにしてください。")
+        if st.session_state['current_project']:
+            set_project_state('include_custom_furniture', include_custom_furniture)
+        miraie_count = st.number_input(
+            "制震ダンパー（ミライエ）本数", min_value=0, max_value=40, step=1,
+            value=int(get_project_state('miraie_count', 0)),
+            help="CAD数量データに制震ダンパーは出力されないため、採用時に本数を指定してください"
+                 "（単価マスター30033・木工事に計上）。0なら計上しません。")
+        if st.session_state['current_project']:
+            set_project_state('miraie_count', miraie_count)
+        safety_rate_pct = st.number_input(
+            "概算安全率（+%）", min_value=0.0, max_value=10.0, step=0.5,
+            value=float(get_project_state('safety_rate_pct', DEFAULT_SAFETY_RATE_PCT)),
+            help="CADに現れない打合せ造作・グレードアップ・現場条件で実績が上振れするため、"
+                 "工事費計に対する予備費を「25 概算調整」として計上します。"
+                 f"実績8物件の検証では+{DEFAULT_SAFETY_RATE_PCT:g}%で全物件が実績以上（+0.9〜+4.2%）になります。"
+                 "0にすると計上しません。")
+        if st.session_state['current_project']:
+            set_project_state('safety_rate_pct', safety_rate_pct)
 
         # 案件保存ボタン
         if st.session_state['current_project']:
@@ -2149,7 +2542,7 @@ def main():
             st.caption("💾 データ保存: クラウド永続化 有効")
         else:
             st.caption("⚠️ データ保存: 一時保存（再起動で消える場合があります）")
-        st.caption("build 2026-07-20.2")
+        st.caption("build 2026-07-31.1")
 
     # 単価マスタ読み込み
     csv_path = os.path.join(base_dir, "tankamaster_updated.csv")
@@ -2176,7 +2569,7 @@ def main():
             st.session_state['projects'][proj_id] = {
                 'name': '古居様邸（サンプル）',
                 'file_name': 'サンプルデータ',
-                'created': datetime.now().strftime('%Y-%m-%d %H:%M'),
+                'created': now_jst().strftime('%Y-%m-%d %H:%M'),
             }
             save_project_list(st.session_state['projects'])
             st.session_state['current_project'] = proj_id
@@ -2215,7 +2608,7 @@ def main():
         st.session_state['projects'][proj_id] = {
             'name': cad_data.property_name or uploaded_file.name,
             'file_name': uploaded_file.name,
-            'created': datetime.now().strftime('%Y-%m-%d %H:%M'),
+            'created': now_jst().strftime('%Y-%m-%d %H:%M'),
         }
         save_project_list(st.session_state['projects'])
         st.session_state['current_project'] = proj_id
@@ -2258,6 +2651,9 @@ def main():
         estimate_no=estimate_no,
         include_adjustment=include_adjustment,
         include_solar=include_solar,
+        safety_rate=safety_rate_pct / 100.0,
+        include_custom_furniture=include_custom_furniture,
+        miraie_count=int(miraie_count),
     )
 
     # 修正の初期化と適用
@@ -2806,10 +3202,32 @@ def main():
 
             st.markdown(
                 '<div class="warning-box">発注先をクリックすると明細が開閉します。'
-                'ANDPADでの発注時は、明細を開いてコピー＆ペーストしてください。'
+                'ANDPADでの発注時は、下の「ANDPAD貼り付け用」から細目工種・金額をコピーしてください。'
                 '並び順は予実管理表（積算原価⇒工務予算振り分け方法）に合わせています。</div>',
                 unsafe_allow_html=True,
             )
+
+            # ANDPADの発注画面へ列ごとに貼り付けられるようにする
+            with st.expander("ANDPAD貼り付け用（列ごとにコピー）", expanded=True):
+                st.caption(
+                    "各枠の右上のコピーボタンで列ごとにまとめてコピーできます。"
+                    "ANDPADの該当列にそのまま貼り付けてください（並び順は下の一覧と同じです）。")
+                paste_c1, paste_c2, paste_c3, paste_c4 = st.columns([2.2, 1, 1, 1])
+                vendors = list(by_vendor.keys())
+                paste_c1.markdown("**細目工種（発注先）**")
+                paste_c1.code("\n".join(vendors), language=None)
+                paste_c2.markdown("**合計金額**")
+                paste_c2.code("\n".join(str(by_vendor[v]['total']) for v in vendors), language=None)
+                paste_c3.markdown("**材料費**")
+                paste_c3.code("\n".join(str(by_vendor[v]['material']) for v in vendors), language=None)
+                paste_c4.markdown("**施工費**")
+                paste_c4.code("\n".join(str(by_vendor[v]['labor']) for v in vendors), language=None)
+                st.markdown("**表ごとコピー（タブ区切り／Excel・ANDPADへそのまま貼付）**")
+                st.code(
+                    "細目工種\t材料費\t施工費\t合計\n" + "\n".join(
+                        f"{v}\t{by_vendor[v]['material']}\t{by_vendor[v]['labor']}\t{by_vendor[v]['total']}"
+                        for v in vendors),
+                    language=None)
             st.markdown("")
 
             for vendor, data in by_vendor.items():
@@ -3156,15 +3574,35 @@ def main():
                     append_project_changelog(
                         current_pid, '実績取込',
                         f"実績見積を取込（税抜 {parsed.get('total_excl_tax', 0):,}円 / {up_actual.name}）")
-                    st.success(f"実績見積を取り込みました（税抜 {parsed.get('total_excl_tax', 0):,}円）")
+                    _flash(f"実績見積を取り込みました（税抜 {parsed.get('total_excl_tax', 0):,}円）")
+                    # 読み取り時の注意（金額の再計算・0円の種別など）は必ず伝える
+                    for warn in parsed.get('warnings', []):
+                        _flash(warn, "warning")
                     st.rerun()
-                except Exception as exc:
+                except ValueError as exc:
+                    # パーサが原因を特定できた場合はその説明をそのまま出す
+                    st.error(str(exc))
+                except Exception as exc:  # noqa: BLE001 - 想定外の形式も画面で伝える
                     st.error(f"Excelの解析に失敗しました。提出見積の形式（明細書シート）かご確認ください: {exc}")
+
+            if st.button("最新の内容に更新", key="reload_actual",
+                         help="他の担当者が保存した実績見積・差異理由をサーバーから読み直します"):
+                for cache_key in ('_actual_cache', '_diffnote_cache', '_fb_cache'):
+                    st.session_state.pop(cache_key, None)
+                st.session_state.pop('_diff_lib', None)
+                _flash("サーバーの最新内容を読み込みました。")
+                st.rerun()
 
             actual = load_project_actual(current_pid)
             if actual is None:
                 st.info("この案件の実績見積はまだ取り込まれていません。")
             else:
+                # 取り込み時の注意は差分を見るたびに参照できるようにしておく
+                actual_warnings = actual.get('warnings') or []
+                if actual_warnings:
+                    with st.expander(f"⚠ 読み取り時の注意 {len(actual_warnings)}件", expanded=False):
+                        for warn in actual_warnings:
+                            st.markdown(f"- {warn}")
                 diff = excel_diff.diff_estimates(estimate, actual)
                 ai_total = diff['total_ai']
                 act_total = diff['total_actual']
@@ -3173,6 +3611,36 @@ def main():
                 c1.metric("AI見積（税抜）", f"{ai_total:,}円")
                 c2.metric("実績見積（税抜）", f"{act_total:,}円")
                 c3.metric("差額（AI−実績）", f"{ai_total - act_total:+,}円", f"{rate_pct:+.1f}%")
+                if rate_pct < 0:
+                    st.warning(
+                        f"AI概算が実績を{abs(rate_pct):.1f}%下回っています。"
+                        "サイドバーの「概算安全率」を上げると、概算段階で高めに出せます"
+                        f"（既定+{DEFAULT_SAFETY_RATE_PCT:g}%）。")
+
+                with st.expander("この見積をどう計算したか（算出根拠）"):
+                    st.markdown(
+                        "AI概算は「CADから拾った数量 × 単価マスターの単価」で1行ずつ積み上げています。"
+                        "下表がその計算内容です（数量の出どころはCADの実測集計値・部屋データ・建具データ）。")
+                    basis_rows = []
+                    for c in estimate.categories:
+                        for it in c.items:
+                            basis_rows.append({
+                                '工事種別': c.name, '品名': it.name, '摘要': it.summary,
+                                '数量': it.quantity, '単位': it.unit,
+                                '単価': it.estimate_price, '金額': it.estimate_amount,
+                                '計算式': it.formula,
+                            })
+                    st.dataframe(pd.DataFrame(basis_rows), use_container_width=True,
+                                 hide_index=True, height=320)
+                    safety_cat = next((c for c in estimate.categories if c.no == 25), None)
+                    if safety_cat:
+                        st.info(
+                            f"概算安全率として {safety_cat.estimate_total:,}円 を計上しています"
+                            f"（{safety_cat.items[0].formula}）。CADに現れない打合せ造作・"
+                            "グレードアップ・現場条件で実績が上振れする分の予備費です。"
+                            "サイドバーで率を変更できます。")
+                    else:
+                        st.info("概算安全率は0%（計上なし）です。サイドバーで設定できます。")
 
                 st.markdown("##### 工事種別ごとの差分")
                 rows = []
@@ -3189,6 +3657,17 @@ def main():
                     use_container_width=True, hide_index=True)
 
                 with st.expander("明細レベルの差分を見る"):
+                    st.caption(
+                        "同じ品名の明細は実績見積の粒度に合わせて1行にまとめて比較しています"
+                        "（合計金額は変わりません）。")
+
+                    def _qty_label(item: dict, qty_key: str = 'quantity') -> str:
+                        """数量＋単位の表示文字列（数量が無ければ空文字）"""
+                        qty = item.get(qty_key) or 0
+                        if not qty:
+                            return ""
+                        return f"{qty:g}{item.get('unit', '')}"
+
                     for cat_name, d in diff.get('item_diffs', {}).items():
                         big = [m for m in d.get('matched', [])
                                if abs(m['ai_amount'] - m['actual_amount']) >= 10000]
@@ -3196,30 +3675,162 @@ def main():
                             continue
                         st.markdown(f"**{cat_name}**")
                         for m in big[:15]:
+                            ai_q = _qty_label(m, 'ai_quantity')
+                            ac_q = _qty_label(m, 'actual_quantity')
+                            rows = m.get('ai_rows', 1)
+                            note = f"　※AI{rows}行を集約" if rows > 1 else ""
                             st.markdown(
                                 f"- {m['ai_name']} ⇔ {m['actual_name']}: "
-                                f"AI {m['ai_amount']:,}円 / 実績 {m['actual_amount']:,}円 "
-                                f"（差 {m['ai_amount'] - m['actual_amount']:+,}円）")
+                                f"AI {ai_q} {m['ai_amount']:,}円 / "
+                                f"実績 {ac_q} {m['actual_amount']:,}円 "
+                                f"（差 {m['ai_amount'] - m['actual_amount']:+,}円）{note}")
                         for x in d.get('ai_only', [])[:8]:
-                            st.markdown(f"- 🟦 AIのみ: {x['name']}（{x['amount']:,}円）")
+                            st.markdown(
+                                f"- 🟦 AIのみ: {x['name']} "
+                                f"{_qty_label(x)}（{x['amount']:,}円）")
                         for x in d.get('actual_only', [])[:8]:
-                            st.markdown(f"- 🟥 実績のみ: {x['name']}（{x['amount']:,}円）")
+                            st.markdown(
+                                f"- 🟥 実績のみ: {x['name']} "
+                                f"{_qty_label(x)}（{x['amount']:,}円）")
+
+                # ===== 差異の理由を記入して学習させる =====
+                st.markdown("")
+                st.markdown("##### 差異の理由を記入（学習データになります）")
+                st.caption(
+                    "「なぜこの金額差が出たのか」を記入して保存すると、案件をまたいで蓄積され、"
+                    "同じ品名が別の案件で出たときに過去の理由が参考として表示されます。"
+                    "AI側の数量・単位・単価はそのまま「どう計算して出した金額か」を表しています。")
+
+                notes = load_project_diff_notes(current_pid)
+                lib = load_diff_reason_library()
+                prop_name = st.session_state['projects'].get(current_pid, {}).get('name', '')
+
+                note_rows = []
+                for cat_name, d in diff.get('item_diffs', {}).items():
+                    for m in d.get('matched', []):
+                        if m['diff'] == 0:
+                            continue
+                        note_rows.append({
+                            '工事種別': cat_name, '区分': '金額差', '品名': m['ai_name'],
+                            '摘要': m.get('actual_summary') or m.get('ai_summary', ''),
+                            'AI数量': m.get('ai_quantity', 0), '実績数量': m.get('actual_quantity', 0),
+                            '単位': m.get('unit', ''),
+                            'AI金額': m['ai_amount'], '実績金額': m['actual_amount'],
+                            '差額': m['diff'],
+                        })
+                    for x in d.get('ai_only', []):
+                        note_rows.append({
+                            '工事種別': cat_name, '区分': 'AIのみ', '品名': x['name'],
+                            '摘要': x.get('summary', ''),
+                            'AI数量': x.get('quantity', 0), '実績数量': 0,
+                            '単位': x.get('unit', ''),
+                            'AI金額': x['amount'], '実績金額': 0, '差額': x['amount'],
+                        })
+                    for x in d.get('actual_only', []):
+                        note_rows.append({
+                            '工事種別': cat_name, '区分': '実績のみ', '品名': x['name'],
+                            '摘要': x.get('summary', ''),
+                            'AI数量': 0, '実績数量': x.get('quantity', 0),
+                            '単位': x.get('unit', ''),
+                            'AI金額': 0, '実績金額': x['amount'], '差額': -x['amount'],
+                        })
+                note_rows.sort(key=lambda r: -abs(r['差額']))
+
+                if not note_rows:
+                    st.info("金額差のある明細はありません。")
+                else:
+                    only_unfilled = st.checkbox(
+                        "未記入のみ表示", value=False, key="diff_note_filter")
+                    for r in note_rows:
+                        key = diff_note_key(r['工事種別'], r['品名'])
+                        saved = notes.get(key, {})
+                        r['分類'] = saved.get('category', '')
+                        r['差異の理由'] = saved.get('reason', '')
+                        r['過去の理由（参考）'] = past_reason_hint(lib, key, prop_name)
+                    shown = [r for r in note_rows
+                             if not only_unfilled or not r['差異の理由']]
+                    st.caption(f"差額の大きい順に {len(shown)} 件（金額差のある明細のみ）")
+                    edited = st.data_editor(
+                        pd.DataFrame(shown),
+                        key=f"diff_notes_editor_{current_pid}",
+                        use_container_width=True, hide_index=True,
+                        column_config={
+                            '分類': st.column_config.SelectboxColumn(
+                                '分類', options=DIFF_REASON_CATEGORIES, width='small'),
+                            '差異の理由': st.column_config.TextColumn(
+                                '差異の理由（なぜ金額が違うか）', width='large'),
+                            '過去の理由（参考）': st.column_config.TextColumn(
+                                '過去の理由（参考）', width='medium'),
+                            'AI金額': st.column_config.NumberColumn('AI金額', format='%d'),
+                            '実績金額': st.column_config.NumberColumn('実績金額', format='%d'),
+                            '差額': st.column_config.NumberColumn('差額(AI−実績)', format='%d'),
+                        },
+                        disabled=['工事種別', '区分', '品名', '摘要', 'AI数量', '実績数量',
+                                  '単位', 'AI金額', '実績金額', '差額', '過去の理由（参考）'],
+                    )
+                    if st.button("差異の理由を保存して学習させる", type="primary",
+                                 key="save_diff_notes"):
+                        new_notes = dict(notes)
+                        lib_entries = []
+                        for _, row in edited.iterrows():
+                            key = diff_note_key(row['工事種別'], row['品名'])
+                            reason = (row.get('差異の理由') or '').strip()
+                            category = (row.get('分類') or '').strip()
+                            if not reason and not category:
+                                new_notes.pop(key, None)
+                                continue
+                            new_notes[key] = {
+                                'category': category, 'reason': reason,
+                                'diff': int(row['差額']),
+                                'updated_at': now_jst().strftime('%Y-%m-%d %H:%M'),
+                            }
+                            if reason:
+                                lib_entries.append({
+                                    'key': key, 'item': row['品名'],
+                                    'category': category, 'reason': reason,
+                                    'property': prop_name, 'diff': int(row['差額']),
+                                })
+                        save_project_diff_notes(current_pid, new_notes)
+                        update_diff_reason_library(lib_entries)
+                        append_project_changelog(
+                            current_pid, '実績取込',
+                            f"差異理由を{len(lib_entries)}件登録（学習データへ蓄積）")
+                        _flash(f"差異の理由を保存しました（{len(lib_entries)}件を学習データへ蓄積）。")
+                        st.rerun()
 
                 st.markdown("")
+                diff_files = st.file_uploader(
+                    "差分レポートに添付するファイル（任意・複数可）",
+                    accept_multiple_files=True, key="diff_fb_files",
+                    help="実績見積のExcelや根拠資料を添付して弊社へ送れます（1ファイル10MB／合計20MBまで）")
                 if st.button("この差分をフィードバックとして送信", key="send_diff_fb"):
                     summary_text = excel_diff.diff_summary_text(diff)
+                    reason_lines = [
+                        f"  [{k.split('|')[0]}] {k.split('|', 1)[1]}: "
+                        f"{v.get('category', '')} / {v.get('reason', '')}"
+                        for k, v in load_project_diff_notes(current_pid).items()
+                        if v.get('reason')
+                    ]
+                    if reason_lines:
+                        summary_text += ("\n■ 差異の理由（現場記入）\n"
+                                         + "\n".join(reason_lines[:30]))
+                    uploads = [{'name': f.name, 'data': f.getvalue()}
+                               for f in (diff_files or [])]
                     result = send_feedback_to_company(
                         name="実績差分レポート（自動）", email="",
                         category="実績差分レポート", message=summary_text,
-                        property_name=st.session_state['projects'].get(
-                            current_pid, {}).get('name', ''),
+                        attachments=uploads,
+                        property_name=prop_name,
                     )
                     if result.get('success'):
                         fbs = load_project_feedbacks(current_pid)
+                        fb_id = result.get('feedback_id', '')
                         fbs.append({
-                            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M'),
+                            'timestamp': now_jst().strftime('%Y-%m-%d %H:%M'),
                             'category': '実績差分レポート', 'name': '自動生成',
                             'body': summary_text, 'priority': '通常', 'status': '未対応',
+                            'feedback_id': fb_id,
+                            'attachments': save_feedback_files(current_pid, fb_id, uploads),
                         })
                         save_project_feedbacks(current_pid, fbs)
                         st.success("差分レポートをフィードバックとして送信しました。")
@@ -3594,24 +4205,30 @@ def main():
                 placeholder="返信が必要な場合のみご入力ください",
             )
 
+            fb_files = st.file_uploader(
+                "添付ファイル（任意・複数可）",
+                accept_multiple_files=True,
+                help="見積書・図面・スクリーンショットなどを添付できます"
+                     "（1ファイル10MBまで／合計20MBまで）。添付は弊社への通知メール・Slackに"
+                     "実ファイルとして送られ、この画面からも後でダウンロードできます。",
+            )
+
             submitted = st.form_submit_button("フィードバックを送信", type="primary")
+            # 同じ内容が二重に登録されるのを防ぐ（フォーム送信直後の再実行対策）
+            fb_signature = "|".join([
+                fb_category, fb_target or "", fb_body or "", fb_priority,
+                ",".join(sorted(f.name for f in (fb_files or []))),
+            ])
+            if submitted and fb_body and st.session_state.get('_last_fb_sig') == fb_signature:
+                submitted = False
             if submitted and fb_body:
+                st.session_state['_last_fb_sig'] = fb_signature
                 if not current_pid:
                     st.error("案件が選択されていません。先にCADデータをアップロードしてください。")
                 else:
                     property_name_for_fb = cad_data.property_name if cad_data else ''
-                    feedbacks.append({
-                        'category': fb_category,
-                        'target': fb_target,
-                        'body': fb_body,
-                        'priority': fb_priority,
-                        'name': fb_name,
-                        'email': fb_email,
-                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M'),
-                        'property': property_name_for_fb,
-                        'status': '未対応',
-                    })
-                    save_project_feedbacks(current_pid, feedbacks)
+                    uploads = [{'name': f.name, 'data': f.getvalue()}
+                               for f in (fb_files or [])]
 
                     # 弊社のSlackチャンネルへ即時通知（メール併設定時はメールも）
                     with st.spinner("フィードバックを弊社に送信しています..."):
@@ -3620,10 +4237,27 @@ def main():
                             email=fb_email or "",
                             category=fb_category,
                             message=fb_body,
+                            attachments=uploads,
                             property_name=property_name_for_fb,
                             priority=fb_priority,
                             target=fb_target,
                         )
+
+                    fb_id = send_result.get('feedback_id', '')
+                    feedbacks.append({
+                        'category': fb_category,
+                        'target': fb_target,
+                        'body': fb_body,
+                        'priority': fb_priority,
+                        'name': fb_name,
+                        'email': fb_email,
+                        'timestamp': now_jst().strftime('%Y-%m-%d %H:%M'),
+                        'property': property_name_for_fb,
+                        'status': '未対応',
+                        'feedback_id': fb_id,
+                        'attachments': save_feedback_files(current_pid, fb_id, uploads),
+                    })
+                    save_project_feedbacks(current_pid, feedbacks)
 
                     if send_result.get("success"):
                         channels = "・".join(
@@ -3640,7 +4274,6 @@ def main():
                         st.warning(
                             f"案件フォルダへの保存は完了しましたが、弊社への通知に一部失敗しました: {errs}"
                         )
-                    st.rerun()
 
         # 仕組みの説明
         st.markdown("")
@@ -3723,6 +4356,28 @@ def main():
                     f'</div>',
                     unsafe_allow_html=True,
                 )
+
+                # 添付ファイル（保存済みならダウンロード可能）
+                fb_atts = fb.get('attachments') or []
+                if fb_atts:
+                    att_cols = st.columns(min(len(fb_atts), 4))
+                    for a_i, att in enumerate(fb_atts):
+                        col = att_cols[a_i % len(att_cols)]
+                        if not isinstance(att, dict):
+                            col.caption(f"📎 {att}")
+                            continue
+                        blob = load_feedback_file(
+                            fb.get('_proj_id', current_pid) if fb_view_mode == "全案件横断表示" else current_pid,
+                            fb.get('feedback_id', ''), att)
+                        if blob is None:
+                            col.caption(f"📎 {att.get('name', '')}"
+                                        f"{'（' + att['error'] + '）' if att.get('error') else '（保存なし）'}")
+                        else:
+                            col.download_button(
+                                f"📎 {att.get('name', '')}", data=blob,
+                                file_name=att.get('name', 'file'),
+                                key=f"fbdl_{idx}_{a_i}_{fb.get('timestamp', '')}",
+                                use_container_width=True)
 
                 # ステータス変更・削除ボタン（案件横断表示でも操作可能）
                 target_pid = fb.get('_proj_id', current_pid) if fb_view_mode == "全案件横断表示" else current_pid

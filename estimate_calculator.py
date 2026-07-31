@@ -159,7 +159,10 @@ def calculate_estimate(cad_data: CADData, prices: dict,
                        owner_name: str = "", location: str = "",
                        estimate_no: str = "",
                        include_adjustment: bool = True,
-                       include_solar: bool = False) -> Estimate:
+                       include_solar: bool = False,
+                       safety_rate: float = 0.0,
+                       include_custom_furniture: bool = False,
+                       miraie_count: int = 0) -> Estimate:
     """CADデータから概算見積を算出
 
     Args:
@@ -168,6 +171,14 @@ def calculate_estimate(cad_data: CADData, prices: dict,
         include_solar: 太陽光発電システムを計上するか。CAD条件04は実仕様と
             食い違う実例が多い（8物件検証で採用可否とフラグが一致しない）ため
             自動判定せず、明示的な指定のみで計上する。デフォルトFalse。
+        safety_rate: 概算安全率（0.04 なら +4%）。CADに現れない打合せ造作・
+            グレードアップ・現場条件で実績が上振れするため、工事費計に対する
+            予備費を「25 概算調整」として明示計上する。0なら計上しない。
+        include_custom_furniture: 造作収納・カウンター類の概算含みを計上するか。
+            造作家具は大工・建具屋の手作り特殊品で図面から拾えないため、
+            既定では計上せず必要時に手入力する運用（顧客要望による）。
+        miraie_count: 制震ダンパー（MIRAIE）の本数。CAD数量データに現れないため
+            自動判定できず、指定された本数だけ木工事に計上する。0なら計上しない。
     """
     estimate = Estimate(
         property_name=cad_data.property_name,
@@ -528,6 +539,13 @@ def calculate_estimate(cad_data: CADData, prices: dict,
     # 打合せ造作の概算含み: CADに現れない造作（下がり天井・ニッチ・垂れ壁・
     # 造作枠等）が8物件全てで発生しており、実績中央値ベースで概算計上する
     add_item(cat03, 30099, prices, 1, category="大工手間")
+
+    # 制震ダンパー（MIRAIE）: CAD数量データに現れないため自動判定できず、
+    # 採用時に本数を指定して計上する
+    if miraie_count > 0:
+        add_item(cat03, 30033, prices, miraie_count, category="軸組・羽柄材・PC")
+        estimate.warnings.append(
+            f"制震ダンパー（MIRAIE）を{miraie_count}本計上しています。本数はサイドバーで変更できます。")
 
     estimate.categories.append(cat03)
 
@@ -897,12 +915,16 @@ def calculate_estimate(cad_data: CADData, prices: dict,
     # ===== 20 造作家具工事 =====
     cat20 = WorkCategory(no=20, name="造作家具工事")
     add_item(cat20, 200001, prices, 1)  # ユーティリティカウンター
-    # 造作収納・カウンター類の概算含み: CADに現れない打合せ造作
-    # （脱衣カウンター・トイレ収納等）が8物件全てで発生しており、
-    # 実績中央値ベースで概算計上する（内訳確定時に見積修正で調整）
-    add_item(cat20, 200010, prices, 1)
-    estimate.warnings.append(
-        "造作家具は「造作収納・カウンター類（概算含み）」を実績中央値ベースで計上しています。TVボード・大型造作等の採用時は追加費用が発生します。")
+    if include_custom_furniture:
+        # 造作収納・カウンター類の概算含み（脱衣カウンター・トイレ収納等）。
+        # 大工・建具屋の手作り特殊品で図面から拾えないため、既定では計上せず
+        # 採用が決まった時点で計上する（顧客要望による）
+        add_item(cat20, 200010, prices, 1)
+        estimate.warnings.append(
+            "造作家具は「造作収納・カウンター類（概算含み）」を実績中央値ベースで計上しています。TVボード・大型造作等の採用時は追加費用が発生します。")
+    else:
+        estimate.warnings.append(
+            "造作収納・カウンター類は特殊品のため計上していません。採用する場合はサイドバーの「造作家具の概算含み」をONにするか、見積修正タブで追加してください。")
     estimate.categories.append(cat20)
 
     # ===== 21 雑工事 =====
@@ -942,6 +964,26 @@ def calculate_estimate(cad_data: CADData, prices: dict,
     add_item(cat24, 230002, prices, 1)  # 設計申請費
     estimate.categories.append(cat24)
 
+    # ===== 25 概算調整（安全率） =====
+    # CADに現れない打合せ造作・グレードアップ・現場条件により実績が上振れする
+    # 傾向があるため、予備費を明示の1行として計上する（発注側も同額とし粗利率は不変）。
+    if safety_rate > 0:
+        base = estimate.total_estimate_excl_tax
+        base_order = estimate.total_order_excl_tax
+        cat25 = WorkCategory(no=25, name="概算調整")
+        amount = int(base * safety_rate)
+        order_amount = int(base_order * safety_rate)
+        cat25.items.append(EstimateItem(
+            parent_no=25, child_no=1,
+            name=f"概算安全率（+{safety_rate * 100:.1f}%）",
+            summary="CAD未反映の打合せ造作・グレードアップ・現場条件の予備費",
+            unit="式", quantity=1,
+            estimate_price=amount, order_price=order_amount,
+            estimate_amount=amount, order_amount=order_amount,
+            formula=f"工事費計 {base:,}円 × {safety_rate * 100:.1f}%",
+        ))
+        estimate.categories.append(cat25)
+
     return estimate
 
 
@@ -971,6 +1013,8 @@ def add_item(work_cat: WorkCategory, code: int, prices: dict,
         estimate_amount=est_amount,
         order_amount=ord_amount,
         category=category,
+        # 「どう計算して出した金額か」を画面で示せるようにする
+        formula=f"{qty:g}{p['unit']} × {p['estimate_price']:,}円",
     )
     work_cat.items.append(item)
 

@@ -11,6 +11,7 @@ Streamlitアプリからのユーザーフィードバックを、以下の3チ�
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import uuid
@@ -22,13 +23,24 @@ import requests
 
 # --- 定数 ---------------------------------------------------------------
 
-FEEDBACK_LOG_PATH = Path(__file__).resolve().parent / "feedbacks.json"
+# 送信ログの保存先。旧グローバル保存ファイル(feedbacks.json)とは名前を分ける。
+# 同名にすると、アプリ起動時の「旧feedbacks.jsonを案件別へ移行する処理」が
+# 送信のたびに書かれたこのログを取り込み、同じ内容が二重に登録されてしまう。
+FEEDBACK_LOG_PATH = Path(__file__).resolve().parent / "feedback_sendlog.json"
 RESEND_ENDPOINT = "https://api.resend.com/emails"
 RESEND_FROM_ADDRESS = "onboarding@resend.dev"
 REQUEST_TIMEOUT_SEC = 10
+ATTACHMENT_UPLOAD_TIMEOUT_SEC = 60   # 添付ありの送信は時間がかかるため別枠
+
+# 添付ファイルの上限（Resendのメール全体上限40MBに対し、base64化で約1.37倍に
+# 膨らむことを見込んで保守的に設定する）
+MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024        # 1ファイルあたり
+MAX_ATTACHMENT_TOTAL_BYTES = 20 * 1024 * 1024  # 合計
 
 # Slack Bot Token は環境変数または Streamlit secrets から読み込む（ハードコード禁止）。
 SLACK_API_ENDPOINT = "https://slack.com/api/chat.postMessage"
+SLACK_UPLOAD_URL_ENDPOINT = "https://slack.com/api/files.getUploadURLExternal"
+SLACK_UPLOAD_COMPLETE_ENDPOINT = "https://slack.com/api/files.completeUploadExternal"
 
 
 # --- 内部ヘルパー -------------------------------------------------------
@@ -36,6 +48,62 @@ SLACK_API_ENDPOINT = "https://slack.com/api/chat.postMessage"
 def _now_iso() -> str:
     """現在時刻を ISO8601 (UTC) 形式で返す。"""
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _normalize_attachments(attachments: list | None) -> list[dict[str, Any]]:
+    """添付指定を {'name','data','size','error'} の形に揃える。
+
+    受け付ける形式:
+      - {'name': str, 'data': bytes}      … 実体つき（メール/Slackへ添付する）
+      - str（ファイル名またはパス）        … 実体が読めればbytesを読み込む
+    サイズ上限を超えたものは data を落とし、error に理由を入れて記録だけ残す。
+    """
+    normalized: list[dict[str, Any]] = []
+    total = 0
+    for att in attachments or []:
+        name, data = "", None
+        if isinstance(att, dict):
+            name = str(att.get("name") or att.get("filename") or "")
+            data = att.get("data")
+        else:
+            name = str(att)
+            path = Path(name)
+            if path.is_file():
+                try:
+                    data = path.read_bytes()
+                except OSError:
+                    data = None
+                name = path.name
+        if not name:
+            continue
+        entry: dict[str, Any] = {"name": name, "size": len(data) if data else 0}
+        if data is None:
+            entry["error"] = "ファイルの実体を取得できませんでした（ファイル名のみ記録）"
+        elif len(data) > MAX_ATTACHMENT_BYTES:
+            entry["error"] = (f"1ファイル {MAX_ATTACHMENT_BYTES // (1024 * 1024)}MB の上限超過"
+                              f"（{len(data) / (1024 * 1024):.1f}MB）")
+        elif total + len(data) > MAX_ATTACHMENT_TOTAL_BYTES:
+            entry["error"] = f"合計 {MAX_ATTACHMENT_TOTAL_BYTES // (1024 * 1024)}MB の上限超過"
+        else:
+            entry["data"] = data
+            total += len(data)
+        normalized.append(entry)
+    return normalized
+
+
+def _attachment_labels(record: dict[str, Any]) -> list[str]:
+    """添付ファイルの一覧表示用ラベル（名前・サイズ・エラー）"""
+    labels = []
+    for att in record.get("attachments", []):
+        if isinstance(att, dict):
+            size_kb = (att.get("size") or 0) / 1024
+            label = f"{att.get('name', '')}（{size_kb:,.0f}KB）"
+            if att.get("error"):
+                label += f" ※未送信: {att['error']}"
+        else:
+            label = str(att)
+        labels.append(label)
+    return labels
 
 
 def _append_local_log(record: dict[str, Any]) -> None:
@@ -53,7 +121,13 @@ def _append_local_log(record: dict[str, Any]) -> None:
         except (json.JSONDecodeError, OSError):
             data = []
 
-    data.append(record)
+    # 添付の実体（bytes）はJSONに載せられないため、メタ情報だけ残す
+    loggable = dict(record)
+    loggable["attachments"] = [
+        {k: v for k, v in att.items() if k != "data"} if isinstance(att, dict) else att
+        for att in record.get("attachments", [])
+    ]
+    data.append(loggable)
 
     with FEEDBACK_LOG_PATH.open("w", encoding="utf-8") as fp:
         json.dump(data, fp, ensure_ascii=False, indent=2)
@@ -89,15 +163,24 @@ def _build_slack_blocks(record: dict[str, Any]) -> list[dict[str, Any]]:
                 "text": f"*メッセージ:*\n>>> {record['message']}",
             },
         },
-    ]
+    ] + ([
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "*添付ファイル:*\n" + "\n".join(
+                    f"• {label}" for label in _attachment_labels(record)),
+            },
+        },
+    ] if record.get("attachments") else [])
 
 
 def _build_email_html(record: dict[str, Any]) -> str:
     """Resend 用のフィードバックメール HTML 本文を組み立てる。"""
-    attachments = record.get("attachments") or []
+    labels = _attachment_labels(record)
     attachments_html = (
-        "<ul>" + "".join(f"<li>{str(a)}</li>" for a in attachments) + "</ul>"
-        if attachments
+        "<ul>" + "".join(f"<li>{a}</li>" for a in labels) + "</ul>"
+        if labels
         else "<p style='color:#4a5568;'>(なし)</p>"
     )
     # メッセージ本文の簡易エスケープ + 改行保持
@@ -175,10 +258,63 @@ def _send_slack(record: dict[str, Any], errors: list[str]) -> bool:
         if not body.get("ok"):
             errors.append(f"slack: API error - {body.get('error', 'unknown')}")
             return False
+        _upload_slack_files(record, token, channel, errors)
         return True
     except Exception as exc:  # noqa: BLE001 - 外部送信はまとめて捕捉
         errors.append(f"slack: {type(exc).__name__}: {exc}")
         return False
+
+
+def _upload_slack_files(record: dict[str, Any], token: str, channel: str,
+                        errors: list[str]) -> None:
+    """添付ファイルをSlackチャンネルへアップロードする。
+
+    files.getUploadURLExternal で発行されたURLへPUT相当のPOSTを行い、
+    completeUploadExternal でチャンネルへ紐付ける（Slackの現行手順）。
+    失敗しても通知本文の送信自体は成功扱いのままとし、errors に記録する
+    （添付が上がらないことよりも通知が届かないことのほうが問題のため）。
+    """
+    files = [a for a in record.get("attachments", [])
+             if isinstance(a, dict) and a.get("data")]
+    if not files:
+        return
+    auth = {"Authorization": f"Bearer {token}"}
+    uploaded = []
+    for att in files:
+        try:
+            got = requests.get(
+                SLACK_UPLOAD_URL_ENDPOINT,
+                params={"filename": att["name"], "length": len(att["data"])},
+                headers=auth, timeout=REQUEST_TIMEOUT_SEC,
+            ).json()
+            if not got.get("ok"):
+                errors.append(f"slack file: {got.get('error', 'unknown')}")
+                continue
+            put = requests.post(
+                got["upload_url"],
+                files={"file": (att["name"], att["data"])},
+                timeout=ATTACHMENT_UPLOAD_TIMEOUT_SEC,
+            )
+            if put.status_code >= 300:
+                errors.append(f"slack file: upload HTTP {put.status_code}")
+                continue
+            uploaded.append({"id": got["file_id"], "title": att["name"]})
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"slack file: {type(exc).__name__}: {exc}")
+    if not uploaded:
+        return
+    try:
+        done = requests.post(
+            SLACK_UPLOAD_COMPLETE_ENDPOINT,
+            json={"files": uploaded, "channel_id": channel,
+                  "initial_comment": f"フィードバック `{record['feedback_id'][:8]}` の添付ファイル"},
+            headers={**auth, "Content-Type": "application/json; charset=utf-8"},
+            timeout=REQUEST_TIMEOUT_SEC,
+        ).json()
+        if not done.get("ok"):
+            errors.append(f"slack file: complete - {done.get('error', 'unknown')}")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"slack file: {type(exc).__name__}: {exc}")
 
 
 def _send_email(record: dict[str, Any], errors: list[str]) -> bool:
@@ -194,6 +330,15 @@ def _send_email(record: dict[str, Any], errors: list[str]) -> bool:
             "subject": f"【日本住建 見積AI】新しいフィードバック - {record['category']}",
             "html": _build_email_html(record),
         }
+        # 添付ファイル（実体があるもののみ。base64でRESENDに渡す）
+        mail_attachments = [
+            {"filename": att["name"],
+             "content": base64.b64encode(att["data"]).decode("ascii")}
+            for att in record.get("attachments", [])
+            if isinstance(att, dict) and att.get("data")
+        ]
+        if mail_attachments:
+            payload["attachments"] = mail_attachments
         resp = requests.post(
             RESEND_ENDPOINT,
             json=payload,
@@ -201,7 +346,8 @@ def _send_email(record: dict[str, Any], errors: list[str]) -> bool:
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
-            timeout=REQUEST_TIMEOUT_SEC,
+            timeout=(ATTACHMENT_UPLOAD_TIMEOUT_SEC if mail_attachments
+                     else REQUEST_TIMEOUT_SEC),
         )
         if resp.status_code >= 300:
             errors.append(f"email: HTTP {resp.status_code} - {resp.text[:200]}")
@@ -231,7 +377,9 @@ def submit_feedback(
         email: 送信者の返信先メールアドレス (空文字可)。
         category: フィードバックのカテゴリ (例: "バグ報告", "機能要望")。
         message: 本文テキスト。
-        attachments: 添付ファイル名またはパスのリスト。メタデータのみ扱う。
+        attachments: 添付ファイルのリスト。{'name': str, 'data': bytes} を渡すと
+            メールとSlackへ実ファイルとして添付する。文字列を渡した場合は
+            パスとして読み込みを試み、読めなければファイル名のみ記録する。
 
     Returns:
         dict: {
@@ -249,7 +397,7 @@ def submit_feedback(
         "email": email or "",
         "category": category or "未分類",
         "message": message or "",
-        "attachments": attachments or [],
+        "attachments": _normalize_attachments(attachments),
         "property": property_name or "",
         "priority": priority or "通常",
         "target": target or "",
