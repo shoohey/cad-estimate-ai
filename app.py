@@ -18,7 +18,8 @@ from openpyxl.styles import Font, Alignment, Border, Side, PatternFill, numbers
 from openpyxl.utils import get_column_letter
 
 from cad_parser import load_cad_from_bytes, load_cad_file, CADData
-from estimate_calculator import calculate_estimate, load_unit_prices, Estimate, EstimateItem
+from estimate_calculator import (calculate_estimate, load_unit_prices, Estimate,
+                                  EstimateItem, miraie_standard_count)
 from andpad_converter import (convert_to_andpad, ANDPADBudget,
                               ANDPADAllocation, vendor_sort_key)
 from feedback_handler import submit_feedback as send_feedback_to_company
@@ -2106,7 +2107,7 @@ def persist_project_mods():
     inc_solar = get_project_state('include_solar')
     if inc_solar is not None:
         data['include_solar'] = inc_solar
-    for opt_key in ('include_custom_furniture', 'miraie_count', 'safety_rate_pct'):
+    for opt_key in ('include_custom_furniture', 'safety_rate_pct'):
         opt_val = get_project_state(opt_key)
         if opt_val is not None:
             data[opt_key] = opt_val
@@ -2236,7 +2237,7 @@ def restore_project_to_session(proj_id: str):
         st.session_state[f"proj_{proj_id}_include_adjustment"] = data['include_adjustment']
     if 'include_solar' in data:
         st.session_state[f"proj_{proj_id}_include_solar"] = data['include_solar']
-    for opt_key in ('include_custom_furniture', 'miraie_count', 'safety_rate_pct'):
+    for opt_key in ('include_custom_furniture', 'safety_rate_pct'):
         if opt_key in data:
             st.session_state[f"proj_{proj_id}_{opt_key}"] = data[opt_key]
     if 'equipment' in data:
@@ -2536,13 +2537,13 @@ def main():
                  "採用が決まっている場合のみONにしてください。")
         if st.session_state['current_project']:
             set_project_state('include_custom_furniture', include_custom_furniture)
-        miraie_count = st.number_input(
-            "制震ダンパー（ミライエ）本数", min_value=0, max_value=40, step=1,
-            value=int(get_project_state('miraie_count', 0)),
-            help="CAD数量データに制震ダンパーは出力されないため、採用時に本数を指定してください"
-                 "（単価マスター30033・木工事に計上）。0なら計上しません。")
-        if st.session_state['current_project']:
-            set_project_state('miraie_count', miraie_count)
+        _cad_for_miraie = get_project_state('cad_data')
+        if _cad_for_miraie is not None:
+            _miraie_n = miraie_standard_count(_cad_for_miraie.total_floor_area())
+            st.caption(
+                f"制震ダンパー（ミライエ）: {_miraie_n}本を自動計上 "
+                f"（延床{_cad_for_miraie.total_floor_area():.1f}㎡。"
+                "140㎡以下=4本、超過70㎡ごとに+2本）")
         safety_rate_pct = st.number_input(
             "概算安全率（+%）", min_value=0.0, max_value=10.0, step=0.5,
             value=float(get_project_state('safety_rate_pct', DEFAULT_SAFETY_RATE_PCT)),
@@ -2570,7 +2571,7 @@ def main():
             st.caption("💾 データ保存: クラウド永続化 有効")
         else:
             st.caption("⚠️ データ保存: 一時保存（再起動で消える場合があります）")
-        st.caption("build 2026-07-31.2")
+        st.caption("build 2026-07-31.3")
 
     # 単価マスタ読み込み
     csv_path = os.path.join(base_dir, "tankamaster_updated.csv")
@@ -2681,7 +2682,6 @@ def main():
         include_solar=include_solar,
         safety_rate=safety_rate_pct / 100.0,
         include_custom_furniture=include_custom_furniture,
-        miraie_count=int(miraie_count),
     )
 
     # 修正の初期化と適用

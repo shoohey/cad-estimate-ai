@@ -155,14 +155,26 @@ def load_unit_prices(csv_path: str) -> dict:
     return prices
 
 
+def miraie_standard_count(total_floor_area_m2: float) -> int:
+    """制震ダンパー（MIRAIE）の標準本数を延床面積から求める。
+
+    顧客のARCHITREND計算式マスター（条件付き計算式）に準拠:
+      延床面積 ≤ 140㎡ → 4本
+      140㎡超 → ROUNDUP((延床面積 - 140) / 70, 0) × 2 + 4
+      （140㎡を超えて70㎡ごとに2本プラス）
+    """
+    if total_floor_area_m2 <= 140:
+        return 4
+    return math.ceil((total_floor_area_m2 - 140) / 70) * 2 + 4
+
+
 def calculate_estimate(cad_data: CADData, prices: dict,
                        owner_name: str = "", location: str = "",
                        estimate_no: str = "",
                        include_adjustment: bool = True,
                        include_solar: bool = False,
                        safety_rate: float = 0.0,
-                       include_custom_furniture: bool = False,
-                       miraie_count: int = 0) -> Estimate:
+                       include_custom_furniture: bool = False) -> Estimate:
     """CADデータから概算見積を算出
 
     Args:
@@ -177,8 +189,8 @@ def calculate_estimate(cad_data: CADData, prices: dict,
         include_custom_furniture: 造作収納・カウンター類の概算含みを計上するか。
             造作家具は大工・建具屋の手作り特殊品で図面から拾えないため、
             既定では計上せず必要時に手入力する運用（顧客要望による）。
-        miraie_count: 制震ダンパー（MIRAIE）の本数。CAD数量データに現れないため
-            自動判定できず、指定された本数だけ木工事に計上する。0なら計上しない。
+        （制震ダンパーMIRAIEは全物件標準採用のため引数なしで常に自動計上。
+        　本数は miraie_standard_count() で延床面積から自動計算する）
     """
     estimate = Estimate(
         property_name=cad_data.property_name,
@@ -476,7 +488,14 @@ def calculate_estimate(cad_data: CADData, prices: dict,
     add_item(cat03, 30031, prices, ext_wall_area, category="建材・下地材")  # 透湿防水シート
     panel_count = math.ceil((ext_wall_area + gable_area) / 2.72)
     add_item(cat03, 30032, prices, panel_count, category="建材・下地材")  # 耐力面材
-    add_item(cat03, 30033, prices, 4, category="建材・下地材")   # 制震ダンパー
+    # 制震ダンパー（MIRAIE）: 全物件標準採用（実績8物件すべてで計上を確認）。
+    # 本数は顧客のARCHITREND条件付き計算式に従い延床面積から自動計算する
+    miraie_count = miraie_standard_count(total_area)
+    add_item(cat03, 30033, prices, miraie_count, category="建材・下地材")
+    if miraie_count > 4:
+        estimate.warnings.append(
+            f"制震ダンパー（MIRAIE）を{miraie_count}本計上しています"
+            f"（延床{total_area:.2f}㎡が140㎡超のため。140㎡以下=4本、超過70㎡ごとに+2本）。")
     add_item(cat03, 30034, prices, ext_fitting_count, category="建材・下地材")  # 窓枠
     add_item(cat03, 30035, prices, baseboard_count, category="建材・下地材")   # 化粧巾木
     add_item(cat03, 30038, prices, roof_edge_length, category="建材・下地材")  # 換気部材
@@ -539,13 +558,6 @@ def calculate_estimate(cad_data: CADData, prices: dict,
     # 打合せ造作の概算含み: CADに現れない造作（下がり天井・ニッチ・垂れ壁・
     # 造作枠等）が8物件全てで発生しており、実績中央値ベースで概算計上する
     add_item(cat03, 30099, prices, 1, category="大工手間")
-
-    # 制震ダンパー（MIRAIE）: CAD数量データに現れないため自動判定できず、
-    # 採用時に本数を指定して計上する
-    if miraie_count > 0:
-        add_item(cat03, 30033, prices, miraie_count, category="軸組・羽柄材・PC")
-        estimate.warnings.append(
-            f"制震ダンパー（MIRAIE）を{miraie_count}本計上しています。本数はサイドバーで変更できます。")
 
     estimate.categories.append(cat03)
 
