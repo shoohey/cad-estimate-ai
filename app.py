@@ -1089,29 +1089,52 @@ def _find_estimate_item(estimate: Estimate, category_name: str, item_name: str):
     return None
 
 
+def _distinct_summary(summary: str, name: str) -> str:
+    """摘要が名称と同じ内容なら空にする（同文言の二重表示を防ぐ）"""
+    s = (summary or '').strip()
+    if not s or _normalize_key(s) == _normalize_key(name or ''):
+        return ""
+    return s[:40]
+
+
+def _normalize_key(text: str) -> str:
+    """名称比較用の正規化（空白・記号を除去して小文字化）"""
+    s = unicodedata.normalize('NFKC', str(text or '')).lower()
+    return re.sub(r'[^0-9a-z぀-ヿ㐀-鿿豈-﫿]', '', s)
+
+
 def _apply_ai_proposal(estimate_base: Estimate, mods: dict, p: dict) -> str | None:
     """AI変更案を見積修正データ(mods)に変換して適用する。
 
     適用できた場合は変更履歴用の説明文を、対象を特定できなかった場合は
-    None を返す。
+    None を返す。金額は編集画面で確定した p['amount'] を最優先で使う。
     """
     ctype = p.get('change_type', '')
+
+    def _amount_of(proposal: dict) -> float | None:
+        """変更後の数値。編集画面の金額列 → proposed文字列の順で拾う"""
+        amt = proposal.get('amount')
+        if isinstance(amt, (int, float)) and amt > 0:
+            return float(amt)
+        return _parse_amount_jp(proposal.get('proposed'))
+
     if ctype == 'add':
-        amount = _parse_amount_jp(p.get('proposed'))
+        amount = _amount_of(p)
         cat_no = 21  # 特定できなければ雑工事に追加
         for cat in estimate_base.categories:
             if p.get('category') and p['category'].replace('工事', '') in cat.name:
                 cat_no = cat.no
                 break
+        name = p.get('item_name', '追加項目')
         mods.setdefault('new_items', []).append({
             'cat_no': cat_no,
-            'name': p.get('item_name', '追加項目'),
-            'summary': (p.get('reason') or '')[:40],
+            'name': name,
+            'summary': _distinct_summary(p.get('reason', ''), name),
             'quantity': 1.0, 'unit': '式',
             'estimate_price': int(amount or 0),
             'order_price': 0,
         })
-        return f"行追加: {p.get('item_name')}（{int(amount or 0):,}円）"
+        return f"行追加: {name}（{int(amount or 0):,}円）"
 
     found = _find_estimate_item(estimate_base, p.get('category', ''), p.get('item_name', ''))
     if not found:
@@ -1126,13 +1149,13 @@ def _apply_ai_proposal(estimate_base: Estimate, mods: dict, p: dict) -> str | No
     ov.setdefault('estimate_price', item.estimate_price)
     ov.setdefault('order_price', item.order_price)
     if ctype == 'quantity':
-        val = _parse_amount_jp(p.get('proposed'))
+        val = _amount_of(p)
         if val is None:
             return None
         desc = f"{item.name}: 数量 {ov['quantity']:g} → {val:g}"
         ov['quantity'] = val
     elif ctype == 'price':
-        val = _parse_amount_jp(p.get('proposed'))
+        val = _amount_of(p)
         if val is None:
             return None
         desc = f"{item.name}: 見積単価 {ov['estimate_price']:,}円 → {int(val):,}円"
@@ -1141,7 +1164,12 @@ def _apply_ai_proposal(estimate_base: Estimate, mods: dict, p: dict) -> str | No
         proposed = p.get('proposed') or item.name
         desc = f"{item.name}: 仕様変更 → {proposed}"
         ov['name'] = proposed
-        ov['summary'] = (p.get('reason') or '')[:40]
+        # 名称と同じ文言を摘要へ重複させない。金額の指定があれば単価も更新する
+        ov['summary'] = _distinct_summary(p.get('reason', ''), proposed)
+        val = _amount_of(p)
+        if val is not None and int(val) != int(ov['estimate_price']):
+            desc += f"（単価 {int(ov['estimate_price']):,}円 → {int(val):,}円）"
+            ov['estimate_price'] = int(val)
     mods.setdefault('overrides', {})[key] = ov
     return desc
 
@@ -2542,7 +2570,7 @@ def main():
             st.caption("💾 データ保存: クラウド永続化 有効")
         else:
             st.caption("⚠️ データ保存: 一時保存（再起動で消える場合があります）")
-        st.caption("build 2026-07-31.1")
+        st.caption("build 2026-07-31.2")
 
     # 単価マスタ読み込み
     csv_path = os.path.join(base_dir, "tankamaster_updated.csv")
@@ -3924,64 +3952,154 @@ def main():
                                 except Exception as exc:
                                     st.error(f"解析に失敗しました: {exc}")
 
-                # --- 変更案の確認・承認 ---
+                # --- 変更案の確認・修正・承認 ---
                 proposals = get_project_state('ai_proposals')
                 if proposals:
                     st.markdown("---")
-                    st.markdown(f"##### 抽出された変更案（{len(proposals)}件）— 反映するものにチェック")
-                    conf_mark = {'high': '🟢', 'medium': '🟡', 'low': '🔴'}
+                    st.markdown(f"##### 抽出された変更案（{len(proposals)}件）— 内容を修正してから反映できます")
+                    conf_mark = {'high': '🟢 高', 'medium': '🟡 中', 'low': '🔴 低'}
                     # 提案書由来の変更案は内容の偽装リスクがあるため初期チェックを
                     # 付けない（音声指示のみ高確度を初期チェック）
                     src_now = get_project_state('ai_proposals_src', '')
                     default_check_ok = src_now.startswith('音声')
                     if not default_check_ok:
                         st.caption("⚠️ 書類から抽出した変更案です。内容をご確認のうえ、反映するものにチェックしてください。")
+                    st.caption(
+                        "読み取りが正しくない行は、品名・変更後の内容・金額を"
+                        "この表で直してから反映してください。"
+                        "金額が空欄（0円）の「追加」は見積の行にせず、打合せメモとして変更履歴にのみ記録します。")
+
+                    ctype_label = {'price': '単価変更', 'quantity': '数量変更',
+                                   'add': '追加', 'remove': '削除', 'spec': '仕様変更'}
+                    prop_rows = []
+                    for p in proposals:
+                        amt = p.get('amount')
+                        if not isinstance(amt, (int, float)):
+                            amt = _parse_amount_jp(p.get('proposed')) or 0
+                        prop_rows.append({
+                            '反映': bool(default_check_ok and p.get('confidence') == 'high'),
+                            '工事種別': p.get('category', ''),
+                            '品名': p.get('item_name', ''),
+                            '変更の種類': ctype_label.get(p.get('change_type'), '仕様変更'),
+                            '変更後の内容': p.get('proposed', ''),
+                            '金額(円)': int(amt or 0),
+                            '読み取り': conf_mark.get(p.get('confidence'), '⚪'),
+                            '根拠': p.get('reason', ''),
+                        })
+                    edited_props = st.data_editor(
+                        pd.DataFrame(prop_rows),
+                        key=f"prop_editor_{current_pid}_{len(proposals)}",
+                        use_container_width=True, hide_index=True,
+                        column_config={
+                            '反映': st.column_config.CheckboxColumn('反映', width='small'),
+                            '変更の種類': st.column_config.SelectboxColumn(
+                                '変更の種類', options=list(ctype_label.values()), width='small'),
+                            '金額(円)': st.column_config.NumberColumn(
+                                '金額(円)', min_value=0, step=100, format='%d'),
+                            '読み取り': st.column_config.TextColumn('読み取り', width='small'),
+                            '根拠': st.column_config.TextColumn('根拠', width='large'),
+                        },
+                        disabled=['読み取り'],
+                    )
+
+                    label_to_ctype = {v: k for k, v in ctype_label.items()}
                     checked = []
-                    for i, p in enumerate(proposals):
-                        label = (
-                            f"{conf_mark.get(p.get('confidence'), '⚪')} "
-                            f"【{p.get('category', '?')}】{p.get('item_name', '?')}: "
-                            f"{p.get('current', '')} → {p.get('proposed', '')}")
-                        c = st.checkbox(
-                            label,
-                            value=(default_check_ok and p.get('confidence') == 'high'),
-                            key=f"prop_chk_{i}")
-                        if p.get('reason'):
-                            st.caption(f"　根拠: {p['reason']}")
-                        if c:
-                            checked.append(p)
+                    for _, row in edited_props.iterrows():
+                        if not row['反映']:
+                            continue
+                        checked.append({
+                            'category': str(row['工事種別'] or ''),
+                            'item_name': str(row['品名'] or ''),
+                            'change_type': label_to_ctype.get(str(row['変更の種類']), 'spec'),
+                            'proposed': str(row['変更後の内容'] or ''),
+                            'amount': int(row['金額(円)'] or 0),
+                            'reason': str(row['根拠'] or ''),
+                        })
+
+                    # 反映先: 元の見積を守るため、既定では変更見積（別プラン）を作る
+                    st.markdown("")
+                    to_new_plan = st.checkbox(
+                        "元の見積は変えず、変更見積（別プラン）を作成して反映する",
+                        value=True, key="props_to_new_plan",
+                        help="ONにすると現在の見積を複製した新しいプランに反映します。"
+                             "元の見積はそのまま残り、案件一覧のツリーで並べて比較できます。")
+                    plan_default = f"打合せ変更 {now_jst().strftime('%m/%d')}"
+                    new_plan_name = st.text_input(
+                        "変更見積のプラン名", value=plan_default,
+                        key="props_plan_name") if to_new_plan else ""
+
                     col_a, col_b = st.columns([1, 1])
                     with col_a:
-                        if st.button(f"選択した{len(checked)}件を見積に反映", type="primary",
+                        if st.button(f"選択した{len(checked)}件を反映", type="primary",
                                      disabled=not checked, key="btn_apply_props"):
                             src = get_project_state('ai_proposals_src', 'AI変更')
-                            applied, failed = [], []
+                            src_pid = current_pid
+
+                            # 金額のない「追加」は見積行にせず打合せメモへ回す
+                            to_apply, memos = [], []
                             for p in checked:
-                                desc = _apply_ai_proposal(estimate_base, mods, p)
+                                if p['change_type'] == 'add' and p['amount'] <= 0:
+                                    memos.append(f"{p['item_name']}: {p['proposed'] or p['reason']}")
+                                else:
+                                    to_apply.append(p)
+
+                            # 反映先の決定（別プラン or 現在の見積）
+                            if to_new_plan:
+                                persist_project_mods()  # 現在の状態を保存してから複製
+                                target_pid = duplicate_project(
+                                    src_pid, st.session_state['projects'],
+                                    new_plan_name or plan_default)
+                                st.session_state['current_project'] = target_pid
+                                restore_project_to_session(target_pid)
+                                target_mods = st.session_state.get(f"proj_{target_pid}_mods")
+                                if not target_mods:
+                                    target_mods = {'overrides': {}, 'deleted': set(),
+                                                   'new_items': []}
+                                if isinstance(target_mods.get('deleted'), list):
+                                    target_mods['deleted'] = set(target_mods['deleted'])
+                            else:
+                                target_pid = src_pid
+                                target_mods = mods
+
+                            applied, failed = [], []
+                            for p in to_apply:
+                                desc = _apply_ai_proposal(estimate_base, target_mods, p)
                                 if desc:
                                     applied.append(desc)
                                 else:
                                     failed.append(f"{p.get('category', '')}/{p.get('item_name', '')}")
-                            if applied:
-                                set_project_state('mods', mods)
+
+                            if applied or memos:
+                                st.session_state[f"proj_{target_pid}_mods"] = target_mods
                                 # 変更履歴フックのスナップショットを先に更新し、
                                 # 「手動修正」としての二重記録を防いだうえで
                                 # 正しい種別（音声変更/提案書反映）で記録する
                                 snap = json.dumps(_convert_sets({
-                                    'overrides': mods.get('overrides', {}),
-                                    'deleted': mods.get('deleted', set()),
-                                    'new_items': mods.get('new_items', []),
+                                    'overrides': target_mods.get('overrides', {}),
+                                    'deleted': target_mods.get('deleted', set()),
+                                    'new_items': target_mods.get('new_items', []),
                                 }), ensure_ascii=False, sort_keys=True)
-                                st.session_state[f'_mods_logged_{current_pid}'] = snap
+                                st.session_state[f'_mods_logged_{target_pid}'] = snap
                                 persist_project_mods()
-                                append_project_changelog(
-                                    current_pid, src.split('（')[0], ' / '.join(applied[:10]))
-                            set_project_state('ai_proposals', None)
-                            set_project_state('ai_transcript', '')
+                                if applied:
+                                    append_project_changelog(
+                                        target_pid, src.split('（')[0], ' / '.join(applied[:10]))
+                                for memo in memos:
+                                    append_project_changelog(target_pid, '打合せメモ', memo)
+
+                            # 変更案は複製元・複製先の両方でクリアする
+                            st.session_state[f"proj_{src_pid}_ai_proposals"] = None
+                            st.session_state[f"proj_{src_pid}_ai_transcript"] = ''
+                            st.session_state[f"proj_{target_pid}_ai_proposals"] = None
+                            st.session_state[f"proj_{target_pid}_ai_transcript"] = ''
                             if failed:
                                 _flash("対象を特定できず反映できなかった変更: " + " / ".join(failed), "warning")
+                            if memos:
+                                _flash(f"金額のない{len(memos)}件は見積行にせず、打合せメモとして変更履歴に記録しました。", "info")
                             if applied:
-                                _flash(f"{len(applied)}件を見積に反映しました（変更履歴に記録済み）。")
+                                where = (f"変更見積「{new_plan_name or plan_default}」"
+                                         if to_new_plan else "この見積")
+                                _flash(f"{len(applied)}件を{where}に反映しました（変更履歴に記録済み）。")
                             st.rerun()
                     with col_b:
                         if st.button("変更案をクリア", key="btn_clear_props"):
