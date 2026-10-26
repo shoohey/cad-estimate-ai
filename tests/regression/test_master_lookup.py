@@ -57,8 +57,9 @@ class TestParsePriceMasterBundled:
         assert all(isinstance(r['estimate_price'], int) and isinstance(r['order_price'], int) for r in rows)
         assert all(isinstance(r['row_no'], int) for r in rows)
         assert [r['row_no'] for r in rows] == sorted(r['row_no'] for r in rows)
-        assert set(rows[0].keys()) == {'code', 'category', 'name', 'summary', 'unit', 'order_price',
-                                       'estimate_price', 'row_no'}
+        assert {'code', 'category', 'name', 'summary', 'unit', 'order_price',
+                'estimate_price', 'row_no'} <= set(rows[0].keys())
+        assert {'group', 'cost_kind', 'breakdown_of'} <= set(rows[0].keys())   # 設計部マスタ形式の追加列
         json.dumps(rows, ensure_ascii=False)                          # クラウド保存できる形
 
     def test_categories_follow_code_prefix(self, parsed):
@@ -98,8 +99,10 @@ class TestParsePriceMasterFiles:
         rows, errors = ml.parse_price_master(data, 'design_master.xlsx')
         assert [r['name'] for r in rows] == ['外部足場組', '仮設ﾄｲﾚ', 'ﾍﾞﾀ基礎', '要打合せ項目']
         assert [r['category'] for r in rows] == ['仮設工事', '仮設工事', '基礎工事', '基礎工事']
-        assert rows[0] == {'code': '10001', 'category': '仮設工事', 'name': '外部足場組', 'summary': '養生ﾈｯﾄ等含む',
-                           'unit': '㎡', 'order_price': 600, 'estimate_price': 1200, 'row_no': 5}
+        expected = {'code': '10001', 'category': '仮設工事', 'name': '外部足場組', 'summary': '養生ﾈｯﾄ等含む',
+                    'unit': '㎡', 'order_price': 600, 'estimate_price': 1200, 'row_no': 5}
+        assert {k: rows[0][k] for k in expected} == expected
+        assert rows[0]['breakdown_of'] == '' and rows[0]['group'] == ''
         assert rows[1]['estimate_price'] == 35800 and rows[1]['order_price'] == 25000 and rows[1]['code'] == ''
         assert rows[2]['code'] == '20002' and rows[2]['row_no'] == 8
         assert rows[3]['estimate_price'] == 0
@@ -378,3 +381,45 @@ class TestMergeAliasEntries:
         assert added == 3 and len(new_lib) == 3
         assert ml.merge_alias_entries([entries[0]], None) == ([entries[0]], 0)
         assert ml.merge_alias_entries(None, None) == ([], 0)
+
+
+class TestDesignMasterFormat:
+    """設計部の単価マスタ形式（コード/分類/種別/名称/摘要/.../30％販価/33％販価/設計原価/工事費・内訳行）"""
+
+    def _book(self):
+        import io
+        import openpyxl
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(['コード', '分類', '種別', '名称', '摘要', '標準', '手間なしテンプレート', '単位',
+                   '30％販価(税別)', '33％販価(税別)', '設計原価【51期】', '工事費'])
+        ws.append(['2', '2.構造オプション工事', None, 'ウッドデッキ ※概算', '床のみ', None, '済', '㎡', '¥51,500', '¥53,800', 36000, '材工'])
+        ws.append(['2-KS-002', '2.構造オプション工事', '基礎工事', '深基礎', '高低差450mm以下', None, '済', 'm', '¥11,500', '¥12,000', 8000, '材工'])
+        ws.append(['2-ST-001', '2.構造オプション工事', '左官・タイル工事', '玄関・ポーチ タイル貼り', '標準タイル材工', None, '済', '㎡', '¥22,000', '¥23,000', 15360, '材工'])
+        ws.append(['2-ST-001-1', '2.構造オプション工事', '左官・タイル工事', 'ㅤ‬内訳①：[材] 玄関・ポーチ土間仕上', '標準タイル材料', None, '', '㎡', '¥7,700', '¥8,000', 5360, '工事費別途'])
+        ws.append(['2-ST-001-2', '2.構造オプション工事', '左官・タイル工事', 'ㅤ‬内訳②：[工] 標準タイル材料 施工費', '', None, '', '㎡', '¥14,300', '¥15,000', 10000, '工事費'])
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+
+    def test_prices_category_group_and_breakdown(self):
+        rows, errors = ml.parse_price_master(self._book(), 'design.xlsx')
+        assert not errors
+        by_code = {r['code']: r for r in rows}
+        # 33％販価を見積単価に、設計原価を発注単価に
+        assert by_code['2-KS-002']['estimate_price'] == 12000 and by_code['2-KS-002']['order_price'] == 8000
+        assert by_code['2']['estimate_price'] == 53800
+        # 種別があれば種別、無ければ分類を工事種別に。分類は group に残す
+        assert by_code['2-KS-002']['category'] == '基礎工事' and by_code['2-KS-002']['group'] == '2.構造オプション工事'
+        assert by_code['2']['category'] == '2.構造オプション工事'
+        # 内訳行は親コードに紐づき、見えない文字が除かれる
+        assert by_code['2-ST-001-1']['breakdown_of'] == '2-ST-001'
+        assert by_code['2-ST-001-1']['name'].startswith('内訳①')
+        assert by_code['2-ST-001-1']['cost_kind'] == '工事費別途' and by_code['2-ST-001']['cost_kind'] == '材工'
+        assert by_code['2-ST-001']['breakdown_of'] == ''
+
+    def test_suggest_skips_breakdown_rows(self):
+        rows, _ = ml.parse_price_master(self._book(), 'design.xlsx')
+        out = ml.suggest_similar('玄関ポーチ タイル', '300角', rows, top_n=5)
+        assert out and all('内訳' not in o['name'] for o in out)
+        assert out[0]['name'] == '玄関・ポーチ タイル貼り'

@@ -42,12 +42,14 @@ _MASTER_COLUMN_RULES: list[tuple[str, set[str], str]] = [
     ('order_price', {'発注単価', '原価', '仕入単価', '仕入価格', '発注価格', '原単価', '仕入値', '仕入', '発注',
                      '原価単価', '発注金額'}, r'原価|仕入|発注'),
     ('estimate_price', {'見積単価', '売単価', '販売単価', '単価', '売価', '見積価格', '販売価格', '提出単価',
-                        '見積', '金額'}, r'単価|売価|価格|金額'),
+                        '見積', '金額', '販価'}, r'販価|単価|売価|価格|金額'),
     ('unit', {'単位'}, r'^単位'),
     ('summary', {'摘要', '規格', '仕様', '備考', '規格仕様', '摘要規格', '仕様規格', '型番', '型式', '摘要備考'},
      r'摘要|規格|仕様|備考'),
-    ('category', {'工事種別', '工種', '種別', '分類', 'カテゴリ', '大分類', '工事区分', '区分', '工種名', '種別名'},
-     r'工事種別|工種|種別|分類|カテゴリ'),
+    ('category', {'工事種別', '工種', '種別', 'カテゴリ', '工事区分', '工種名', '種別名'},
+     r'工事種別|工種|種別|カテゴリ'),
+    ('group', {'分類', '大分類', '区分'}, r'分類|区分'),
+    ('cost_kind', {'工事費', '材工区分', '材工', '区分材工'}, r'^工事費$|材工'),
     ('name', {'名称', '品名', '工事名', '項目', '項目名', '品目', '名前', '内容', '工事項目', '工事内容', '商品名',
               '工事名称', '品名称', '名称品名', '品名名称'}, r'名称|品名|項目|工事名|品目'),
     ('code', {'工事コード', '工種コード', 'コード', 'code', 'no', '項目no', '番号', '項目番号', 'id'},
@@ -76,6 +78,9 @@ _LEGACY_PREFIX_SIGNATURE = {'22': '管理費', '23': '屋外付帯工事', '24':
 
 
 # ---------------------------------------------------------------- セル・見出しの正規化
+_RE_INVISIBLE = re.compile(r'[\u3164\u200b\u200c\u200d\u202a-\u202e\u2060\ufeff]')
+
+
 def _cell_text(value: Any) -> str:
     """セル値を文字列化（数値セルの 10001.0 → '10001'、NaN/None → ''）。前後の空白・全角空白を除く。"""
     if value is None:
@@ -88,7 +93,8 @@ def _cell_text(value: Any) -> str:
         return str(int(value)) if value.is_integer() else str(value)
     if isinstance(value, int):
         return str(value)
-    return str(value).strip(' \t\r\n　')
+    # 見えない文字（ハングル埋め草 U+3164・双方向制御 U+202A〜E・ゼロ幅空白・BOM）を除く
+    return _RE_INVISIBLE.sub('', str(value)).strip(' \t\r\n　')
 
 
 def _norm_header(value: Any) -> str:
@@ -177,6 +183,24 @@ def _load_tables(file_bytes: bytes, filename: str) -> tuple[list[list[list[Any]]
     return [], [f'対応していないファイル形式です（CSV または Excel .xlsx を選んでください）: {filename}']
 
 
+_PREFER_HEADER_RE = re.compile(r'33')   # 30%/33% 販価が並ぶマスタでは 33%（標準の粗利率）を採用
+
+
+def _prefer_33(cells: list[Any], cols: dict[str, int], key: str, rules: list[tuple[str, set[str], str]]) -> None:
+    """key に割り当てた列以外にも同じ規則に合う列があれば、見出しに「33」を含む列を優先する"""
+    if key not in cols:
+        return
+    rule = next((r for r in rules if r[0] == key), None)
+    if rule is None:
+        return
+    exact, partial = rule[1], re.compile(rule[2])
+    cands = [i for i, c in enumerate(cells)
+             if _norm_header(c) in exact or partial.search(_norm_header(c))]
+    pref = [i for i in cands if _PREFER_HEADER_RE.search(_norm_header(cells[i]))]
+    if pref and cols[key] not in pref:
+        cols[key] = pref[0]
+
+
 def _assign_columns(cells: list[Any], rules: list[tuple[str, set[str], str]]) -> dict[str, int]:
     headers = [_norm_header(c) for c in cells]
     mapping: dict[str, int] = {}
@@ -242,18 +266,25 @@ def _parse_master_table(rows: list[list[Any]], errors: list[str]) -> list[dict] 
         lambda m: 'name' in m and ('estimate_price' in m or 'order_price' in m))
     if header_idx is None:
         return None
+    _prefer_33(rows[header_idx], cols, 'estimate_price', _MASTER_COLUMN_RULES)
     out: list[dict] = []
     current_category = ''
+    current_group = ''
     cat_by_code: dict[str, str] = {}
+    last_parent_code = ''   # 内訳行（内訳①…）の親コード
     for i in range(header_idx + 1, len(rows)):
         cells, row_no = rows[i], i + 1
         get = _getter(cells, cols)
         name, summary, unit, code = get('name'), get('summary'), get('unit'), get('code')
         cat_cell = get('category')
+        group_cell = get('group')
+        cost_kind = get('cost_kind')
         raw_order, raw_est = get('order_price'), get('estimate_price')
         order_price, ok_order = _parse_price(raw_order)
         estimate_price, ok_est = _parse_price(raw_est)
 
+        if group_cell and not _is_numeric_code(group_cell):
+            current_group = group_cell
         explicit_category = ''
         if cat_cell:
             if _is_numeric_code(cat_cell) and not code:
@@ -261,6 +292,10 @@ def _parse_master_table(rows: list[list[Any]], errors: list[str]) -> list[dict] 
             elif not _is_numeric_code(cat_cell):
                 explicit_category = cat_cell
                 current_category = cat_cell          # 空欄は上の行の種別を引き継ぐ
+        elif group_cell and not _is_numeric_code(group_cell) and 'group' in cols and 'category' in cols:
+            # 「種別」が空の行は「分類」を種別として使う
+            explicit_category = group_cell
+            current_category = group_cell
 
         if not name:
             if summary or raw_order or raw_est or code:
@@ -276,9 +311,17 @@ def _parse_master_table(rows: list[list[Any]], errors: list[str]) -> list[dict] 
         if not ok_order:
             errors.append(f'{row_no}行目「{name}」: 発注単価『{raw_order}』を数値として読めません（0円として取り込みました）')
         category = explicit_category or _category_for_code(code, cat_by_code) or current_category
+        # 内訳行（「内訳①: [材] …」や親コード + '-1'）は親項目の材／工の内訳。
+        # 候補の語彙には親だけを使うため breakdown_of に親コードを残す
+        breakdown_of = ''
+        if re.match(r'^\s*内訳', name) or (last_parent_code and code and re.fullmatch(re.escape(last_parent_code) + r'-\d+', code)):
+            breakdown_of = last_parent_code
+        else:
+            last_parent_code = code or last_parent_code
         out.append({
-            'code': code, 'category': category, 'name': name, 'summary': summary, 'unit': unit,
-            'order_price': order_price, 'estimate_price': estimate_price, 'row_no': row_no,
+            'code': code, 'category': category, 'group': current_group, 'name': name, 'summary': summary,
+            'unit': unit, 'order_price': order_price, 'estimate_price': estimate_price, 'row_no': row_no,
+            'cost_kind': cost_kind, 'breakdown_of': breakdown_of,
         })
     return out
 
@@ -444,6 +487,7 @@ def suggest_similar(name: str, summary: str, master_rows: list[dict], top_n: int
     Returns:
         [{name, summary, category, unit, estimate_price, score(0〜1), reason}] score 降順
     """
+    master_rows = [r for r in (master_rows or []) if isinstance(r, dict) and not r.get('breakdown_of')]
     name, summary = _cell_text(name), _cell_text(summary)
     if not (name or summary) or not master_rows or top_n <= 0:
         return []

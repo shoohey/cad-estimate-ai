@@ -186,10 +186,11 @@ def parse_amount_jp(text: Any) -> float | None:
 
 # フィードバックのステータス（2026-08-07 MTG で合意した3段階フロー）
 FB_STATUS_OPEN = '未対応'
+FB_STATUS_WIP = '着手中'              # 開発側が着手・試行中（進み具合が分かるように。2026-10-26 MTG）
 FB_STATUS_FIXED = '高井対応済み'      # 開発側が修正・反映した
 FB_STATUS_DONE = '対応完了'           # お客様が確認してOK
 FB_STATUS_RETURNED = '差し戻し'       # お客様が確認してNG（コメント必須）
-FB_STATUSES = [FB_STATUS_OPEN, FB_STATUS_FIXED, FB_STATUS_DONE, FB_STATUS_RETURNED]
+FB_STATUSES = [FB_STATUS_OPEN, FB_STATUS_WIP, FB_STATUS_FIXED, FB_STATUS_DONE, FB_STATUS_RETURNED]
 _LEGACY_STATUS = {'対応済み': FB_STATUS_DONE, '': FB_STATUS_OPEN, None: FB_STATUS_OPEN}
 
 
@@ -202,7 +203,7 @@ def normalize_fb_status(status: Any) -> str:
 
 
 def fb_status_color(status: Any) -> str:
-    return {FB_STATUS_OPEN: '#dc2626', FB_STATUS_FIXED: '#2563eb',
+    return {FB_STATUS_OPEN: '#dc2626', FB_STATUS_WIP: '#7c3aed', FB_STATUS_FIXED: '#2563eb',
             FB_STATUS_DONE: '#16a34a', FB_STATUS_RETURNED: '#d97706'}.get(
         normalize_fb_status(status), '#dc2626')
 
@@ -232,7 +233,7 @@ def apply_fb_status_change(fb: dict, new_status: str, note: str, actor: str, at:
 
 
 # ---------------------------------------------------------------- 問い合わせの保持・アーカイブ
-ACTIVE_FB_STATUSES = [FB_STATUS_OPEN, FB_STATUS_FIXED, FB_STATUS_RETURNED]
+ACTIVE_FB_STATUSES = [FB_STATUS_OPEN, FB_STATUS_WIP, FB_STATUS_FIXED, FB_STATUS_RETURNED]
 
 
 def fb_is_archived(fb: dict) -> bool:
@@ -333,19 +334,26 @@ def _qty_text(qty: Any, unit: Any) -> str:
 
 PROJECT_SPECIFIC_LABEL = '案件特有'   # 図面に表れない物件固有の項目（全案件には該当しない）
 PROJECT_SPECIFIC_CATEGORY = '案件特有（図面に表れない項目）'
+EXCLUDED_LABEL = '除外'               # AIが計上したが不要な項目（理由付き）
+EXCLUDED_CATEGORY = 'AI項目の除外（不要）'
+EXCLUSION_REASONS = ['家の構造の違い', '地域・条例の違い', '仕様に含まない（オプション外）', '図面上は不要', 'その他']
 NOTE_SCOPE_GLOBAL = '全案件共通'
 NOTE_SCOPE_PROJECT = 'この案件のみ'
 
 
-def category_detail_rows(item_diff: dict | None, special_names: set | None = None) -> list[dict]:
+def category_detail_rows(item_diff: dict | None, special_names=None) -> list[dict]:
     """excel_diff の item_diffs[種別] を、画面に出す明細行に変換する。
 
     区分: 金額が違う → AIにしかない → 実績にしかない → 一致 の順、各区分内は差額の大きい順。
-    special_names: 「この案件特有（全案件には該当しない）」と登録済みの品名。'扱い' 列に表示する。
+    special_names: 登録済みの扱い。set なら全て「案件特有」、dict なら {品名: 扱いラベル}
+        （例: '案件特有' / '除外: 地域・条例の違い'）。'扱い' 列に表示する。
     """
     d = item_diff or {}
     rows: list[dict] = []
-    special = {_clean(n) for n in (special_names or set()) if _clean(n)}
+    if isinstance(special_names, dict):
+        special = {_clean(n): (_clean(v) or PROJECT_SPECIFIC_LABEL) for n, v in special_names.items() if _clean(n)}
+    else:
+        special = {_clean(n): PROJECT_SPECIFIC_LABEL for n in (special_names or set()) if _clean(n)}
     for m in d.get('matched', []) or []:
         if not isinstance(m, dict):
             continue
@@ -384,13 +392,30 @@ def category_detail_rows(item_diff: dict | None, special_names: set | None = Non
                      '実績数量': _qty_text(x.get('quantity'), x.get('unit')), '実績金額': amt,
                      '差額(AI−実績)': -amt, '登録済': False})
     for r in rows:
-        r['扱い'] = PROJECT_SPECIFIC_LABEL if (r['AI品名'] in special or r['実績品名'] in special) else ''
+        r['扱い'] = special.get(r['実績品名']) or special.get(r['AI品名']) or ''
     rows.sort(key=lambda r: (DETAIL_KIND_ORDER.index(r['区分']), -abs(r['差額(AI−実績)'])))
     return rows
 
 
 def special_count(rows: list[dict]) -> int:
     return sum(1 for r in rows or [] if r.get('扱い') == PROJECT_SPECIFIC_LABEL)
+
+
+def excluded_count(rows: list[dict]) -> int:
+    return sum(1 for r in rows or [] if str(r.get('扱い') or '').startswith(EXCLUDED_LABEL))
+
+
+def validate_exclusion_selection(selected_rows: list[dict], reason: str) -> tuple[str | None, list[dict]]:
+    """「不要（除外）」として登録する行の入力チェック。AIにしかない／金額が違う行が対象、理由は必須。"""
+    rows = [r for r in selected_rows or [] if isinstance(r, dict)]
+    if not rows:
+        return '登録する行にチェックを付けてください', []
+    if not _clean(reason):
+        return '不要の理由を選んでください', []
+    bad = [r for r in rows if r.get('区分') not in (DETAIL_KIND_AI_ONLY, DETAIL_KIND_DIFF)]
+    if bad:
+        return '「AIにしかない」または「金額が違う」の行だけを選んでください', []
+    return None, rows
 
 
 def validate_special_selection(selected_rows: list[dict]) -> tuple[str | None, list[dict]]:
@@ -417,6 +442,7 @@ def detail_kind_counts(rows: list[dict]) -> dict[str, int]:
         if k in counts:
             counts[k] += 1
     counts[PROJECT_SPECIFIC_LABEL] = special_count(rows)
+    counts[EXCLUDED_LABEL] = excluded_count(rows)
     return counts
 
 
@@ -431,6 +457,9 @@ def detail_header(cat: dict, counts: dict[str, int]) -> str:
     special = counts.get(PROJECT_SPECIFIC_LABEL, 0)
     if special:
         parts.append(f"{PROJECT_SPECIFIC_LABEL} {special}")
+    excluded = counts.get(EXCLUDED_LABEL, 0)
+    if excluded:
+        parts.append(f"{EXCLUDED_LABEL} {excluded}")
     return (f"{_clean(cat.get('name'))}　AI {ai:,}円 / 実績 {ac:,}円 / 差額 {ai - ac:+,}円　"
             f"｜ {'・'.join(parts)}")
 

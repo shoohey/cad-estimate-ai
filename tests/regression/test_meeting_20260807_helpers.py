@@ -64,7 +64,7 @@ class TestDimensionTokens:
 
 class TestFeedbackStatusFlow:
     def test_statuses(self):
-        assert FB_STATUSES == ['未対応', '高井対応済み', '対応完了', '差し戻し']
+        assert FB_STATUSES == ['未対応', '着手中', '高井対応済み', '対応完了', '差し戻し']
 
     def test_legacy_mapping(self):
         assert normalize_fb_status('対応済み') == '対応完了'
@@ -75,7 +75,7 @@ class TestFeedbackStatusFlow:
             assert normalize_fb_status(s) == s
 
     def test_colors_are_distinct(self):
-        assert len({fb_status_color(s) for s in FB_STATUSES}) == 4
+        assert len({fb_status_color(s) for s in FB_STATUSES}) == 5
 
     def test_returned_requires_note(self):
         assert validate_fb_status_change('差し戻し', '') is not None

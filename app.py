@@ -40,7 +40,9 @@ from ui_helpers import (project_display_label, project_full_label, merge_proposa
                         alias_entry_exists, validate_alias_selection, alias_applies,
                         ALIAS_SCOPE_GLOBAL, ALIAS_SCOPE_PROJECT, ALIAS_SCOPE_LABEL,
                         PROJECT_SPECIFIC_LABEL, PROJECT_SPECIFIC_CATEGORY, NOTE_SCOPE_GLOBAL,
-                        NOTE_SCOPE_PROJECT, validate_special_selection, special_note_name)
+                        NOTE_SCOPE_PROJECT, validate_special_selection, special_note_name,
+                        EXCLUDED_LABEL, EXCLUDED_CATEGORY, EXCLUSION_REASONS, validate_exclusion_selection,
+                        FB_STATUS_WIP)
 
 # ページ設定
 st.set_page_config(
@@ -1991,6 +1993,7 @@ def save_project_actual(proj_id: str, parsed: dict):
 DIFF_REASON_CATEGORIES = [
     "",
     "案件特有（図面に表れない項目）",
+    "AI項目の除外（不要）",
     "仕様・グレード差",
     "数量拾いの差",
     "AIの計上漏れ",
@@ -2823,7 +2826,7 @@ def main():
             st.caption("💾 データ保存: クラウド永続化 有効")
         else:
             st.caption("⚠️ データ保存: 一時保存（再起動で消える場合があります）")
-        st.caption("build 2026-10-26.8")
+        st.caption("build 2026-10-26.9")
 
     # 単価マスタ読み込み
     csv_path = os.path.join(base_dir, "tankamaster_updated.csv")
@@ -3974,11 +3977,18 @@ def main():
 
                 proj_notes = load_project_diff_notes(current_pid)
 
-                def _special_names_of(cat_name: str) -> set:
+                def _special_names_of(cat_name: str) -> dict:
+                    """この種別で登録済みの扱い {品名: ラベル}（案件特有／除外: 理由）"""
                     prefix = f"{cat_name}|"
-                    return {k[len(prefix):] for k, v in proj_notes.items()
-                            if k.startswith(prefix) and isinstance(v, dict)
-                            and v.get('category') == PROJECT_SPECIFIC_CATEGORY}
+                    out = {}
+                    for k, v in proj_notes.items():
+                        if not (k.startswith(prefix) and isinstance(v, dict)):
+                            continue
+                        if v.get('category') == PROJECT_SPECIFIC_CATEGORY:
+                            out[k[len(prefix):]] = PROJECT_SPECIFIC_LABEL
+                        elif v.get('category') == EXCLUDED_CATEGORY:
+                            out[k[len(prefix):]] = f"{EXCLUDED_LABEL}: {str(v.get('reason') or '').split('：')[0][:20]}"
+                    return out
 
                 for cd in diff['category_diffs']:
                     detail_rows = category_detail_rows(item_diffs.get(cd['name']),
@@ -4124,6 +4134,43 @@ def main():
                                             current_pid, '実績取込',
                                             f"案件特有として登録: " + " / ".join(e['item'] for e in lib_entries))
                                         _flash(f"{len(rows_sel)}件を「この案件特有（全案件には該当しない）」として登録しました。")
+                                        st.rerun()
+                                # AIが計上したが不要な項目: 理由（構造・条例など）付きで登録し、学習の材料にする
+                                ex1, ex2, ex3 = st.columns([1.2, 1.8, 1])
+                                ex_reason = ex1.selectbox("不要の理由", EXCLUSION_REASONS,
+                                                          key=f"excl_reason_{current_pid}_{cd['no']}")
+                                ex_note = ex2.text_input("補足（任意。例: 平屋のため2階分は不要／○○市は△△が条例で必須）",
+                                                         key=f"excl_note_{current_pid}_{cd['no']}")
+                                if ex3.button("チェックした行を「不要（除外）」として登録",
+                                              key=f"excl_reg_{current_pid}_{cd['no']}",
+                                              help="AIにしかない／金額が違う行が対象。適用範囲は上の「この読み替えは」の選択に従います"):
+                                    selected = [r for r in edited_reg.to_dict('records') if r.get('選択')]
+                                    err, rows_sel = validate_exclusion_selection(selected, ex_reason)
+                                    if err:
+                                        st.error(err)
+                                    else:
+                                        scope = ('project' if scope_label.startswith("この案件") else 'global')
+                                        reason_text = ex_reason + (f"：{ex_note.strip()}" if ex_note.strip() else "")
+                                        new_notes = dict(proj_notes)
+                                        lib_entries = []
+                                        for r in rows_sel:
+                                            nm = _clean_name = (r.get('AI品名') or r.get('実績品名') or '').strip()
+                                            key = diff_note_key(cd['name'], nm)
+                                            new_notes[key] = {
+                                                'category': EXCLUDED_CATEGORY, 'reason': reason_text, 'scope': scope,
+                                                'diff': int(r.get('差額(AI−実績)') or 0),
+                                                'updated_at': now_jst().strftime('%Y-%m-%d %H:%M'),
+                                            }
+                                            lib_entries.append({'key': key, 'item': nm, 'category': EXCLUDED_CATEGORY,
+                                                                'reason': reason_text, 'property': alias_prop_name,
+                                                                'diff': new_notes[key]['diff'], 'scope': scope})
+                                        save_project_diff_notes(current_pid, new_notes)
+                                        update_diff_reason_library(lib_entries)
+                                        append_project_changelog(
+                                            current_pid, '実績取込',
+                                            f"不要（除外）として登録: " + " / ".join(e['item'] for e in lib_entries)
+                                            + f"（{reason_text}・{'この案件のみ' if scope == 'project' else '全案件共通'}）")
+                                        _flash(f"{len(rows_sel)}件を「不要（除外）」として登録しました（{reason_text}）。")
                                         st.rerun()
 
                 # ===== 登録済みの「同じ商品」一覧（適用範囲の変更・解除） =====
@@ -4803,18 +4850,36 @@ def main():
         if ex:
             data = ex['data'] or {}
             st.markdown(f"##### 読み取り結果（{ex['file']}）　確度: {data.get('confidence') or '-'}")
-            p1, p2, p3, p4 = st.columns(4)
-            p1.metric("延床面積", f"{float(data.get('total_floor_area_m2') or 0):.2f}㎡")
-            p2.metric("階数", f"{data.get('floors') or '-'}")
-            p3.metric("建築面積", f"{float(data.get('building_area_m2') or 0):.2f}㎡")
-            p4.metric("部屋数 / 建具数", f"{len(data.get('rooms') or [])} / {len(data.get('fittings') or [])}")
+            st.caption("読み取りが違っていればここで直してください。直した値で概算を作成します（部屋・建具は行の追加・削除もできます）。")
+            pdf_key = re.sub(r'[^0-9A-Za-z_]+', '_', ex['file'])
+            p1, p2, p3 = st.columns(3)
+            v_total = p1.number_input("延床面積（㎡）", min_value=0.0, step=0.01,
+                                      value=float(data.get('total_floor_area_m2') or 0), key=f"pdf_total_{pdf_key}")
+            v_floors = p2.number_input("階数", min_value=0, max_value=4, step=1,
+                                       value=int(data.get('floors') or 0), key=f"pdf_floors_{pdf_key}")
+            v_build = p3.number_input("建築面積（㎡）", min_value=0.0, step=0.01,
+                                      value=float(data.get('building_area_m2') or 0), key=f"pdf_build_{pdf_key}")
             pc1, pc2 = st.columns(2)
             with pc1:
-                if data.get('rooms'):
-                    st.dataframe(pd.DataFrame(data['rooms']), use_container_width=True, hide_index=True, height=260)
+                st.markdown("**部屋**")
+                rooms_df = pd.DataFrame(data.get('rooms') or [], columns=['name', 'floor', 'area_m2'])
+                ed_rooms = st.data_editor(rooms_df, num_rows="dynamic", use_container_width=True, hide_index=True,
+                                          height=260, key=f"pdf_rooms_{pdf_key}",
+                                          column_config={'name': '部屋名', 'floor': '階', 'area_m2': st.column_config.NumberColumn('面積(㎡)', format='%.2f')})
             with pc2:
-                if data.get('fittings'):
-                    st.dataframe(pd.DataFrame(data['fittings']), use_container_width=True, hide_index=True, height=260)
+                st.markdown("**建具**")
+                fit_df = pd.DataFrame(data.get('fittings') or [],
+                                      columns=['kind', 'name', 'width_mm', 'height_mm', 'count', 'location'])
+                ed_fit = st.data_editor(fit_df, num_rows="dynamic", use_container_width=True, hide_index=True,
+                                        height=260, key=f"pdf_fit_{pdf_key}",
+                                        column_config={'kind': '種類', 'name': '名称', 'width_mm': 'W(mm)', 'height_mm': 'H(mm)',
+                                                       'count': '数', 'location': '場所'})
+            # 編集後の値を読み取り結果に反映（概算作成・比較はこの値を使う）
+            data = {**data, 'total_floor_area_m2': v_total or None, 'floors': int(v_floors) or None,
+                    'building_area_m2': v_build or None,
+                    'rooms': [r for r in ed_rooms.to_dict('records') if str(r.get('name') or '').strip()],
+                    'fittings': [r for r in ed_fit.to_dict('records') if str(r.get('name') or r.get('kind') or '').strip()]}
+            st.session_state['_pdf_extracted']['data'] = data
             if data.get('notes'):
                 with st.expander(f"読み取り時の注意（{len(data['notes'])}）"):
                     for n in data['notes']:
@@ -5285,7 +5350,7 @@ def main():
                         if err:
                             st.error(err)
                         else:
-                            actor = '高井' if new_status == FB_STATUS_FIXED else 'お客様'
+                            actor = '高井' if new_status in (FB_STATUS_FIXED, FB_STATUS_WIP) else 'お客様'
                             proj_fbs = load_project_feedbacks(target_pid)
                             updated = None
                             # タイムスタンプと内容で一致するものを探す

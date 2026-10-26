@@ -180,11 +180,11 @@ class TestFeedbackStatusFlowInApp:
         assert views and list(views[0].options) == ["対応中（1）", "アーカイブ・対応完了（0）", "全て"]
         radios = [r for r in at.radio if r.key == "fb_filter_active"]
         assert radios, "表示フィルターが無い"
-        assert list(radios[0].options) == ["全て", "未対応", "高井対応済み", "差し戻し"]
+        assert list(radios[0].options) == ["全て", "未対応", "着手中", "高井対応済み", "差し戻し"]
 
         sel = [s for s in at.selectbox if s.key == "status_fb_sample_furui_0_sel"]
         assert sel, "ステータス変更の選択欄が無い"
-        assert list(sel[0].options) == ["高井対応済み", "対応完了", "差し戻し"]
+        assert list(sel[0].options) == ["着手中", "高井対応済み", "対応完了", "差し戻し"]
 
         # 差し戻しはコメント必須
         sel[0].select("差し戻し")
