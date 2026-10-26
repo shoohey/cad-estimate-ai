@@ -1574,6 +1574,42 @@ def save_cad_file(proj_id: str, file_bytes: bytes):
             _warn_cloud_error(exc)
 
 
+def save_actual_file(proj_id: str, file_bytes: bytes, file_name: str):
+    """実績見積の元Excelを保存（ローカル＋クラウド）。突合ロジックを改善したときに再解析できるようにする"""
+    path = os.path.join(PROJECTS_DIR, f"{proj_id}_actual.xlsx")
+    with open(path, 'wb') as f:
+        f.write(file_bytes)
+    st.session_state.setdefault('_actual_file_cache', {})[proj_id] = (file_bytes, file_name)
+    if _cloud_ok():
+        try:
+            cloud_store.put(f"proj:{proj_id}:actual_file",
+                            {"b64": base64.b64encode(file_bytes).decode('ascii'), "name": file_name})
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
+
+
+def load_actual_file(proj_id: str):
+    """保存済みの実績見積Excel (bytes, name) を返す。無ければ None"""
+    cache = st.session_state.setdefault('_actual_file_cache', {})
+    if proj_id in cache:
+        return cache[proj_id]
+    result = None
+    if _cloud_ok():
+        try:
+            val = cloud_store.get(f"proj:{proj_id}:actual_file")
+            if isinstance(val, dict) and val.get("b64"):
+                result = (base64.b64decode(val["b64"]), val.get("name", "actual.xlsx"))
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
+    if result is None:
+        path = os.path.join(PROJECTS_DIR, f"{proj_id}_actual.xlsx")
+        if os.path.exists(path):
+            with open(path, 'rb') as f:
+                result = (f.read(), os.path.basename(path))
+    cache[proj_id] = result
+    return result
+
+
 def dedupe_feedbacks(fbs: list) -> list:
     """同じ内容が二重に登録されたフィードバックを1件にまとめる。
 
@@ -2787,7 +2823,7 @@ def main():
             st.caption("💾 データ保存: クラウド永続化 有効")
         else:
             st.caption("⚠️ データ保存: 一時保存（再起動で消える場合があります）")
-        st.caption("build 2026-10-26.7")
+        st.caption("build 2026-10-26.8")
 
     # 単価マスタ読み込み
     csv_path = os.path.join(base_dir, "tankamaster_updated.csv")
@@ -3813,8 +3849,10 @@ def main():
                 "提出見積Excel（.xlsx）をアップロード", type=['xlsx'], key="actual_upload")
             if up_actual is not None and st.button("実績見積を取り込む", type="primary"):
                 try:
-                    parsed = excel_diff.parse_actual_estimate(up_actual.read())
+                    actual_bytes = up_actual.getvalue()
+                    parsed = excel_diff.parse_actual_estimate(actual_bytes)
                     save_project_actual(current_pid, parsed)
+                    save_actual_file(current_pid, actual_bytes, up_actual.name)
                     append_project_changelog(
                         current_pid, '実績取込',
                         f"実績見積を取込（税抜 {parsed.get('total_excl_tax', 0):,}円 / {up_actual.name}）")
@@ -3841,6 +3879,24 @@ def main():
             if actual is None:
                 st.info("この案件の実績見積はまだ取り込まれていません。")
             else:
+                # 突合ロジック改善前に取り込んだ実績は内訳（N-M-K）が展開されていない。
+                # 元Excelが保存されていれば再解析、無ければ再アップロードを案内する
+                has_groups = any(c.get('groups') for c in actual.get('categories', []))
+                if not has_groups:
+                    saved_file = load_actual_file(current_pid)
+                    rc1, rc2 = st.columns([3, 1])
+                    rc1.info("この実績見積は以前の読み取り方式で取り込まれています。"
+                             "最新の突合（内訳行の展開）を使うには再解析してください。"
+                             + ("" if saved_file else "元のExcelが保存されていないため、再アップロードをお願いします。"))
+                    if saved_file and rc2.button("最新の方式で再解析", key="reparse_actual", type="primary"):
+                        try:
+                            parsed = excel_diff.parse_actual_estimate(saved_file[0])
+                            save_project_actual(current_pid, parsed)
+                            append_project_changelog(current_pid, '実績取込', f"実績見積を最新の方式で再解析（{saved_file[1]}）")
+                            _flash("実績見積を再解析しました。")
+                            st.rerun()
+                        except Exception as exc:  # noqa: BLE001
+                            st.error(f"再解析に失敗しました: {exc}")
                 # 取り込み時の注意は差分を見るたびに参照できるようにしておく
                 actual_warnings = actual.get('warnings') or []
                 if actual_warnings:
