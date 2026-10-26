@@ -5,6 +5,7 @@ Streamlitアプリの3つのAI機能の基盤を提供する:
   (A) 音声データの文字起こし (打合せ音声・音声コマンド) - OpenAI Whisper API
   (B) 提案書・打合せ記録からの見積変更案抽出 - Anthropic Messages API
   (C) 音声コマンドテキストの数量変更指示への構造化 - Anthropic Messages API
+  (D) PDF図面からの数量抽出 (検証用) - Anthropic Messages API (PDF document ブロック)
 
 設定 (環境変数 → Streamlit secrets の順で取得):
   - ANTHROPIC_API_KEY : テキスト解析用 (必須)
@@ -16,9 +17,13 @@ Streamlitアプリの3つのAI機能の基盤を提供する:
 
 from __future__ import annotations
 
+import base64
 import io
 import json
+import math
 import os
+import re
+import unicodedata
 from typing import Any
 
 import requests
@@ -34,7 +39,12 @@ WHISPER_MODEL = "whisper-1"
 
 TEXT_TIMEOUT_SEC = 120   # テキスト解析 (Anthropic)
 AUDIO_TIMEOUT_SEC = 300  # 音声文字起こし (Whisper)
+PDF_TIMEOUT_SEC = 300    # PDF図面の数量抽出 (Anthropic・ページ数が多いと時間がかかる)
 MAX_TOKENS = 8000
+
+# PDF document ブロックの上限 (Anthropic Messages API の制約)
+PDF_MAX_BYTES = 32 * 1024 * 1024   # 32MB
+PDF_MAX_PAGES = 100
 
 # 変更案スキーマの許容値
 _CHANGE_TYPES = {"price", "quantity", "spec", "add", "remove"}
@@ -82,8 +92,15 @@ def _get_model() -> str:
     return _get_secret("AI_MODEL") or DEFAULT_MODEL
 
 
-def _call_anthropic(system: str, user_text: str) -> str:
-    """Anthropic Messages API を requests 直呼びで実行し、応答テキストを返す。"""
+def _post_anthropic(system: str, content: Any, timeout: int = TEXT_TIMEOUT_SEC) -> str:
+    """Anthropic Messages API を requests 直呼びで実行し、応答テキストを返す。
+
+    Args:
+        system: システムプロンプト。
+        content: user メッセージの content。文字列、または content ブロックのリスト
+            (PDF document ブロック + text ブロック等)。
+        timeout: 読み取りタイムアウト秒。
+    """
     api_key = _get_secret("ANTHROPIC_API_KEY")
     if not api_key:
         raise AIClientError(
@@ -96,18 +113,18 @@ def _call_anthropic(system: str, user_text: str) -> str:
                 "model": _get_model(),
                 "max_tokens": MAX_TOKENS,
                 "system": system,
-                "messages": [{"role": "user", "content": user_text}],
+                "messages": [{"role": "user", "content": content}],
             },
             headers={
                 "x-api-key": api_key,
                 "anthropic-version": ANTHROPIC_VERSION,
                 "Content-Type": "application/json",
             },
-            timeout=TEXT_TIMEOUT_SEC,
+            timeout=timeout,
         )
     except requests.Timeout as exc:
         raise AIClientError(
-            f"AI解析がタイムアウトしました ({TEXT_TIMEOUT_SEC}秒)。時間をおいて再試行してください。"
+            f"AI解析がタイムアウトしました ({timeout}秒)。時間をおいて再試行してください。"
         ) from exc
     except requests.RequestException as exc:
         raise AIClientError(f"AI解析APIへの接続に失敗しました: {exc}") from exc
@@ -127,6 +144,11 @@ def _call_anthropic(system: str, user_text: str) -> str:
     if not text:
         raise AIClientError("AI解析APIの応答にテキストが含まれていませんでした。")
     return text
+
+
+def _call_anthropic(system: str, user_text: str) -> str:
+    """テキストのみの user メッセージで Anthropic Messages API を実行する (後方互換)。"""
+    return _post_anthropic(system, user_text, TEXT_TIMEOUT_SEC)
 
 
 def _strip_code_fence(text: str) -> str:
@@ -218,6 +240,240 @@ def _run_change_extraction(system: str, user_text: str) -> list[dict[str, Any]]:
                 f"AIの応答をJSONとして解析できませんでした: {raw[:200]}"
             ) from exc
     return [_normalize_change(item) for item in items]
+
+
+# --- PDF図面からの数量抽出 (内部ヘルパー) --------------------------------
+
+# extract_quantities_from_pdf が返す dict のキー (固定)
+EXTRACTION_KEYS = (
+    "property_name", "structure", "floors", "total_floor_area_m2", "floor_areas",
+    "building_area_m2", "perimeter_m", "rooms", "fittings", "roof",
+    "exterior_wall_area_m2", "notes", "confidence", "source_pages",
+)
+
+_NUMBER_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
+
+
+def parse_number(value: Any) -> float | None:
+    """数値らしい値を float に正規化する。読めなければ None。
+
+    - int / float はそのまま float にする (bool・NaN・無限大は None)
+    - 文字列は全角→半角 (NFKC) 正規化と桁区切りカンマ除去のうえ、最初に現れる数値を採用する
+      ("115.30㎡" → 115.3、"２,７００" → 2700.0、"約 4.5 m" → 4.5)
+    - それ以外 (list / dict 等) は None
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        f = float(value)
+        return f if math.isfinite(f) else None
+    if isinstance(value, str):
+        text = unicodedata.normalize("NFKC", value).replace(",", "").strip()
+        m = _NUMBER_RE.search(text)
+        if not m:
+            return None
+        try:
+            f = float(m.group(0))
+        except ValueError:
+            return None
+        return f if math.isfinite(f) else None
+    return None
+
+
+def _to_positive(value: Any) -> float | None:
+    """正の数値のみ返す (0 以下・読めない値は None)。面積・長さ・寸法用。"""
+    f = parse_number(value)
+    return f if f is not None and f > 0 else None
+
+
+def _to_int(value: Any) -> int | None:
+    """整数に正規化する (2.0 → 2、"2階建" → 2)。読めなければ None。"""
+    f = parse_number(value)
+    return int(round(f)) if f is not None else None
+
+
+def _to_text(value: Any) -> str | None:
+    """空白を除いた文字列を返す。None / 空文字 / bool は None。"""
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _as_list(value: Any) -> list:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return []
+
+
+def normalize_extraction(raw: Any) -> dict[str, Any]:
+    """AIの応答 (JSONオブジェクト) を EXTRACTION_KEYS の固定スキーマに正規化する。
+
+    型が合わない値は None (または空) にし、例外は送出しない。
+    面積・長さ・寸法は正の数値のみ採用する (0 以下や文字列混入は None)。
+    """
+    if not isinstance(raw, dict):
+        raw = {}
+
+    floor_areas: dict[str, float] = {}
+    fa = raw.get("floor_areas")
+    if isinstance(fa, dict):
+        for key, val in fa.items():
+            label = _to_text(key)
+            area = _to_positive(val)
+            if label and area is not None:
+                floor_areas[label] = area
+    elif isinstance(fa, list):
+        # [{"floor": "1階", "area_m2": 55.5}] 形式で返ってきた場合も受け付ける
+        for entry in fa:
+            if not isinstance(entry, dict):
+                continue
+            label = _to_text(entry.get("floor") or entry.get("name"))
+            area = _to_positive(entry.get("area_m2") or entry.get("area"))
+            if label and area is not None:
+                floor_areas[label] = area
+
+    rooms: list[dict[str, Any]] = []
+    for r in _as_list(raw.get("rooms")):
+        if not isinstance(r, dict):
+            continue
+        name = _to_text(r.get("name"))
+        if not name:
+            continue
+        rooms.append({
+            "name": name,
+            "floor": _to_text(r.get("floor")),
+            "area_m2": _to_positive(r.get("area_m2")),
+        })
+
+    fittings: list[dict[str, Any]] = []
+    for f in _as_list(raw.get("fittings")):
+        if not isinstance(f, dict):
+            continue
+        kind = _to_text(f.get("kind"))
+        name = _to_text(f.get("name"))
+        if not (kind or name):
+            continue
+        count = _to_int(f.get("count"))
+        if count is None or count < 1:
+            count = 1
+        fittings.append({
+            "kind": kind,
+            "name": name,
+            "width_mm": _to_positive(f.get("width_mm")),
+            "height_mm": _to_positive(f.get("height_mm")),
+            "count": count,
+            "location": _to_text(f.get("location")),
+        })
+
+    roof_raw = raw.get("roof") if isinstance(raw.get("roof"), dict) else {}
+    roof = {
+        "type": _to_text(roof_raw.get("type")),
+        "pitch": _to_text(roof_raw.get("pitch")),
+        "area_m2": _to_positive(roof_raw.get("area_m2")),
+    }
+
+    notes = [n for n in (_to_text(x) for x in _as_list(raw.get("notes"))) if n]
+
+    confidence = str(raw.get("confidence") or "").strip().lower()
+    if confidence not in _CONFIDENCES:
+        confidence = "low"
+
+    pages = {p for p in (_to_int(x) for x in _as_list(raw.get("source_pages")))
+             if p is not None and p > 0}
+
+    return {
+        "property_name": _to_text(raw.get("property_name")),
+        "structure": _to_text(raw.get("structure")),
+        "floors": _to_int(raw.get("floors")),
+        "total_floor_area_m2": _to_positive(raw.get("total_floor_area_m2")),
+        "floor_areas": floor_areas,
+        "building_area_m2": _to_positive(raw.get("building_area_m2")),
+        "perimeter_m": _to_positive(raw.get("perimeter_m")),
+        "rooms": rooms,
+        "fittings": fittings,
+        "roof": roof,
+        "exterior_wall_area_m2": _to_positive(raw.get("exterior_wall_area_m2")),
+        "notes": notes,
+        "confidence": confidence,
+        "source_pages": sorted(pages),
+    }
+
+
+def _parse_extraction_json(text: str) -> dict[str, Any]:
+    """応答テキストをJSONオブジェクトとして解析する。失敗時は例外を送出する。"""
+    stripped = _strip_code_fence(text)
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        # 前置き文が付いている場合は最初の { から最後の } までを試す
+        start, end = stripped.find("{"), stripped.rfind("}")
+        if start < 0 or end <= start:
+            raise
+        parsed = json.loads(stripped[start:end + 1])
+    if not isinstance(parsed, dict):
+        raise ValueError("JSONがオブジェクト形式ではありません")
+    return parsed
+
+
+def _count_pdf_pages(pdf_bytes: bytes) -> int | None:
+    """PDFのページ数を返す。pypdf が無い環境では None (チェックをスキップ)。"""
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return None
+    try:
+        return len(PdfReader(io.BytesIO(pdf_bytes)).pages)
+    except Exception as exc:  # noqa: BLE001 - 破損・暗号化PDF等
+        raise AIClientError(
+            f"PDFとして読み取れませんでした: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
+_PDF_EXTRACTION_SYSTEM = """\
+あなたは木造住宅の積算担当者を支援するAIアシスタントです。
+添付されたPDF図面 (配置図・平面図・立面図・屋根伏図・仕上表・建具表・面積表など) を読み取り、
+概算見積の算出に必要な数量をJSONで出力します。図面に書かれていないことを創作してはいけません。
+
+読み取りのルール:
+- 読み取れない値・図面に記載の無い値は null にすること。推測や一般的な相場値で埋めてはいけない。
+- 「W2700」「H2000」「2,730」「910」のような寸法 (サイズ・芯々距離・mm表記の数値) は数量ではない。
+  部屋数・建具の本数・面積と混同しないこと。建具の寸法は width_mm / height_mm にのみ入れる。
+- 単位は 面積=m² (平方メートル)、長さ=m、建具寸法=mm に統一する。
+  坪・帖 (畳) 表記しか無い場合は 1坪=3.3057m²、1帖=1.62m² で換算し、換算したことを notes に書く。
+- 延床面積・階別面積・建築面積は面積表 (求積表) の記載を最優先し、部屋面積の合計から求めた場合は notes に明記する。
+- バルコニー・ポーチ・小屋裏収納・吹抜など延床面積に算入しない部分は rooms に含めてよいが、floor_areas には含めない。
+- 建具は建具表があればそれに従い、無ければ平面図の記号から数える。同一仕様はまとめて count に本数を入れる。
+- 複数ページにまたがる場合は、根拠としたページ番号 (1始まり) を source_pages に列挙する。
+
+出力は必ず以下のキーを全て持つJSONオブジェクトのみとし、説明文・前置き・コードフェンスは付けないこと:
+{
+  "property_name": 物件名・工事名 (string | null),
+  "structure": 構造 (例 "在来木造", "木造軸組", "2×4") (string | null),
+  "floors": 階数 (integer | null),
+  "total_floor_area_m2": 延床面積 m² (number | null),
+  "floor_areas": {"1階": m², "2階": m²}  ※階別床面積。無い階は省略,
+  "building_area_m2": 建築面積 m² (number | null),
+  "perimeter_m": 1階外周長 m (number | null),
+  "rooms": [{"name": 部屋名, "floor": "1階" | "2階" | ..., "area_m2": number | null}],
+  "fittings": [{"kind": "窓" | "玄関ドア" | "勝手口" | "内部建具",
+                "name": 種類 (例 "引違い窓", "FIX窓", "縦すべり出し窓", "片開きドア", "片引き戸", "折戸"),
+                "width_mm": number | null, "height_mm": number | null,
+                "count": integer, "location": 取付位置 | null}],
+  "roof": {"type": 屋根形状・材質 (例 "切妻 ガルバリウム鋼板", "寄棟 瓦") | null,
+           "pitch": 勾配 (例 "4寸") | null, "area_m2": 屋根面積 m² | null},
+  "exterior_wall_area_m2": 外壁面積 m² (number | null),
+  "notes": [読み取り上の注意・換算・不確かな点 (string)],
+  "confidence": "high" | "medium" | "low",
+  "source_pages": [根拠ページ番号 (integer)]
+}"""
+
+_RETRY_INSTRUCTION_OBJECT = (
+    "\n\n注意: 前回の応答はJSONとして解析できませんでした。"
+    "今回は必ず有効なJSONオブジェクトだけを出力してください。"
+)
 
 
 # --- 公開 API -----------------------------------------------------------
@@ -439,6 +695,89 @@ def extract_text_from_upload(file_bytes: bytes, filename: str) -> str:
         f"未対応のファイル形式です: {ext or '(拡張子なし)'} "
         "(対応形式: .pdf / .docx / .xlsx / .txt)"
     )
+
+
+def extract_quantities_from_pdf(pdf_bytes: bytes, filename: str,
+                                hints: str = "") -> dict:
+    """PDF図面から概算見積に必要な数量をAIで読み取る (検証用)。
+
+    PDF を Anthropic Messages API に document ブロックとして渡し、平面図・配置図・
+    立面図・仕上表・建具表から延床面積・階別面積・部屋・建具・屋根などを JSON で抽出する。
+
+    Args:
+        pdf_bytes: PDFファイルのバイナリデータ (32MB・100ページまで)。
+        filename: 元ファイル名 (エラーメッセージとプロンプトに使う)。
+        hints: 担当者からの補足 (任意。例: "2階建・延床は面積表の値を採用")。
+            空でなければプロンプトに添える。
+
+    Returns:
+        dict: EXTRACTION_KEYS を全て持つ辞書。読み取れなかった値は None または空。
+            {property_name, structure, floors, total_floor_area_m2,
+             floor_areas({"1階": m2, ...}), building_area_m2, perimeter_m,
+             rooms([{name, floor, area_m2}]),
+             fittings([{kind, name, width_mm, height_mm, count, location}]),
+             roof({type, pitch, area_m2}), exterior_wall_area_m2,
+             notes([str]), confidence("high"/"medium"/"low"), source_pages([int])}
+
+    Raises:
+        AIClientError: データが空・サイズ/ページ数超過・PDF破損・APIキー未設定・
+            通信エラー・JSON解析失敗 (再試行後) の場合。
+    """
+    if not pdf_bytes:
+        raise AIClientError("PDFデータが空です。")
+    size = len(pdf_bytes)
+    if size > PDF_MAX_BYTES:
+        raise AIClientError(
+            f"PDF「{filename}」のサイズが {size / (1024 * 1024):.1f}MB で、"
+            f"上限 {PDF_MAX_BYTES // (1024 * 1024)}MB を超えています。"
+            "必要な図面ページだけに分割するか、解像度を下げて再試行してください。"
+        )
+    pages = _count_pdf_pages(pdf_bytes)
+    if pages is not None:
+        if pages == 0:
+            raise AIClientError(f"PDF「{filename}」にページが含まれていません。")
+        if pages > PDF_MAX_PAGES:
+            raise AIClientError(
+                f"PDF「{filename}」は {pages} ページで、上限 {PDF_MAX_PAGES} ページを超えています。"
+                "必要な図面ページだけに分割して再試行してください。"
+            )
+
+    document_block = {
+        "type": "document",
+        "source": {
+            "type": "base64",
+            "media_type": "application/pdf",
+            # standard_b64encode は改行を含まない (API の要件)
+            "data": base64.standard_b64encode(pdf_bytes).decode("ascii"),
+        },
+    }
+    user_text = (
+        f"添付のPDF図面「{filename}」から概算見積に必要な数量を読み取り、"
+        "指定のJSONオブジェクトで出力してください。"
+    )
+    if (hints or "").strip():
+        user_text += f"\n\n## 担当者からの補足\n{hints.strip()}"
+
+    def _content(text: str) -> list[dict[str, Any]]:
+        return [document_block, {"type": "text", "text": text}]
+
+    raw = _post_anthropic(_PDF_EXTRACTION_SYSTEM, _content(user_text), PDF_TIMEOUT_SEC)
+    try:
+        parsed = _parse_extraction_json(raw)
+    except (json.JSONDecodeError, ValueError):
+        # 1回だけ再試行 (より厳格な指示を追加)
+        raw = _post_anthropic(
+            _PDF_EXTRACTION_SYSTEM,
+            _content(user_text + _RETRY_INSTRUCTION_OBJECT),
+            PDF_TIMEOUT_SEC,
+        )
+        try:
+            parsed = _parse_extraction_json(raw)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise AIClientError(
+                f"AIの応答をJSONとして解析できませんでした: {raw[:200]}"
+            ) from exc
+    return normalize_extraction(parsed)
 
 
 # --- CLI エントリポイント -----------------------------------------------

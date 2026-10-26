@@ -25,6 +25,9 @@ from andpad_converter import (convert_to_andpad, ANDPADBudget,
 from feedback_handler import submit_feedback as send_feedback_to_company, notify_feedback_status
 import cloud_store
 import equipment_db
+import master_lookup
+import pdf_estimate
+import hidden_items
 import html as _html
 from ui_helpers import (project_display_label, project_full_label, merge_proposal_edits,
                         parse_amount_jp, linked_order_price, FB_STATUSES, FB_STATUS_FIXED,
@@ -2065,6 +2068,147 @@ def save_item_alias_library(lib: list):
             _warn_cloud_error(exc)
 
 
+DESIGN_MASTER_KEY = "design_price_master"   # 設計部の単価マスタ（類似候補の語彙に使う）
+
+
+def load_design_master() -> dict:
+    """設計部から取り込んだ単価マスタ {'rows': [...], 'file': str, 'at': str} を読む（無ければ空）"""
+    if '_design_master' in st.session_state:
+        return st.session_state['_design_master']
+    result = None
+    if _cloud_ok():
+        try:
+            result = cloud_store.get(DESIGN_MASTER_KEY)
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
+    if result is None:
+        path = os.path.join(PROJECTS_DIR, "design_price_master.json")
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                result = json.load(f)
+    if not isinstance(result, dict) or not isinstance(result.get('rows'), list):
+        result = {'rows': [], 'file': '', 'at': ''}
+    st.session_state['_design_master'] = result
+    return result
+
+
+def save_design_master(data: dict):
+    path = os.path.join(PROJECTS_DIR, "design_price_master.json")
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False)
+    st.session_state['_design_master'] = data
+    if _cloud_ok():
+        try:
+            cloud_store.put(DESIGN_MASTER_KEY, data)
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
+
+
+def _load_store_value(key: str, local_name: str, default):
+    """app_store の key（無ければローカル projects/<local_name>）を読む。セッション内キャッシュ付き"""
+    cache_key = f"_store_{key}"
+    if cache_key in st.session_state:
+        return st.session_state[cache_key]
+    result = None
+    if _cloud_ok():
+        try:
+            result = cloud_store.get(key)
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
+    if result is None:
+        path = os.path.join(PROJECTS_DIR, local_name)
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                result = json.load(f)
+    if result is None or type(result) is not type(default):
+        result = copy.deepcopy(default)
+    st.session_state[cache_key] = result
+    return result
+
+
+def _save_store_value(key: str, local_name: str, value):
+    path = os.path.join(PROJECTS_DIR, local_name)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(value, f, ensure_ascii=False, indent=2)
+    st.session_state[f"_store_{key}"] = value
+    if _cloud_ok():
+        try:
+            cloud_store.put(key, value)
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
+
+
+HIDDEN_PATTERNS_KEY = "hidden_item_patterns"    # 図面に現れない項目のパターン（口頭で聞く内容のセット）
+HIDDEN_STATS_KEY = "hidden_item_stats"          # 実績から導いた「図面に無いが出やすい項目」の統計
+HIDDEN_FEEDBACK_KEY = "hidden_item_feedback"    # 必要／不要の判定（学習）
+
+
+def load_hidden_patterns() -> list:
+    return _load_store_value(HIDDEN_PATTERNS_KEY, "hidden_item_patterns.json", [])
+
+
+def save_hidden_patterns(lib: list):
+    _save_store_value(HIDDEN_PATTERNS_KEY, "hidden_item_patterns.json", lib)
+
+
+def load_hidden_stats() -> dict:
+    return _load_store_value(HIDDEN_STATS_KEY, "hidden_item_stats.json", {'items': [], 'at': '', 'n_properties': 0})
+
+
+def save_hidden_stats(data: dict):
+    _save_store_value(HIDDEN_STATS_KEY, "hidden_item_stats.json", data)
+
+
+def load_hidden_feedback() -> dict:
+    return _load_store_value(HIDDEN_FEEDBACK_KEY, "hidden_item_feedback.json", {})
+
+
+def save_hidden_feedback(data: dict):
+    _save_store_value(HIDDEN_FEEDBACK_KEY, "hidden_item_feedback.json", data)
+
+
+def recompute_hidden_stats(projects: dict, prices: dict) -> dict:
+    """実績見積を取り込んだ全案件から「実績にはあるがAI概算に無い項目」を集計する"""
+    alias_lib = load_item_alias_library()
+    samples = []
+    for pid, pinfo in projects.items():
+        actual = load_project_actual(pid)
+        if not actual:
+            continue
+        cad = load_cad_for_project(pid)
+        if cad is None:
+            continue
+        solar = any('太陽光' in c.get('name', '') and c.get('total', 0) > 0 for c in actual.get('categories', []))
+        est = calculate_estimate(cad, prices, include_solar=solar, safety_rate=DEFAULT_SAFETY_RATE_PCT / 100.0)
+        diff = excel_diff.diff_estimates(est, actual, alias_pairs_from_library(alias_lib, pid))
+        actual_only = []
+        for cat_name, d in diff.get('item_diffs', {}).items():
+            for x in d.get('actual_only', []):
+                actual_only.append({'category': cat_name, 'name': x.get('name', ''), 'summary': x.get('summary', ''),
+                                    'quantity': x.get('quantity', 0), 'unit': x.get('unit', ''),
+                                    'amount': int(x.get('amount', 0))})
+        samples.append({'property': project_full_label(pinfo), 'actual_only': actual_only})
+    stats = hidden_items.derive_hidden_item_stats(samples)
+    data = {'items': stats, 'at': now_jst().strftime('%Y-%m-%d %H:%M'), 'n_properties': len(samples)}
+    save_hidden_stats(data)
+    return data
+
+
+def master_vocabulary(csv_path: str) -> list:
+    """類似候補に使うマスタ行。設計部の単価マスタがあればそれ、無ければアプリの単価マスタ"""
+    design = load_design_master()
+    if design.get('rows'):
+        return design['rows']
+    if '_tanka_master_rows' not in st.session_state:
+        try:
+            with open(csv_path, 'rb') as f:
+                rows, _errs = master_lookup.parse_price_master(f.read(), os.path.basename(csv_path))
+        except Exception:  # noqa: BLE001
+            rows = []
+        st.session_state['_tanka_master_rows'] = rows
+    return st.session_state['_tanka_master_rows']
+
+
 def update_diff_reason_library(entries: list):
     """差異理由をライブラリへ蓄積する（同一項目は新しいものを先頭に最大20件）
 
@@ -2643,7 +2787,7 @@ def main():
             st.caption("💾 データ保存: クラウド永続化 有効")
         else:
             st.caption("⚠️ データ保存: 一時保存（再起動で消える場合があります）")
-        st.caption("build 2026-10-26.5")
+        st.caption("build 2026-10-26.6")
 
     # 単価マスタ読み込み
     csv_path = os.path.join(base_dir, "tankamaster_updated.csv")
@@ -2823,9 +2967,9 @@ def main():
 
     # タブ構成（案件一覧を先頭に追加）
     (tab_proj, tab1, tab_mod, tab2, tab3, tab4,
-     tab_actual, tab_meeting, tab_equip, tab_history, tab_fb) = st.tabs([
+     tab_actual, tab_meeting, tab_equip, tab_master, tab_pdf, tab_history, tab_fb) = st.tabs([
         "案件一覧", "見積概要", "見積修正", "見積明細", "ANDPAD材工分離", "CADデータ確認",
-        "実績比較", "打合せ変更", "設備設定", "変更履歴", "フィードバック"
+        "実績比較", "打合せ変更", "設備設定", "マスタ・対応表", "PDF見積（検証）", "変更履歴", "フィードバック"
     ])
 
     # ===== 案件一覧タブ =====
@@ -3838,6 +3982,57 @@ def main():
                                             _flash(f"「{entry['ai_name']}」と「{entry['actual_name']}」を同じ商品として"
                                                    f"登録しました（{ALIAS_SCOPE_LABEL[scope]}）。")
                                         st.rerun()
+                                # 単価マスタから類似候補を拾う（設計部マスタ優先）。重いので要求時のみ計算
+                                if st.checkbox("単価マスタから類似候補を表示（実績にしかない行）",
+                                               key=f"cand_toggle_{current_pid}_{cd['no']}"):
+                                    vocab = master_vocabulary(csv_path)
+                                    ac_rows = [r for r in reg_rows if r['区分'] == DETAIL_KIND_ACTUAL_ONLY][:20]
+                                    cand_rows, cand_options = [], {}
+                                    for r in ac_rows:
+                                        sugg = master_lookup.suggest_similar(
+                                            r['実績品名'], r['実績摘要'], vocab, top_n=3, category=cd['name'])
+                                        labels = []
+                                        for sg in sugg:
+                                            lab = f"{sg['name']}{'｜' + sg['summary'] if sg.get('summary') else ''}"
+                                            labels.append(f"{lab}（{sg['score']:.2f}）")
+                                            cand_options.setdefault(lab, sg)
+                                        cand_rows.append({'実績品名': r['実績品名'], '実績摘要': r['実績摘要'],
+                                                          '候補1': labels[0] if len(labels) > 0 else '',
+                                                          '候補2': labels[1] if len(labels) > 1 else '',
+                                                          '候補3': labels[2] if len(labels) > 2 else ''})
+                                    if cand_rows:
+                                        st.dataframe(pd.DataFrame(cand_rows), use_container_width=True, hide_index=True)
+                                        mc1, mc2 = st.columns([2, 1])
+                                        chosen = mc1.selectbox("AI側（単価マスタ）の名称を選ぶ", list(cand_options.keys()),
+                                                               key=f"cand_pick_{current_pid}_{cd['no']}")
+                                        if mc2.button("チェックした実績明細を、選んだマスタ名と同じ商品として登録",
+                                                      key=f"cand_reg_{current_pid}_{cd['no']}"):
+                                            selected = [r for r in edited_reg.to_dict('records') if r.get('選択')]
+                                            ac_sel = [r for r in selected if r.get('区分') == DETAIL_KIND_ACTUAL_ONLY]
+                                            if len(ac_sel) != 1 or len(selected) != 1:
+                                                st.error("「実績にしかない」行を1件だけチェックしてください")
+                                            else:
+                                                sg = cand_options[chosen]
+                                                scope = (ALIAS_SCOPE_PROJECT if scope_label.startswith("この案件")
+                                                         else ALIAS_SCOPE_GLOBAL)
+                                                entry = make_alias_entry(
+                                                    {'AI品名': sg['name'], 'AI摘要': sg.get('summary', '')}, ac_sel[0],
+                                                    cd['name'], alias_prop_name, now_jst().strftime('%Y-%m-%d %H:%M'),
+                                                    scope=scope, project_id=current_pid)
+                                                if alias_entry_exists(alias_lib, entry):
+                                                    _flash("この組み合わせは登録済みです。", "info")
+                                                else:
+                                                    alias_lib.append(entry)
+                                                    save_item_alias_library(alias_lib)
+                                                    append_project_changelog(
+                                                        current_pid, '実績取込',
+                                                        f"同じ商品として登録（単価マスタ）: {entry['ai_name']} ⇔ {entry['actual_name']}"
+                                                        f"（{ALIAS_SCOPE_LABEL[scope]}）")
+                                                    _flash(f"「{entry['ai_name']}」と「{entry['actual_name']}」を同じ商品として"
+                                                           f"登録しました（{ALIAS_SCOPE_LABEL[scope]}）。")
+                                                st.rerun()
+                                    else:
+                                        st.caption("類似候補は見つかりませんでした。")
                                 if rc3.button("チェックした行を「この案件特有」として登録",
                                               key=f"special_reg_{current_pid}_{cd['no']}",
                                               help="図面に表れない物件固有の項目など、全案件には該当しないもの。"
@@ -4455,6 +4650,275 @@ def main():
                 st.rerun()
 
     # ===== 変更履歴タブ =====
+    # ===== マスタ・対応表タブ =====
+    with tab_master:
+        st.markdown("#### 単価マスタ・対応表の取込")
+        st.caption("設計部の単価マスタを取り込むと、実績比較の「類似候補」がそのマスタの名称で拾われます。"
+                   "対応表（図面表記 ⇔ 実績の名称）を取り込むと「同じ商品」辞書にまとめて登録できます。")
+        design = load_design_master()
+        alias_lib_m = load_item_alias_library()
+        m1, m2, m3 = st.columns(3)
+        m1.metric("設計部 単価マスタ", f"{len(design.get('rows', []))} 行",
+                  help=f"{design.get('file', '')} {design.get('at', '')}".strip() or None)
+        m2.metric("同じ商品 辞書", f"{len(alias_lib_m)} 件")
+        m3.metric("アプリ内 単価マスタ", f"{len(master_vocabulary(csv_path)) if not design.get('rows') else len(st.session_state.get('_tanka_master_rows') or [])} 行")
+
+        col_m, col_a = st.columns(2)
+        with col_m:
+            st.markdown("##### 設計部の単価マスタ（CSV / Excel）")
+            up_master = st.file_uploader("単価マスタを選択", type=['csv', 'xlsx'], key="design_master_upload",
+                                         help="列: 工事コード/名称/摘要/単位/発注単価/見積単価（列名のゆれは自動で吸収します）")
+            if up_master is not None:
+                rows_m, errs_m = master_lookup.parse_price_master(up_master.getvalue(), up_master.name)
+                st.caption(f"読み取り: {len(rows_m)} 行" + (f"（読めなかった行 {len(errs_m)}）" if errs_m else ""))
+                if rows_m:
+                    st.dataframe(pd.DataFrame(rows_m[:50]), use_container_width=True, hide_index=True, height=240)
+                    if st.button("この単価マスタを保存して類似候補に使う", key="btn_save_design_master", type="primary"):
+                        save_design_master({'rows': rows_m, 'file': up_master.name,
+                                            'at': now_jst().strftime('%Y-%m-%d %H:%M')})
+                        _flash(f"設計部の単価マスタを保存しました（{len(rows_m)} 行）。")
+                        st.rerun()
+                if errs_m:
+                    with st.expander(f"読めなかった行（{len(errs_m)}）"):
+                        for e in errs_m[:50]:
+                            st.markdown(f"- {e}")
+            if design.get('rows') and st.button("保存済みの単価マスタを削除", key="btn_del_design_master"):
+                save_design_master({'rows': [], 'file': '', 'at': ''})
+                _flash("設計部の単価マスタを削除しました（アプリ内の単価マスタで候補を拾います）。")
+                st.rerun()
+
+        with col_a:
+            st.markdown("##### 対応表（図面表記 ⇔ 実績の名称）")
+            st.download_button(
+                "対応表のテンプレートをダウンロード（CSV）",
+                data="図面表記,AI摘要,実績品名,実績摘要,工事種別,適用範囲\n"
+                     "カウンター,,造作カウンター,,木工事,全案件共通\n"
+                     "可動棚,,可動棚 ﾌｨｯﾄﾗｯｸ,材工,内部建具工事,全案件共通\n".encode('utf-8-sig'),
+                file_name="taiouhyou_template.csv", mime="text/csv", key="dl_alias_template")
+            up_alias = st.file_uploader("対応表を選択", type=['csv', 'xlsx'], key="alias_table_upload",
+                                        help="列: 図面表記（またはAI品名）/ 実績品名（またはマスタ名）/ 工事種別 / 適用範囲（全案件共通・この案件のみ）")
+            if up_alias is not None:
+                entries_a, errs_a = master_lookup.parse_alias_table(
+                    up_alias.getvalue(), up_alias.name,
+                    st.session_state['projects'].get(current_pid, {}).get('name', ''), current_pid,
+                    now_jst().strftime('%Y-%m-%d %H:%M'))
+                st.caption(f"読み取り: {len(entries_a)} 件" + (f"（スキップ {len(errs_a)}）" if errs_a else ""))
+                if entries_a:
+                    st.dataframe(pd.DataFrame([{
+                        '図面表記/AI': e['ai_name'], 'AI摘要': e['ai_summary'], '実績品名': e['actual_name'],
+                        '実績摘要': e['actual_summary'], '工事種別': e['category'],
+                        '適用範囲': ALIAS_SCOPE_LABEL.get(e.get('scope'), '全案件共通')} for e in entries_a[:100]]),
+                        use_container_width=True, hide_index=True, height=240)
+                    if st.button("この対応表を「同じ商品」辞書に追加", key="btn_merge_alias_table", type="primary"):
+                        new_lib, added = master_lookup.merge_alias_entries(alias_lib_m, entries_a)
+                        save_item_alias_library(new_lib)
+                        append_project_changelog(current_pid, '実績取込', f"対応表を取込: {added}件を同じ商品辞書に追加")
+                        _flash(f"対応表から {added} 件を辞書に追加しました（重複 {len(entries_a) - added} 件は除外）。")
+                        st.rerun()
+                if errs_a:
+                    with st.expander(f"スキップした行（{len(errs_a)}）"):
+                        for e in errs_a[:50]:
+                            st.markdown(f"- {e}")
+
+    # ===== PDF見積（検証）タブ =====
+    with tab_pdf:
+        st.markdown("#### PDF図面から概算見積（検証）")
+        st.caption("正の情報源は数量データTXTです。ここではPDF図面をAIが読み取り、同じ計算エンジンで概算して、"
+                   "TXT由来の見積とどれだけ差が出るかを検証します。読めなかった数量は延床面積からの比率で補い、注意として表示します。")
+        pdf_caps = ai_client.ai_capabilities()
+        if not pdf_caps.get('text'):
+            st.info("ANTHROPIC_API_KEY が未設定のため、図面の読み取りは利用できません。")
+        up_pdf = st.file_uploader("図面PDF（平面図・配置図・立面図・建具表など）", type=['pdf'], key="pdf_est_upload")
+        pdf_hints = st.text_area(
+            "図面の補足（口頭で聞いた内容。例: 太陽光あり／吹抜あり／ガレージ別棟。AIの読み取りにも使います）",
+            key="pdf_hints", height=70)
+        if up_pdf is not None and st.button("図面を読み取る（AI）", key="btn_pdf_extract", type="primary",
+                                            disabled=not pdf_caps.get('text')):
+            try:
+                with st.spinner("図面を読み取り中（1〜2分かかることがあります）..."):
+                    extracted = ai_client.extract_quantities_from_pdf(up_pdf.getvalue(), up_pdf.name,
+                                                                      hints=pdf_hints or "")
+                st.session_state['_pdf_extracted'] = {'file': up_pdf.name, 'data': extracted}
+                st.session_state.pop('_pdf_estimate', None)
+                st.rerun()
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"読み取りに失敗しました: {exc}")
+        ex = st.session_state.get('_pdf_extracted')
+        if ex:
+            data = ex['data'] or {}
+            st.markdown(f"##### 読み取り結果（{ex['file']}）　確度: {data.get('confidence') or '-'}")
+            p1, p2, p3, p4 = st.columns(4)
+            p1.metric("延床面積", f"{float(data.get('total_floor_area_m2') or 0):.2f}㎡")
+            p2.metric("階数", f"{data.get('floors') or '-'}")
+            p3.metric("建築面積", f"{float(data.get('building_area_m2') or 0):.2f}㎡")
+            p4.metric("部屋数 / 建具数", f"{len(data.get('rooms') or [])} / {len(data.get('fittings') or [])}")
+            pc1, pc2 = st.columns(2)
+            with pc1:
+                if data.get('rooms'):
+                    st.dataframe(pd.DataFrame(data['rooms']), use_container_width=True, hide_index=True, height=260)
+            with pc2:
+                if data.get('fittings'):
+                    st.dataframe(pd.DataFrame(data['fittings']), use_container_width=True, hide_index=True, height=260)
+            if data.get('notes'):
+                with st.expander(f"読み取り時の注意（{len(data['notes'])}）"):
+                    for n in data['notes']:
+                        st.markdown(f"- {n}")
+            # ---- 図面に現れない項目（パターン／統計）を見積に反映する ----
+            st.markdown("##### 図面に現れない項目を反映する")
+            st.caption("口頭で聞いた内容は「パターン」として登録しておき、この図面がどのパターンかを選びます。"
+                       "さらに、実績見積にはあるのに図面（CAD数量）には出てこなかった項目を統計的に含められます。"
+                       "見積後に必要／不要を判定して保存すると、次回の採用確率に反映されます。")
+            patterns = load_hidden_patterns()
+            hidden_stats = load_hidden_stats()
+            hidden_fb = load_hidden_feedback()
+            hp1, hp2, hp3 = st.columns([2, 1, 1])
+            sel_pattern_names = hp1.multiselect("この図面のパターン", [p['name'] for p in patterns],
+                                                key="pdf_sel_patterns")
+            use_stats = hp2.checkbox("統計的に出やすい項目を含める", value=True, key="pdf_use_stats")
+            threshold = hp3.slider("採用する確率", 0.3, 1.0, 0.5, 0.05, key="pdf_stats_threshold",
+                                   help="実績見積に出てきた物件の割合（必要／不要の判定で補正）がこの値以上の項目を含めます")
+            if not hidden_stats.get('items'):
+                st.caption("統計がまだありません。実績見積を取り込んだ案件から集計できます。")
+            sc1, sc2 = st.columns([1, 3])
+            if sc1.button("統計を更新（実績を取り込んだ全案件から）", key="btn_recompute_hidden"):
+                with st.spinner("集計中..."):
+                    hidden_stats = recompute_hidden_stats(st.session_state['projects'], prices)
+                _flash(f"{hidden_stats['n_properties']}案件の実績から {len(hidden_stats['items'])} 項目を集計しました。")
+                st.rerun()
+            if hidden_stats.get('at'):
+                sc2.caption(f"統計: {hidden_stats.get('n_properties', 0)}案件・{len(hidden_stats.get('items', []))}項目（{hidden_stats.get('at')}）")
+            stats_adj = hidden_items.apply_feedback(hidden_stats.get('items', []), hidden_fb)
+            candidates = hidden_items.build_candidates(
+                stats_adj, threshold if use_stats else 1.01,
+                [p for p in patterns if p['name'] in sel_pattern_names])
+            if candidates:
+                st.dataframe(pd.DataFrame([{
+                    '出どころ': c['source'], '工事種別': c['category'], '品名': c['name'], '摘要': c['summary'],
+                    '確率': round(c['prob'], 2), '数量': c['quantity'], '単位': c['unit'],
+                    '見積単価': c['estimate_price'], '原価': c['order_price']} for c in candidates]),
+                    use_container_width=True, hide_index=True, height=min(60 + 35 * len(candidates), 360))
+            else:
+                st.caption("反映する図面外の項目はありません（パターン未選択・統計のしきい値未満）。")
+
+            if st.button("この読み取りで概算見積を作成（検証）", key="btn_pdf_estimate", type="primary"):
+                try:
+                    pdf_est, pdf_cad, pdf_warns = pdf_estimate.estimate_from_pdf_extraction(
+                        data, prices_effective,
+                        include_adjustment=include_adjustment, include_solar=include_solar,
+                        safety_rate=safety_rate_pct / 100.0,
+                        include_custom_furniture=include_custom_furniture)
+                    if candidates:
+                        new_items = hidden_items.to_new_items(
+                            candidates, [(c.no, c.name) for c in pdf_est.categories])
+                        pdf_est = apply_modifications(
+                            pdf_est, {'overrides': {}, 'deleted': set(), 'new_items': new_items})
+                    st.session_state['_pdf_estimate'] = {'file': ex['file'], 'est': pdf_est, 'warnings': pdf_warns,
+                                                         'candidates': candidates}
+                    st.rerun()
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"見積の作成に失敗しました: {exc}")
+            pe = st.session_state.get('_pdf_estimate')
+            if pe and pe.get('file') == ex['file']:
+                pdf_est = pe['est']
+                pdf_total = int(pdf_est.total_estimate_excl_tax)
+                txt_total = int(estimate.total_estimate_excl_tax)
+                e1, e2, e3 = st.columns(3)
+                e1.metric("PDF由来の概算（税抜）", f"{pdf_total:,}円")
+                e2.metric("数量TXT由来の見積（税抜）", f"{txt_total:,}円")
+                e3.metric("差（PDF−TXT）", f"{pdf_total - txt_total:+,}円",
+                          f"{(pdf_total - txt_total) / txt_total * 100:+.1f}%" if txt_total else None)
+                if pe.get('warnings'):
+                    with st.expander(f"推定で補った数量（{len(pe['warnings'])}）", expanded=True):
+                        for w in pe['warnings']:
+                            st.markdown(f"- {w}")
+                comp = pdf_estimate.compare_with_estimate(pdf_est, estimate)
+                if comp:
+                    st.markdown("##### 工事種別ごとの比較（PDF由来 vs 数量TXT由来）")
+                    st.dataframe(pd.DataFrame(comp).rename(columns={
+                        'name': '工事種別', 'pdf_total': 'PDF由来', 'base_total': 'TXT由来', 'diff': '差（PDF−TXT）'})
+                        .style.format({'PDF由来': '{:,}', 'TXT由来': '{:,}', '差（PDF−TXT）': '{:+,}'}),
+                        use_container_width=True, hide_index=True)
+
+                # ---- 図面外項目の必要／不要フィードバック（学習） ----
+                cands = pe.get('candidates') or []
+                if cands:
+                    st.markdown("##### 図面外の項目は必要でしたか？（判定を保存すると学習します）")
+                    judge_df = pd.DataFrame([{
+                        '判定': '未判定', '出どころ': c['source'], '工事種別': c['category'], '品名': c['name'],
+                        '摘要': c['summary'], '確率': round(c['prob'], 2), '見積単価': c['estimate_price']} for c in cands])
+                    edited_judge = st.data_editor(
+                        judge_df, hide_index=True, use_container_width=True,
+                        key=f"pdf_judge_{ex['file']}_{len(cands)}",
+                        column_config={'判定': st.column_config.SelectboxColumn('判定', options=['未判定', '必要', '不要'], width='small')},
+                        disabled=['出どころ', '工事種別', '品名', '摘要', '確率', '見積単価'])
+                    jc1, jc2, jc3 = st.columns([1, 1.4, 1.6])
+                    if jc1.button("判定を保存して学習", key="btn_save_judgments", type="primary"):
+                        judgments = [{'key': c['key'], 'judgment': row.get('判定')}
+                                     for c, (_, row) in zip(cands, edited_judge.iterrows())]
+                        decided = [j for j in judgments if j['judgment'] in ('必要', '不要')]
+                        if not decided:
+                            st.error("「必要」か「不要」を1件以上選んでください")
+                        else:
+                            save_hidden_feedback(hidden_items.record_judgments(load_hidden_feedback(), decided))
+                            append_project_changelog(current_pid, '実績取込',
+                                                     f"図面外項目の判定を学習: 必要{sum(1 for j in decided if j['judgment'] == '必要')}件 / "
+                                                     f"不要{sum(1 for j in decided if j['judgment'] == '不要')}件")
+                            _flash(f"{len(decided)}件の判定を保存しました。次回の採用確率に反映されます。")
+                            st.rerun()
+                    pat_name = jc2.text_input("「必要」の項目で新しいパターンを作る（名前）", key="pdf_new_pattern_name",
+                                              placeholder="例: 太陽光＋蓄電池セット")
+                    if jc3.button("必要と判定した項目でパターンを作成", key="btn_pattern_from_judge"):
+                        need_keys = {c['key'] for c, (_, row) in zip(cands, edited_judge.iterrows()) if row.get('判定') == '必要'}
+                        if not pat_name.strip() or not need_keys:
+                            st.error("パターン名と「必要」の項目が必要です")
+                        else:
+                            lib_p = load_hidden_patterns()
+                            lib_p.append(hidden_items.pattern_from_candidates(
+                                pat_name.strip(), f"{ex['file']} の判定から作成",
+                                [c for c in cands if c['key'] in need_keys], now_jst().strftime('%Y-%m-%d %H:%M')))
+                            save_hidden_patterns(lib_p)
+                            _flash(f"パターン「{pat_name.strip()}」を作成しました（{len(need_keys)}項目）。")
+                            st.rerun()
+
+        # ---- パターンの管理（図面に現れない項目のセット） ----
+        with st.expander(f"パターンの管理（{len(load_hidden_patterns())}件）"):
+            st.caption("口頭で聞く「この図面はこういう仕様」をセットにしておき、PDF見積のときに選ぶだけで反映できます。")
+            lib_p = load_hidden_patterns()
+            for i, p in enumerate(lib_p):
+                pc1, pc2 = st.columns([5, 1])
+                pc1.markdown(f"**{_html.escape(p.get('name', ''))}**　{_html.escape(p.get('description', ''))}　"
+                             f"<span style='font-size:0.8rem;color:#4a5568;'>{len(p.get('items', []))}項目・{p.get('at', '')}</span>",
+                             unsafe_allow_html=True)
+                if p.get('items'):
+                    pc1.dataframe(pd.DataFrame(p['items'])[['category', 'name', 'summary', 'quantity', 'unit', 'estimate_price', 'order_price']]
+                                  .rename(columns={'category': '工事種別', 'name': '品名', 'summary': '摘要', 'quantity': '数量',
+                                                   'unit': '単位', 'estimate_price': '見積単価', 'order_price': '原価'}),
+                                  use_container_width=True, hide_index=True, height=min(60 + 35 * len(p['items']), 240))
+                if pc2.button("削除", key=f"pattern_del_{i}"):
+                    lib_p.pop(i)
+                    save_hidden_patterns(lib_p)
+                    st.rerun()
+            st.markdown("**新しいパターンを作成**")
+            np1, np2 = st.columns([1, 2])
+            new_pat_name = np1.text_input("パターン名", key="new_pattern_name", placeholder="例: 全館空調仕様")
+            new_pat_desc = np2.text_input("説明（口頭で聞く内容のメモ）", key="new_pattern_desc")
+            new_pat_df = st.data_editor(
+                pd.DataFrame([{'工事種別': '', '品名': '', '摘要': '', '数量': 1.0, '単位': '式', '見積単価': 0, '原価': 0}]),
+                num_rows="dynamic", hide_index=True, use_container_width=True, key="new_pattern_items")
+            if st.button("パターンを登録", key="btn_new_pattern"):
+                items = [{'category': r.get('工事種別', ''), 'name': r.get('品名', ''), 'summary': r.get('摘要', ''),
+                          'quantity': r.get('数量', 1), 'unit': r.get('単位', '式'),
+                          'estimate_price': r.get('見積単価', 0), 'order_price': r.get('原価', 0)}
+                         for _, r in new_pat_df.iterrows() if str(r.get('品名', '') or '').strip()]
+                try:
+                    lib_p.append(hidden_items.new_pattern(new_pat_name.strip(), new_pat_desc.strip(), items,
+                                                          now_jst().strftime('%Y-%m-%d %H:%M')))
+                    save_hidden_patterns(lib_p)
+                    _flash(f"パターン「{new_pat_name.strip()}」を登録しました（{len(items)}項目）。")
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
+
     with tab_history:
         st.markdown("#### 変更履歴")
         logs = load_project_changelog(current_pid)

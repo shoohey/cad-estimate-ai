@@ -5,6 +5,7 @@
   対応付かなかった明細（AIのみ／実績のみ）を出す。突合ロジック改善の前後比較に使う。
 """
 import json
+import os
 import sys
 
 import excel_diff
@@ -16,6 +17,13 @@ from estimate_calculator import calculate_estimate, load_unit_prices
 def measure() -> dict:
     prices = load_unit_prices("tankamaster_updated.csv")
     report = {"properties": [], "unmatched": {}}
+    # ローカルに「同じ商品」辞書があれば反映して測る（本番の辞書は projects/item_alias_library.json に同期される）
+    aliases = set()
+    alias_path = os.path.join("projects", "item_alias_library.json")
+    if os.path.exists(alias_path):
+        from ui_helpers import alias_pairs_from_library
+        aliases = alias_pairs_from_library(json.load(open(alias_path, encoding="utf-8")))
+        report["alias_entries"] = len(aliases)
     tot_ac_n = tot_ac_matched_n = 0
     tot_ac_amt = tot_ac_matched_amt = 0
     for pair in iter_pairs():
@@ -25,7 +33,7 @@ def measure() -> dict:
             actual = excel_diff.parse_actual_estimate(f.read())
         solar = any("太陽光" in c["name"] for c in actual["categories"])
         est = calculate_estimate(cad, prices, include_solar=solar, safety_rate=DEFAULT_SAFETY_RATE)
-        diff = excel_diff.diff_estimates(est, actual)
+        diff = excel_diff.diff_estimates(est, actual, aliases)
         ac_n = ac_matched_n = ac_amt = ac_matched_amt = exact_n = 0
         unmatched = {}
         for cat, d in diff["item_diffs"].items():

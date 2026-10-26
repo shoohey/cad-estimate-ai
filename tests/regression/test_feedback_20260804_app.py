@@ -52,8 +52,12 @@ def app_dir(tmp_path_factory):
 def _no_cloud(monkeypatch):
     """本番 Supabase への接続経路を物理的に遮断する（環境変数・st.secrets の両方）"""
     import cloud_store
-    for k in ("SUPABASE_URL", "SUPABASE_SERVICE_KEY"):
+    # 本番DBだけでなく、外部AI APIのキーも環境から外す（テストから実APIを呼ばない・画面の案内文を固定する）
+    for k in ("SUPABASE_URL", "SUPABASE_SERVICE_KEY", "OPENAI_API_KEY", "RESEND_API_KEY", "SLACK_BOT_TOKEN"):
         monkeypatch.delenv(k, raising=False)
+    # AI機能のUI（打合せ変更・PDF見積）はキーの有無で出し分けるため、ダミーキーで「設定あり」に固定する。
+    # テストは実APIを呼ばない（呼ぶ経路は requests を使うので、万一呼べば接続エラーで失敗する）
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-dummy-key-not-real")
     monkeypatch.setattr(cloud_store, "_config", lambda: ("", ""))
 
     def _blocked(*_a, **_k):
