@@ -2465,6 +2465,12 @@ def main():
             group_names = list(tree.keys())
             cur_pid = st.session_state['current_project']
             cur_group = project_group(projects.get(cur_pid, {})) if cur_pid in projects else group_names[0]
+            # 反映・複製・「この案件を開く」などプログラム側で案件が切り替わったときは、
+            # 選択欄の保持値を追従させる（追従しないと選択欄の旧値で元の案件に戻されてしまう）
+            if st.session_state.get('_selector_synced_pid') != cur_pid and cur_pid in projects:
+                st.session_state['project_group_selector'] = cur_group
+                st.session_state['project_selector'] = cur_pid
+                st.session_state['_selector_synced_pid'] = cur_pid
             selected_group = st.selectbox(
                 "お施主様を選択",
                 group_names,
@@ -2489,6 +2495,7 @@ def main():
                 # 現在の案件を保存してから切り替え
                 persist_project_mods()
                 st.session_state['current_project'] = selected_proj
+                st.session_state['_selector_synced_pid'] = selected_proj
                 # 切り替え先のデータがsession_stateになければ復元
                 if get_project_state('cad_data') is None:
                     restore_project_to_session(selected_proj)
@@ -2586,7 +2593,7 @@ def main():
             st.caption("💾 データ保存: クラウド永続化 有効")
         else:
             st.caption("⚠️ データ保存: 一時保存（再起動で消える場合があります）")
-        st.caption("build 2026-10-26.1")
+        st.caption("build 2026-10-26.2")
 
     # 単価マスタ読み込み
     csv_path = os.path.join(base_dir, "tankamaster_updated.csv")
