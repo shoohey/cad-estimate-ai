@@ -21,7 +21,19 @@ import re
 import statistics
 from typing import Any
 
-from ai_client import parse_number
+try:
+    from ai_client import parse_number
+except ImportError:  # pragma: no cover - Streamlit Cloud で旧 ai_client が残留した場合の保険
+    def parse_number(value):
+        """ai_client.parse_number と同じ仕様の簡易版（数値/数字文字列→float、それ以外は None）"""
+        import math as _math
+        import re as _re
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return None if (isinstance(value, float) and _math.isnan(value)) else float(value)
+        m = _re.search(r"-?\d+(?:\.\d+)?", str(value).replace(",", ""))
+        return float(m.group(0)) if m else None
 from cad_parser import (CADData, FittingData, PropertyCondition, RoomData,
                         load_cad_file, _norm)
 from estimate_calculator import Estimate, calculate_estimate

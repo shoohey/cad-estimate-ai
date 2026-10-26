@@ -8,3 +8,5 @@ font = "sans serif"
 
 [browser]
 gatherUsageStats = false
+
+# build 2026-10-26.6: 完全再起動の誘発（新規モジュール追加後の ImportError 対策）
