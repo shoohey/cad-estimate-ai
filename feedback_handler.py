@@ -29,7 +29,12 @@ import requests
 # 送信のたびに書かれたこのログを取り込み、同じ内容が二重に登録されてしまう。
 FEEDBACK_LOG_PATH = Path(__file__).resolve().parent / "feedback_sendlog.json"
 RESEND_ENDPOINT = "https://api.resend.com/emails"
-RESEND_FROM_ADDRESS = "onboarding@resend.dev"
+RESEND_FROM_ADDRESS = "onboarding@resend.dev"   # Resend の検証用送信元（自分のアドレスにしか届かない）
+
+
+def _from_address() -> str:
+    """送信元。Secrets の RESEND_FROM（独自ドメイン検証後に設定）を優先し、無ければ検証用アドレス。"""
+    return _get_secret("RESEND_FROM").strip() or RESEND_FROM_ADDRESS
 REQUEST_TIMEOUT_SEC = 10
 ATTACHMENT_UPLOAD_TIMEOUT_SEC = 60   # 添付ありの送信は時間がかかるため別枠
 
@@ -326,7 +331,7 @@ def _send_email(record: dict[str, Any], errors: list[str]) -> bool:
         return False
     try:
         payload = {
-            "from": RESEND_FROM_ADDRESS,
+            "from": _from_address(),
             "to": [to_email],
             "subject": f"【日本住建 見積AI】新しいフィードバック - {record['category']}",
             "html": _build_email_html(record),
@@ -489,7 +494,7 @@ def notify_feedback_status(record: dict[str, Any], new_status: str, note: str,
         resp = requests.post(
             RESEND_ENDPOINT,
             json={
-                "from": RESEND_FROM_ADDRESS,
+                "from": _from_address(),
                 "to": recipients,
                 "subject": f"【日本住建 見積AI】修正のご連絡（{new_status}） - {record.get('category', '')}",
                 "html": _status_mail_html(record, new_status, note, project_name),
