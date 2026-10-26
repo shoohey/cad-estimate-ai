@@ -125,3 +125,34 @@ def delete(key: str) -> None:
         raise
     except Exception as exc:  # noqa: BLE001
         raise CloudStoreError(f"DELETE {key}: {type(exc).__name__}: {exc}") from exc
+
+
+# --- アプリ用シークレット（Streamlit Secrets に書けない環境向けのフォールバック） ---------
+# 公開リポジトリにキーを書かないため、app_store の 'app_secrets' 行（service_role 以外は読めない）
+# から読む。読めるキーは下の許可リストに限る。値は画面・ログに出さないこと。
+APP_SECRETS_KEY = "app_secrets"
+ALLOWED_APP_SECRETS = frozenset({"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "AI_MODEL"})
+_APP_SECRET_TTL_SEC = 600
+_app_secret_cache: dict = {"at": 0.0, "values": None}
+
+
+def app_secret(key: str) -> str:
+    """app_store の app_secrets から key を返す（許可外・未設定・接続失敗は空文字）。"""
+    import time
+
+    if key not in ALLOWED_APP_SECRETS or not enabled():
+        return ""
+    now = time.time()
+    if _app_secret_cache["values"] is None or now - _app_secret_cache["at"] > _APP_SECRET_TTL_SEC:
+        try:
+            val = get(APP_SECRETS_KEY)
+            _app_secret_cache["values"] = val if isinstance(val, dict) else {}
+        except Exception:  # noqa: BLE001 - 接続失敗時は「未設定」として扱い、アプリは止めない
+            _app_secret_cache["values"] = {}
+        _app_secret_cache["at"] = now
+    return str(_app_secret_cache["values"].get(key) or "")
+
+
+def clear_app_secret_cache() -> None:
+    _app_secret_cache["at"] = 0.0
+    _app_secret_cache["values"] = None
