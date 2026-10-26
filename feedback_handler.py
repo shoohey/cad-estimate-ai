@@ -12,6 +12,7 @@ Streamlitアプリからのユーザーフィードバックを、以下の3チ�
 from __future__ import annotations
 
 import base64
+import html
 import json
 import os
 import uuid
@@ -442,3 +443,62 @@ if __name__ == "__main__":
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     print(f"\nローカルログ: {FEEDBACK_LOG_PATH}")
+
+
+# --- 修正完了の自動メール通知（2026-08-07 MTG） ------------------------------
+
+def _status_mail_html(record: dict[str, Any], new_status: str, note: str, project_name: str) -> str:
+    esc = html.escape
+    body = esc(str(record.get("body") or record.get("message") or "")).replace("\n", "<br>")
+    return (
+        "<div style=\"font-family:'Noto Sans JP',sans-serif;color:#1a1a2e;line-height:1.8;\">"
+        f"<p>いただいたフィードバックのステータスが「<b>{esc(new_status)}</b>」になりました。</p>"
+        f"<p><b>案件:</b> {esc(project_name or record.get('property') or '')}<br>"
+        f"<b>カテゴリ:</b> {esc(str(record.get('category') or ''))}<br>"
+        f"<b>受付日時:</b> {esc(str(record.get('timestamp') or ''))}</p>"
+        f"<p><b>変更箇所:</b><br>{esc(note).replace(chr(10), '<br>') or '（記載なし）'}</p>"
+        f"<p style=\"color:#4a5568;\"><b>元のご指摘:</b><br>{body}</p>"
+        "<p>お手数ですが、見積AIシステムの「フィードバック」タブでご確認のうえ、"
+        "問題なければ「対応完了」、問題があれば「差し戻し」（コメント付き）に変更をお願いいたします。</p>"
+        "</div>"
+    )
+
+
+def notify_feedback_status(record: dict[str, Any], new_status: str, note: str,
+                           project_name: str = "") -> tuple[bool, str]:
+    """ステータス変更（主に「高井対応済み」）をお客様へメール通知する。
+
+    宛先: フィードバック送信者のメール + Secrets の FEEDBACK_NOTIFY_TO（カンマ区切り）。
+    Resend 未設定・宛先なしの場合は送らず、その旨を文字列で返す（アプリは止めない）。
+    Returns: (送信できたか, 画面に出す説明文)
+    """
+    api_key = _get_secret("RESEND_API_KEY")
+    recipients: list[str] = []
+    reporter = str(record.get("email") or "").strip()
+    if "@" in reporter:
+        recipients.append(reporter)
+    for addr in str(_get_secret("FEEDBACK_NOTIFY_TO") or "").split(","):
+        addr = addr.strip()
+        if "@" in addr and addr not in recipients:
+            recipients.append(addr)
+    if not api_key:
+        return False, "メール通知は未設定のため送信していません（RESEND_API_KEY が未設定）。"
+    if not recipients:
+        return False, "メール通知の宛先がありません（送信者メール未記入・FEEDBACK_NOTIFY_TO 未設定）。"
+    try:
+        resp = requests.post(
+            RESEND_ENDPOINT,
+            json={
+                "from": RESEND_FROM_ADDRESS,
+                "to": recipients,
+                "subject": f"【日本住建 見積AI】修正のご連絡（{new_status}） - {record.get('category', '')}",
+                "html": _status_mail_html(record, new_status, note, project_name),
+            },
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            timeout=REQUEST_TIMEOUT_SEC,
+        )
+        if resp.status_code >= 300:
+            return False, f"メール送信に失敗しました（HTTP {resp.status_code}）。"
+        return True, f"メールで通知しました（宛先 {len(recipients)} 件）。"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"メール送信に失敗しました（{type(exc).__name__}）。"

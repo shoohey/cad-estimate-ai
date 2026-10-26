@@ -22,3 +22,5 @@ projects/equipment_master.json
 projects/*_feedbacks.json
 projects/*_changelog.json
 projects/*_actual.json
+.pytest_cache/
+tests/**/__pycache__/

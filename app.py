@@ -22,9 +22,14 @@ from estimate_calculator import (calculate_estimate, load_unit_prices, Estimate,
                                   EstimateItem, miraie_standard_count)
 from andpad_converter import (convert_to_andpad, ANDPADBudget,
                               ANDPADAllocation, vendor_sort_key)
-from feedback_handler import submit_feedback as send_feedback_to_company
+from feedback_handler import submit_feedback as send_feedback_to_company, notify_feedback_status
 import cloud_store
 import equipment_db
+import html as _html
+from ui_helpers import (project_display_label, project_full_label, merge_proposal_edits,
+                        parse_amount_jp, linked_order_price, FB_STATUSES, FB_STATUS_FIXED,
+                        normalize_fb_status, fb_status_color, validate_fb_status_change,
+                        apply_fb_status_change)
 
 # ページ設定
 st.set_page_config(
@@ -1022,19 +1027,12 @@ def _render_flash():
 
 
 def _parse_amount_jp(text) -> float | None:
-    """『150万』『1,500,000円』『2台』等の文字列から数値を取り出す"""
-    if text is None:
-        return None
-    if isinstance(text, (int, float)):
-        if isinstance(text, float) and math.isnan(text):
-            return None
-        return float(text)
-    s = str(text).replace(',', '').replace('円', '').strip()
-    m = re.search(r'(\d+(?:\.\d+)?)\s*万', s)
-    if m:
-        return float(m.group(1)) * 10000
-    m = re.search(r'\d+(?:\.\d+)?', s)
-    return float(m.group(0)) if m else None
+    """『150万』『1,500,000円』『2台』等の文字列から数値を取り出す。
+
+    『W2700』『H850』『2700mm』のような寸法表記は数量・金額とみなさない
+    （2026-08-07 MTG: カップボード W2700 を数量2700と誤認識した件）。
+    """
+    return parse_amount_jp(text)
 
 
 def _find_estimate_item(estimate: Estimate, category_name: str, item_name: str):
@@ -1159,8 +1157,12 @@ def _apply_ai_proposal(estimate_base: Estimate, mods: dict, p: dict) -> str | No
         val = _amount_of(p)
         if val is None:
             return None
-        desc = f"{item.name}: 見積単価 {ov['estimate_price']:,}円 → {int(val):,}円"
+        # 販価を変えたら原価（発注単価）も同じ粗利率で連動させる（2026-08-07 MTG）
+        new_ord = linked_order_price(ov['estimate_price'], ov.get('order_price'), int(val))
+        desc = (f"{item.name}: 見積単価 {ov['estimate_price']:,}円 → {int(val):,}円"
+                f"（原価 {int(ov.get('order_price') or 0):,}円 → {new_ord:,}円）")
         ov['estimate_price'] = int(val)
+        ov['order_price'] = new_ord
     else:  # spec: 仕様変更は名称・摘要に反映
         proposed = p.get('proposed') or item.name
         desc = f"{item.name}: 仕様変更 → {proposed}"
@@ -1169,8 +1171,11 @@ def _apply_ai_proposal(estimate_base: Estimate, mods: dict, p: dict) -> str | No
         ov['summary'] = _distinct_summary(p.get('reason', ''), proposed)
         val = _amount_of(p)
         if val is not None and int(val) != int(ov['estimate_price']):
-            desc += f"（単価 {int(ov['estimate_price']):,}円 → {int(val):,}円）"
+            new_ord = linked_order_price(ov['estimate_price'], ov.get('order_price'), int(val))
+            desc += (f"（単価 {int(ov['estimate_price']):,}円 → {int(val):,}円 / "
+                     f"原価 {int(ov.get('order_price') or 0):,}円 → {new_ord:,}円）")
             ov['estimate_price'] = int(val)
+            ov['order_price'] = new_ord
     mods.setdefault('overrides', {})[key] = ov
     return desc
 
@@ -1688,7 +1693,7 @@ def load_all_feedbacks(projects: dict) -> list:
             # キャッシュ上のdictを汚さないようコピーに表示用キーを付与する
             fb2 = dict(fb)
             fb2['_proj_id'] = pid
-            fb2['_proj_name'] = projects[pid].get('name', pid)
+            fb2['_proj_name'] = project_full_label(projects[pid]) or pid
             all_fbs.append(fb2)
     all_fbs.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
     return all_fbs
@@ -2166,9 +2171,13 @@ def project_tree(projects: dict) -> dict:
 
 
 def project_label(pinfo: dict) -> str:
-    """一覧・選択欄に出す表示名（プラン名があれば併記）"""
-    plan = project_plan(pinfo)
-    return f"{pinfo.get('name', '')}（{plan}）" if plan else pinfo.get('name', '')
+    """一覧・選択欄に出す表示名。
+
+    変更見積（別プラン）はプラン名（作成時に入力したタイトル）のみを返す。
+    元見積名を前に連結すると選択欄でタイトルが切れて区別できないため
+    （2026-08-04 ご指摘）。選択欄はお施主様ごとに絞られているので識別できる。
+    """
+    return project_display_label(pinfo)
 
 
 def duplicate_project(src_pid: str, projects: dict, plan_name: str) -> str:
@@ -2211,7 +2220,7 @@ def duplicate_project(src_pid: str, projects: dict, plan_name: str) -> str:
     save_project_list(projects)
     append_project_changelog(
         new_pid, 'システム',
-        f"「{project_label(base)}」を複製して作成（プラン: {projects[new_pid]['plan']}）")
+        f"「{project_full_label(base)}」を複製して作成（プラン: {projects[new_pid]['plan']}）")
     return new_pid
 
 
@@ -2302,15 +2311,17 @@ def _render_project_list_tab(projects: dict, restore_fn):
                          'font-weight:700;padding:2px 10px;border-radius:4px;margin-left:0.5rem;">'
                          '表示中</span>') if is_current else ''
                 plan = project_plan(pinfo)
-                plan_badge = (f'<span style="background:#e0f2fe;color:#0c4a6e;font-size:0.72rem;'
-                              f'font-weight:700;padding:2px 10px;border-radius:4px;'
-                              f'margin-left:0.5rem;">{plan}</span>') if plan else ''
+                # 変更見積（別プラン）は入力したプラン名を見出しにし、元見積名は小さく添える
+                # （2026-08-04 ご指摘: 元見積名の後ろに連結すると、どの変更か分からない）
+                title = _html.escape(project_display_label(pinfo))
+                base_line = (f'元の見積: {_html.escape(str(pinfo.get("name", "")))}<br>'
+                             if plan else '')
                 st.markdown(
                     f'<div style="background:{bg};border:1.5px solid {border_color};border-radius:10px;'
                     f'padding:0.8rem 1.2rem;margin-bottom:0.5rem;box-shadow:0 1px 3px rgba(0,0,0,0.04);">'
-                    f'<span style="font-weight:700;font-size:1rem;color:#1e3a5f;">{pinfo["name"]}</span>'
-                    f'{plan_badge}{badge}<br>'
-                    f'<span style="font-size:0.8rem;color:#64748b;">登録: {pinfo.get("created", "-")}'
+                    f'<span style="font-weight:700;font-size:1rem;color:#1e3a5f;">{title}</span>'
+                    f'{badge}<br>'
+                    f'<span style="font-size:0.8rem;color:#64748b;">{base_line}登録: {pinfo.get("created", "-")}'
                     f'　ファイル: {pinfo.get("file_name", "-")}</span>'
                     f'</div>',
                     unsafe_allow_html=True,
@@ -2462,11 +2473,15 @@ def main():
             )
             proj_options = [pid for pid, _ in tree.get(selected_group, [])]
             current_idx = proj_options.index(cur_pid) if cur_pid in proj_options else 0
+            # 表示はプラン名のみ。同じ名前が並ぶときだけ元見積名も併記して区別する
+            opt_labels = {pid: project_label(projects[pid]) for pid in proj_options}
+            dup_labels = {lb for lb in opt_labels.values() if list(opt_labels.values()).count(lb) > 1}
             selected_proj = st.selectbox(
                 "案件（プラン）を選択",
                 proj_options,
                 index=current_idx,
-                format_func=lambda x: project_label(projects[x]),
+                format_func=lambda x: (project_full_label(projects[x])
+                                       if opt_labels[x] in dup_labels else opt_labels[x]),
                 key="project_selector",
                 help="同じお施主様で仕様違いの見積を持てます。追加は案件一覧タブの「プランを複製」から。",
             )
@@ -2571,7 +2586,7 @@ def main():
             st.caption("💾 データ保存: クラウド永続化 有効")
         else:
             st.caption("⚠️ データ保存: 一時保存（再起動で消える場合があります）")
-        st.caption("build 2026-07-31.3")
+        st.caption("build 2026-10-26.1")
 
     # 単価マスタ読み込み
     csv_path = os.path.join(base_dir, "tankamaster_updated.csv")
@@ -2664,7 +2679,7 @@ def main():
         badges = []
         for pid, pinfo in st.session_state['projects'].items():
             cls = "project-badge project-badge-active" if pid == st.session_state['current_project'] else "project-badge"
-            badges.append(f'<span class="{cls}">{pinfo["name"]}</span>')
+            badges.append(f'<span class="{cls}">{_html.escape(project_full_label(pinfo))}</span>')
         st.markdown(f'<div class="project-bar">{"".join(badges)}</div>', unsafe_allow_html=True)
 
     # 設備マスターの反映（案件の設備選択で単価を上書き）
@@ -3899,6 +3914,8 @@ def main():
                             if not proposals:
                                 _flash("この書類から見積の変更点は見つかりませんでした。", "info")
                             set_project_state('ai_proposals', proposals)
+                            set_project_state('ai_proposals_epoch',
+                                              int(get_project_state('ai_proposals_epoch', 0) or 0) + 1)
                             set_project_state('ai_proposals_src', f"提案書反映（{up_doc.name}）")
                             st.rerun()
                         except Exception as exc:
@@ -3947,6 +3964,8 @@ def main():
                                     if not proposals:
                                         _flash("この指示から見積の変更点を特定できませんでした。言い方を変えてお試しください。", "info")
                                     set_project_state('ai_proposals', proposals)
+                                    set_project_state('ai_proposals_epoch',
+                                                      int(get_project_state('ai_proposals_epoch', 0) or 0) + 1)
                                     set_project_state('ai_proposals_src', '音声変更')
                                     st.rerun()
                                 except Exception as exc:
@@ -3971,13 +3990,18 @@ def main():
 
                     ctype_label = {'price': '単価変更', 'quantity': '数量変更',
                                    'add': '追加', 'remove': '削除', 'spec': '仕様変更'}
+                    label_to_ctype = {v: k for k, v in ctype_label.items()}
+                    # 表（data_editor）を作り直すための世代番号。全て選択／全て解除や
+                    # 変更案の再抽出で +1 して、古い編集状態を引きずらないようにする
+                    editor_epoch = int(get_project_state('ai_proposals_epoch', 0) or 0)
                     prop_rows = []
                     for p in proposals:
                         amt = p.get('amount')
                         if not isinstance(amt, (int, float)):
                             amt = _parse_amount_jp(p.get('proposed')) or 0
                         prop_rows.append({
-                            '反映': bool(default_check_ok and p.get('confidence') == 'high'),
+                            '反映': (bool(p['apply']) if isinstance(p.get('apply'), bool)
+                                     else bool(default_check_ok and p.get('confidence') == 'high')),
                             '工事種別': p.get('category', ''),
                             '品名': p.get('item_name', ''),
                             '変更の種類': ctype_label.get(p.get('change_type'), '仕様変更'),
@@ -3988,7 +4012,7 @@ def main():
                         })
                     edited_props = st.data_editor(
                         pd.DataFrame(prop_rows),
-                        key=f"prop_editor_{current_pid}_{len(proposals)}",
+                        key=f"prop_editor_{current_pid}_{len(proposals)}_{editor_epoch}",
                         use_container_width=True, hide_index=True,
                         column_config={
                             '反映': st.column_config.CheckboxColumn('反映', width='small'),
@@ -4001,8 +4025,23 @@ def main():
                         },
                         disabled=['読み取り'],
                     )
+                    # 反映チェックの一括操作（2026-08-04 ご指摘）。表で直した品名・金額などを
+                    # 変更案へ書き戻してから表を作り直すので、修正内容は失われない
+                    bulk_apply = None
+                    sel_c1, sel_c2, _sel_sp = st.columns([1, 1, 4])
+                    with sel_c1:
+                        if st.button("全て選択", key="btn_props_select_all"):
+                            bulk_apply = True
+                    with sel_c2:
+                        if st.button("全て解除", key="btn_props_clear_all"):
+                            bulk_apply = False
+                    if bulk_apply is not None:
+                        set_project_state('ai_proposals', merge_proposal_edits(
+                            proposals, edited_props.to_dict('records'), label_to_ctype,
+                            apply_all=bulk_apply))
+                        set_project_state('ai_proposals_epoch', editor_epoch + 1)
+                        st.rerun()
 
-                    label_to_ctype = {v: k for k, v in ctype_label.items()}
                     checked = []
                     for _, row in edited_props.iterrows():
                         if not row['反映']:
@@ -4023,7 +4062,7 @@ def main():
                         value=True, key="props_to_new_plan",
                         help="ONにすると現在の見積を複製した新しいプランに反映します。"
                              "元の見積はそのまま残り、案件一覧のツリーで並べて比較できます。")
-                    plan_default = f"打合せ変更 {now_jst().strftime('%m/%d')}"
+                    plan_default = f"打合せ変更 {now_jst().strftime('%m/%d %H:%M')}"
                     new_plan_name = st.text_input(
                         "変更見積のプラン名", value=plan_default,
                         key="props_plan_name") if to_new_plan else ""
@@ -4255,7 +4294,7 @@ def main():
     # ===== フィードバックタブ =====
     with tab_fb:
         current_pid = st.session_state.get('current_project', '')
-        current_pname = st.session_state['projects'].get(current_pid, {}).get('name', '') if current_pid else ''
+        current_pname = project_full_label(st.session_state['projects'].get(current_pid, {})) if current_pid else ''
 
         st.markdown("#### フィードバック・ご要望")
         st.markdown(
@@ -4426,16 +4465,19 @@ def main():
         # 送信済みフィードバック一覧
         if display_fbs:
             # ステータスフィルター
-            status_options = ["全て", "未対応", "対応済み"]
+            # ステータスは 未対応 → 高井対応済み → 対応完了 / 差し戻し の3段階（2026-08-07 MTG）
+            status_options = ["全て"] + FB_STATUSES
             fb_filter = st.radio("表示フィルター", status_options, horizontal=True, key="fb_filter")
+            st.caption("流れ: 高井が修正したら「高井対応済み」→ ご確認いただき問題なければ「対応完了」、"
+                       "問題があれば「差し戻し」（コメント必須）にしてください。")
 
             filtered = display_fbs if fb_filter == "全て" else [
-                fb for fb in display_fbs if fb.get('status', '未対応') == fb_filter
+                fb for fb in display_fbs if normalize_fb_status(fb.get('status')) == fb_filter
             ]
 
-            undone_count = sum(1 for fb in display_fbs if fb.get('status', '未対応') == '未対応')
-            done_count = sum(1 for fb in display_fbs if fb.get('status') == '対応済み')
-            st.markdown(f"全 {len(display_fbs)} 件（未対応: {undone_count} / 対応済み: {done_count}）")
+            counts = {s: sum(1 for fb in display_fbs if normalize_fb_status(fb.get('status')) == s)
+                      for s in FB_STATUSES}
+            st.markdown(f"全 {len(display_fbs)} 件（" + " / ".join(f"{s}: {n}" for s, n in counts.items()) + "）")
 
             for idx, fb in enumerate(filtered if fb_view_mode == "全案件横断表示" else list(reversed(filtered))):
                 if fb_view_mode == "全案件横断表示":
@@ -4453,8 +4495,8 @@ def main():
                         actual_idx_in_list = idx
 
                 priority_mark = '<span style="color:#dc2626;font-weight:700;">【急ぎ】</span>' if fb.get('priority') == '急ぎ' else ""
-                status = fb.get('status', '未対応')
-                status_color = "#dc2626" if status == "未対応" else "#16a34a"
+                status = normalize_fb_status(fb.get('status'))
+                status_color = fb_status_color(status)
                 status_html = f'<span style="color:{status_color};font-weight:600;">[{status}]</span>'
                 proj_label = f'<span style="background:#e0f2fe;color:#0c4a6e;font-size:0.75rem;font-weight:600;padding:2px 8px;border-radius:4px;margin-right:0.4rem;">{fb_proj_name}</span>' if show_project_name and fb_proj_name else ""
                 st.markdown(
@@ -4470,6 +4512,7 @@ def main():
                     f'<div class="fb-body">'
                     f'{"<b>対象:</b> " + fb["target"] + "<br>" if fb.get("target") else ""}'
                     f'{fb.get("body") or fb.get("message", "")}'
+                    f'{"<br><b>対応メモ（" + status + "）:</b> " + _html.escape(str(fb.get("status_note"))) if fb.get("status_note") else ""}'
                     f'</div>'
                     f'</div>',
                     unsafe_allow_html=True,
@@ -4499,18 +4542,41 @@ def main():
 
                 # ステータス変更・削除ボタン（案件横断表示でも操作可能）
                 target_pid = fb.get('_proj_id', current_pid) if fb_view_mode == "全案件横断表示" else current_pid
-                col_s, col_d = st.columns([1, 1])
+                col_s, col_d = st.columns([3, 1])
                 with col_s:
-                    new_status = "対応済み" if status == "未対応" else "未対応"
-                    if st.button(f"{new_status}にする", key=f"status_fb_{target_pid}_{idx}"):
-                        proj_fbs = load_project_feedbacks(target_pid)
-                        # タイムスタンプと内容で一致するものを探す
-                        for i, pfb in enumerate(proj_fbs):
-                            if pfb.get('timestamp') == fb.get('timestamp') and pfb.get('body') == fb.get('body'):
-                                proj_fbs[i]['status'] = new_status
-                                break
-                        save_project_feedbacks(target_pid, proj_fbs)
-                        st.rerun()
+                    st_key = f"status_fb_{target_pid}_{idx}"
+                    next_options = [s for s in FB_STATUSES if s != status]
+                    sc1, sc2 = st.columns([1, 2])
+                    new_status = sc1.selectbox("変更後のステータス", next_options, key=f"{st_key}_sel")
+                    status_note = sc2.text_input(
+                        "コメント／変更箇所（差し戻しは必須）", key=f"{st_key}_note",
+                        placeholder="高井対応済み: 変更した箇所 ／ 差し戻し: 問題点")
+                    if st.button("ステータスを更新", key=st_key):
+                        err = validate_fb_status_change(new_status, status_note)
+                        if err:
+                            st.error(err)
+                        else:
+                            actor = '高井' if new_status == FB_STATUS_FIXED else 'お客様'
+                            proj_fbs = load_project_feedbacks(target_pid)
+                            updated = None
+                            # タイムスタンプと内容で一致するものを探す
+                            for i, pfb in enumerate(proj_fbs):
+                                if pfb.get('timestamp') == fb.get('timestamp') and pfb.get('body') == fb.get('body'):
+                                    proj_fbs[i] = apply_fb_status_change(
+                                        pfb, new_status, status_note, actor,
+                                        now_jst().strftime('%Y-%m-%d %H:%M'))
+                                    updated = proj_fbs[i]
+                                    break
+                            save_project_feedbacks(target_pid, proj_fbs)
+                            msg = f"ステータスを「{new_status}」に更新しました。"
+                            kind = "success"
+                            if updated is not None and new_status == FB_STATUS_FIXED:
+                                # 修正完了時に変更箇所を自動メール通知（2026-08-07 MTG）
+                                sent, note_msg = notify_feedback_status(updated, new_status, status_note, fb_proj_name)
+                                msg += " " + note_msg
+                                kind = "success" if sent else "info"
+                            _flash(msg, kind)
+                            st.rerun()
                 with col_d:
                     if st.button("削除", key=f"del_fb_{target_pid}_{idx}", type="secondary"):
                         proj_fbs = load_project_feedbacks(target_pid)
@@ -4538,7 +4604,7 @@ def main():
                     fb_csv_data += (
                         f'"{fb.get("timestamp", "")}","{pname}","{fb.get("category", "未分類")}","{target_escaped}",'
                         f'"{body_escaped}","{fb.get("priority", "通常")}","{fb.get("name", "")}",'
-                        f'"{fb.get("property", "")}","{fb.get("status", "未対応")}"\n'
+                        f'"{fb.get("property", "")}","{normalize_fb_status(fb.get("status"))}"\n'
                     )
                 st.download_button(
                     label="フィードバック一覧をCSVダウンロード",
