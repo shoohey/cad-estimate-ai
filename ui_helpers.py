@@ -353,6 +353,7 @@ def category_detail_rows(item_diff: dict | None, special_names: set | None = Non
         ac_amt = int(m.get('actual_amount') or 0)
         rows.append({
             '区分': DETAIL_KIND_SAME if ai_amt == ac_amt else DETAIL_KIND_DIFF,
+            'グループ': _clean(m.get('group')) + ('（種別合計のみ）' if m.get('via_pseudo') else ''),
             'AI品名': _clean(m.get('ai_name')),
             'AI摘要': _clean(m.get('ai_summary')),
             'AI数量': _qty_text(m.get('ai_quantity'), m.get('unit')),
@@ -368,7 +369,8 @@ def category_detail_rows(item_diff: dict | None, special_names: set | None = Non
         if not isinstance(x, dict):
             continue
         amt = int(x.get('amount') or 0)
-        rows.append({'区分': DETAIL_KIND_AI_ONLY, 'AI品名': _clean(x.get('name')), 'AI摘要': _clean(x.get('summary')),
+        rows.append({'区分': DETAIL_KIND_AI_ONLY, 'グループ': _clean(x.get('group')),
+                     'AI品名': _clean(x.get('name')), 'AI摘要': _clean(x.get('summary')),
                      'AI数量': _qty_text(x.get('quantity'), x.get('unit')), 'AI金額': amt,
                      '実績品名': '', '実績摘要': '', '実績数量': '', '実績金額': 0, '差額(AI−実績)': amt,
                      '登録済': False})
@@ -376,7 +378,8 @@ def category_detail_rows(item_diff: dict | None, special_names: set | None = Non
         if not isinstance(x, dict):
             continue
         amt = int(x.get('amount') or 0)
-        rows.append({'区分': DETAIL_KIND_ACTUAL_ONLY, 'AI品名': '', 'AI摘要': '', 'AI数量': '', 'AI金額': 0,
+        rows.append({'区分': DETAIL_KIND_ACTUAL_ONLY, 'グループ': _clean(x.get('group')),
+                     'AI品名': '', 'AI摘要': '', 'AI数量': '', 'AI金額': 0,
                      '実績品名': _clean(x.get('name')), '実績摘要': _clean(x.get('summary')),
                      '実績数量': _qty_text(x.get('quantity'), x.get('unit')), '実績金額': amt,
                      '差額(AI−実績)': -amt, '登録済': False})

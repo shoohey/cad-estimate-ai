@@ -65,6 +65,8 @@ _DEFAULT_COLUMNS = {"no": 1, "name": 2, "summary": 3,
 
 # 明細マッチングのしきい値（過剰マッチより未マッチのほうが良い＝保守的に設定）
 ITEM_MATCH_RATIO = 0.80               # difflib類似度の下限
+_RE_CODE = re.compile(r"(?<!\d)\d{4,6}(?:-\d)?(?!\d)")   # 名称中の数字コード（サッシ呼称等）
+_RE_ANNEX = re.compile(r"追加分|変更|差額|追加")              # 実績側だけの追加・変更行
 ITEM_CONTAIN_MIN_LEN = 4              # 部分一致を認める正規化後の最小文字数
 ITEM_CONTAIN_MIN_COVER = 0.6          # 部分一致で短い側が長い側を覆う最低比率
                                       # （「大工手間」⊂「●33調整分（大工手間）」の
@@ -81,18 +83,45 @@ _RE_SUBITEM_NO = re.compile(r"^\d+-\d+-\d+$")  # レベル2内訳 (例 '1-1-1')
 
 # --- 内部ヘルパー -------------------------------------------------------
 
-def _normalize_name(text: Any) -> str:
+_RE_LEADING_MARK = re.compile(r"^[●★■◆▲※☆□◇△]+")
+_RE_TRAILING_PAREN = re.compile(r"[（(]([^（）()]*)[）)]\s*$")
+_RE_ANNOTATION = re.compile(r"令和|平成|\d{4}年|\d{1,2}/\d{1,2}|見積no|見積番号|no\.")
+_RE_KEEP = re.compile(r"[^0-9a-z぀-ヿ㐀-鿿豈-﫿]")
+
+
+def _core(text: Any) -> str:
+    return _RE_KEEP.sub("", unicodedata.normalize("NFKC", str(text or "")).lower()).replace("・", "")
+
+
+def _is_annotation(inner: str, groups: tuple) -> bool:
+    """名称末尾の括弧の中身が『付記』（親グループ名・日付・見積No）か"""
+    core = _core(inner)
+    if not core:
+        return True
+    if _RE_ANNOTATION.search(unicodedata.normalize("NFKC", inner).lower()):
+        return True
+    return any(_core(g) and core == _core(g) for g in groups)
+
+
+def _normalize_name(text: Any, *groups: str) -> str:
     """名称マッチング用に文字列を正規化する。
 
-    NFKC正規化（半角カナ→全角・全角英数→半角）→ 小文字化 →
-    空白/記号を除去し、英数字・かな・カタカナ・漢字のみを残す。
-    例: 'ﾍﾞﾀ基礎' → 'ベタ基礎', '板金・樋工事' → '板金樋工事'
+    NFKC正規化（半角カナ→全角・全角英数→半角）→ 小文字化 → 先頭の記号（●★■等）除去 →
+    末尾の括弧付記（親グループ名・日付・見積No）除去 → 空白/記号/「・」/「%」を除去し、
+    英数字・かな・カタカナ・漢字のみを残す。
+    例: 'ﾍﾞﾀ基礎' → 'ベタ基礎', '板金・樋工事' → '板金樋工事',
+        '●33調整分（大工手間）' + groups=('大工手間',) → '33調整分'
     """
     if text is None:
         return ""
-    s = unicodedata.normalize("NFKC", str(text)).lower()
-    # 英数字・ひらがな・カタカナ（長音符含む）・CJK漢字のみ残す
-    return re.sub(r"[^0-9a-z぀-ヿ㐀-鿿豈-﫿]", "", s)
+    t = unicodedata.normalize("NFKC", str(text)).lower().strip()
+    t = _RE_LEADING_MARK.sub("", t).strip()
+    m = _RE_TRAILING_PAREN.search(t)
+    if m and _is_annotation(m.group(1), tuple(groups)):
+        t = t[:m.start()].strip()
+    t = t.replace("%", "")
+    # 「・」(U+30FB)はカタカナ範囲に含まれるので明示的に除去する
+    return _RE_KEEP.sub("", t).replace("・", "")
 
 
 def _to_int(value: Any) -> int:
@@ -291,6 +320,8 @@ def parse_actual_estimate(file_bytes: bytes) -> dict:
     sub_names: dict[str, str] = {}            # {'N-M': サブヘッダ行の名称}
     subitems: dict[str, list[dict]] = {}      # {'N-M': [レベル2明細dict]}
     level1_with_amount: set[str] = set()      # 金額を持つレベル1の項目№
+    level1_item_by_no: dict[str, dict] = {}   # {'N-M': レベル1明細dict}（内訳展開で親を外すため）
+    cur_parent = ""                           # 直前に出たレベル1の項目№（内訳行の親判定に使う）
     cat_names: dict[int, str] = {}            # {種別no: 明細部ヘッダ行の名称}
     rounding_adjustment = 0
     tax = 0
@@ -371,44 +402,74 @@ def parse_actual_estimate(file_bytes: bytes) -> dict:
             continue
 
         if in_detail and _RE_ITEM_NO.fullmatch(no_raw):
+            cur_parent = no_raw
             if not has_amount:
                 # レベル2内訳のサブヘッダ行（'N-M'・金額なし）。
                 # 展開形式ではここが唯一の名称の出どころになるため控えておく
                 sub_names.setdefault(no_raw, name)
                 continue
             cat_no = int(no_raw.split("-")[0])
-            items_by_cat.setdefault(cat_no, []).append(_read_item(r, name, amount))
+            item = _read_item(r, name, amount)
+            item["no"] = no_raw
+            items_by_cat.setdefault(cat_no, []).append(item)
             level1_with_amount.add(no_raw)
+            level1_item_by_no[no_raw] = item
             continue
 
         # レベル2内訳行（'N-M-K'）。通常形式ではレベル1と二重計上になるため
         # 集計しないが、親のレベル1に金額が無い場合の復元用に保持する
         if _RE_SUBITEM_NO.fullmatch(no_raw):
             if has_amount:
-                parent = "-".join(no_raw.split("-")[:2])
-                subitems.setdefault(parent, []).append(_read_item(r, name, amount))
+                prefix = "-".join(no_raw.split("-")[:2])
+                # 親は直前のレベル1行で決める（「3-3」配下の行が「3-2-23」と誤採番されている物件への対策）
+                parent = cur_parent if (cur_parent and cur_parent.split("-")[0] == prefix.split("-")[0]) else prefix
+                child = _read_item(r, name, amount)
+                child["no"] = no_raw
+                subitems.setdefault(parent, []).append(child)
             continue
 
-    # --- 展開形式の復元: レベル1に金額が無い親をレベル2の合計で補う ---
-    rolled_up = 0
+    # --- 内訳展開: レベル2(N-M-K)の内訳を突合対象の明細として採用する ---
+    # 提出見積は「1-1 安全対策費 387,300」のような親（レベル1・小計）の下に
+    # 「1-1-1 駐車場代 171,500 …」の内訳を持つ。AI概算は内訳の粒度で出すため、
+    # 親だけを残すと内訳行が全て突合できない（8物件で実績の約36%が親行に隠れていた）。
+    # 親は候補から外して group 名として内訳に付け、親金額−内訳合計の残差は
+    # 「親名（内訳外）」の1行にして種別合計との整合を保つ。
+    groups_by_cat: dict[int, list[dict]] = {}
+    expanded = 0
     for parent, children in subitems.items():
         cat_no = int(parent.split("-")[0])
-        # 同じ項目№のレベル1明細が金額付きで存在するなら二重計上になるため使わない
-        # （通常形式では全ての親が該当するので、この復元は一切動かない）
+        cat_items = items_by_cat.setdefault(cat_no, [])
         if parent in level1_with_amount:
-            continue
-        items_by_cat.setdefault(cat_no, []).append({
-            "name": sub_names.get(parent, "") or (children[0]["name"] if children else parent),
-            "summary": "",
-            "quantity": 1.0,
-            "unit": "式",
-            "price": sum(c["amount"] for c in children),
-            "amount": sum(c["amount"] for c in children),
-        })
-        rolled_up += 1
-    if rolled_up:
+            p = level1_item_by_no[parent]
+            if p in cat_items:
+                cat_items.remove(p)
+            group_name = p["name"]
+            children_sum = int(sum(c["amount"] for c in children))
+            groups_by_cat.setdefault(cat_no, []).append(
+                {"name": group_name, "amount": int(p["amount"]), "children_sum": children_sum, "no": parent})
+            for c in children:
+                c["group"] = group_name
+                cat_items.append(c)
+            residual = int(p["amount"]) - children_sum
+            if residual:
+                cat_items.append({
+                    "name": f"{group_name}（内訳外）", "summary": "", "quantity": 1.0, "unit": "式",
+                    "price": residual, "amount": residual, "group": group_name, "no": parent,
+                })
+        else:
+            # 展開形式（親に金額なし）: 内訳をそのまま明細にする
+            group_name = sub_names.get(parent, "") or (children[0]["name"] if children else parent)
+            children_sum = int(sum(c["amount"] for c in children))
+            for c in children:
+                c["group"] = group_name
+                cat_items.append(c)
+            groups_by_cat.setdefault(cat_no, []).append(
+                {"name": group_name, "amount": children_sum, "children_sum": children_sum, "no": parent})
+        expanded += 1
+    if expanded:
         warnings.append(
-            f"内訳を展開した形式と判断し、{rolled_up}件の小計を内訳から積み上げて復元しました")
+            f"{expanded}件の小計行を内訳（N-M-K行）に展開して比較します"
+            "（親の小計と内訳合計に差がある場合は「（内訳外）」の行として残しています）")
 
     if recomputed:
         warnings.append(
@@ -436,7 +497,8 @@ def parse_actual_estimate(file_bytes: bytes) -> dict:
                     f"種別{cat_no}「{name}」の明細合計{item_sum:,}円が"
                     f"サマリ金額{total:,}円と一致しません"
                 )
-        categories.append({"no": cat_no, "name": name, "total": total, "items": items})
+        categories.append({"no": cat_no, "name": name, "total": total, "items": items,
+                           "groups": groups_by_cat.get(cat_no, [])})
 
     # 金額0円の種別は読み取り漏れの可能性が高い（実際の見積で0円の種別は稀）
     zero_cats = [c["name"] for c in categories if c["total"] == 0]
@@ -536,14 +598,20 @@ def _ai_items_to_dicts(ai_items: list) -> list[dict]:
         "quantity": _to_float(getattr(it, "quantity", 0)),
         "unit": _cell_str(getattr(it, "unit", "")),
         "amount": int(it.estimate_amount),
+        "group": _cell_str(getattr(it, "category", "")),
     } for it in ai_items]
 
 
-def _match_keys(item: dict) -> tuple[str, str]:
-    """明細の照合キー（名称のみ／名称＋摘要）を正規化して返す。"""
+def _match_keys(item: dict, *extra_groups: str) -> tuple[str, str]:
+    """明細の照合キー（名称のみ／名称＋摘要）を正規化して返す。
+
+    名称末尾の括弧が自分または相手側の group 名（親の小計名）なら付記として外す
+    （例: 「33調整分（大工手間）」⇔ 3-3 大工手間 配下の「33調整分」）。
+    """
     name = _cell_str(item.get("name"))
     summary = _cell_str(item.get("summary"))
-    return _normalize_name(name), _normalize_name(name + summary)
+    groups = tuple(g for g in (_cell_str(item.get("group")), *extra_groups) if g)
+    return _normalize_name(name, *groups), _normalize_name(name + summary, *groups)
 
 
 def item_alias_keys(item: dict) -> set[str]:
@@ -569,8 +637,8 @@ def _item_similarity(ai: dict, ac: dict) -> float:
     AI側は「鋼板屋根　荷揚げ費」と名称に含めることがある。名称だけで比べると
     同じ項目が別物として扱われるため、摘要を連結した表記どうしも突き合わせる。
     """
-    ai_name, ai_full = _match_keys(ai)
-    ac_name, ac_full = _match_keys(ac)
+    ai_name, ai_full = _match_keys(ai, _cell_str(ac.get("group")))
+    ac_name, ac_full = _match_keys(ac, _cell_str(ai.get("group")))
     return max(
         _similarity(ai_name, ac_name),
         _similarity(ai_full, ac_full),
@@ -592,7 +660,7 @@ def _rollup_items(items: list[dict]) -> list[dict]:
     order: list[tuple] = []
     for it in items:
         # 摘要までキーに含める（同じ名称でも摘要が違えば別の項目として扱う）
-        key = (_match_keys(it)[1], _cell_str(it.get("unit", "")))
+        key = (_match_keys(it)[1], _cell_str(it.get("unit", "")), _cell_str(it.get("group", "")))
         cur = merged.get(key)
         if cur is None:
             merged[key] = {
@@ -602,6 +670,8 @@ def _rollup_items(items: list[dict]) -> list[dict]:
                 "unit": _cell_str(it.get("unit", "")),
                 "amount": int(it["amount"]),
                 "rows": 1,
+                "group": _cell_str(it.get("group", "")),
+                "pseudo": bool(it.get("pseudo", False)),
             }
             order.append(key)
         else:
@@ -630,18 +700,37 @@ def _match_items(ai_items: list[dict], actual_items: list[dict],
                 alias_hits.add((i, j))
             else:
                 score = _item_similarity(ai, ac)
+                # 名称中の数字コード（サッシ呼称 16005 等）が両側にあり一致しない組は、
+                # 文字の並びが似ていても別品目の可能性が高いので順位を下げる
+                codes_ai = set(_RE_CODE.findall(unicodedata.normalize("NFKC", _cell_str(ai.get("name")))))
+                codes_ac = set(_RE_CODE.findall(unicodedata.normalize("NFKC", _cell_str(ac.get("name")))))
+                if codes_ai and codes_ac and codes_ai.isdisjoint(codes_ac) and score < 1.0:
+                    score = min(score, ITEM_MATCH_RATIO)
             if score < ITEM_MATCH_RATIO:
                 continue
-            # 同名でも単位・数量が揃う組を優先する（換気システムのように
-            # 同じ品名が単位違いで並ぶ種別で、並び順任せの対応付けを避ける）。
-            # 加点は順位付けだけに使い、マッチ可否の判定には使わない。
+            # 順位付け（マッチ可否の判定には使わない）:
+            #   名称＋摘要の完全一致 > 登録済みの組 > 名称のみ一致 > 部分一致 > 類似
+            #   同じ group（親の小計名）・単位・数量が揃う組を優先し、
+            #   実績側だけが「追加分／変更／差額」の行は後回し、最後は金額の近さ
             rank = score
-            if (i, j) in alias_hits:
-                rank += 0.01   # 登録済みの組は同点の自動候補より常に優先
+            _, ai_full_key = _match_keys(ai, _cell_str(ac.get("group")))
+            _, ac_full_key = _match_keys(ac, _cell_str(ai.get("group")))
+            if ai_full_key and ai_full_key == ac_full_key:
+                rank += 0.02
+            elif (i, j) in alias_hits:
+                rank += 0.01
+            if _cell_str(ai.get("group")) and _core(ai.get("group")) == _core(ac.get("group")):
+                rank += 0.003
             if _cell_str(ai.get("unit")) == _cell_str(ac.get("unit")):
                 rank += 0.002
             if abs(_to_float(ai.get("quantity")) - _to_float(ac.get("quantity"))) < 1e-6:
                 rank += 0.001
+            ac_text = _cell_str(ac.get("name")) + _cell_str(ac.get("summary"))
+            ai_text = _cell_str(ai.get("name")) + _cell_str(ai.get("summary"))
+            if _RE_ANNEX.search(ac_text) and not _RE_ANNEX.search(ai_text):
+                rank -= 0.005
+            ai_amt, ac_amt = abs(int(ai.get("amount", 0))), abs(int(ac.get("amount", 0)))
+            rank += 0.0005 * (1 - min(1.0, abs(ai_amt - ac_amt) / max(ai_amt, ac_amt, 1)))
             scored.append((rank, i, j))
 
     matched = []
@@ -664,6 +753,8 @@ def _match_items(ai_items: list[dict], actual_items: list[dict],
             "unit": ai.get("unit") or ac.get("unit", ""),
             "ai_rows": ai.get("rows", 1),
             "via_alias": (i, j) in alias_hits,
+            "via_pseudo": bool(ac.get("pseudo", False)),
+            "group": ac.get("group") or ai.get("group", ""),
         })
         used_ai.add(i)
         used_actual.add(j)
@@ -672,7 +763,7 @@ def _match_items(ai_items: list[dict], actual_items: list[dict],
         return [{"name": it["name"], "amount": int(it["amount"]),
                  "summary": it.get("summary", ""),
                  "quantity": it["quantity"], "unit": it.get("unit", ""),
-                 "rows": it.get("rows", 1)}
+                 "rows": it.get("rows", 1), "group": it.get("group", "")}
                 for k, it in enumerate(items) if k not in used]
 
     return {"matched": matched,
@@ -735,8 +826,13 @@ def diff_estimates(estimate, actual: dict, aliases: set | None = None) -> dict:
         # 双方とも同一名称の明細を1行に集約してから突合する（粒度合わせ）
         ai_items = _rollup_items(
             _ai_items_to_dicts(ai_cat.items)) if ai_cat is not None else []
-        actual_items = _rollup_items(
-            list(actual_cat["items"])) if actual_cat is not None else []
+        actual_raw = list(actual_cat["items"]) if actual_cat is not None else []
+        if actual_cat is not None and not actual_raw and int(actual_cat["total"]) > 0:
+            # 管理費のようにサマリ部にしか無い種別は、種別合計を1行の擬似明細にして突合する
+            actual_raw = [{"name": actual_cat["name"], "summary": "", "quantity": 1.0, "unit": "式",
+                           "price": int(actual_cat["total"]), "amount": int(actual_cat["total"]),
+                           "pseudo": True}]
+        actual_items = _rollup_items(actual_raw)
         if ai_items or actual_items:
             item_diffs[cat_name] = _match_items(ai_items, actual_items, aliases)
 
