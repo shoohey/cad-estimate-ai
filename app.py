@@ -29,7 +29,15 @@ import html as _html
 from ui_helpers import (project_display_label, project_full_label, merge_proposal_edits,
                         parse_amount_jp, linked_order_price, FB_STATUSES, FB_STATUS_FIXED,
                         normalize_fb_status, fb_status_color, validate_fb_status_change,
-                        apply_fb_status_change)
+                        apply_fb_status_change, ACTIVE_FB_STATUSES, fb_is_archived,
+                        partition_feedbacks, fb_timeline_text, release_log_rows,
+                        category_detail_rows, detail_kind_counts, detail_header,
+                        DETAIL_KIND_DIFF, DETAIL_KIND_AI_ONLY, DETAIL_KIND_ACTUAL_ONLY,
+                        DETAIL_KIND_SAME, make_alias_entry, alias_pairs_from_library,
+                        alias_entry_exists, validate_alias_selection, alias_applies,
+                        ALIAS_SCOPE_GLOBAL, ALIAS_SCOPE_PROJECT, ALIAS_SCOPE_LABEL,
+                        PROJECT_SPECIFIC_LABEL, PROJECT_SPECIFIC_CATEGORY, NOTE_SCOPE_GLOBAL,
+                        NOTE_SCOPE_PROJECT, validate_special_selection, special_note_name)
 
 # ページ設定
 st.set_page_config(
@@ -1943,6 +1951,7 @@ def save_project_actual(proj_id: str, parsed: dict):
 
 DIFF_REASON_CATEGORIES = [
     "",
+    "案件特有（図面に表れない項目）",
     "仕様・グレード差",
     "数量拾いの差",
     "AIの計上漏れ",
@@ -2017,6 +2026,45 @@ def load_diff_reason_library() -> dict:
     return result
 
 
+ITEM_ALIAS_KEY = "item_alias_library"   # 「同じ商品」の名寄せ辞書（全案件横断・案件特有分も同居）
+
+
+def load_item_alias_library() -> list:
+    """利用者が登録した「AI明細 ⇔ 実績明細 は同じ商品」の辞書を読み込む"""
+    if '_alias_lib' in st.session_state:
+        return st.session_state['_alias_lib']
+    result = None
+    if _cloud_ok():
+        try:
+            result = cloud_store.get(ITEM_ALIAS_KEY)
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
+    if result is None:
+        path = os.path.join(PROJECTS_DIR, "item_alias_library.json")
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                result = json.load(f)
+        else:
+            result = []
+    if not isinstance(result, list):
+        result = []
+    st.session_state['_alias_lib'] = result
+    return result
+
+
+def save_item_alias_library(lib: list):
+    """同じ商品辞書を保存（ローカル＋クラウド）"""
+    path = os.path.join(PROJECTS_DIR, "item_alias_library.json")
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(lib, f, ensure_ascii=False, indent=2)
+    st.session_state['_alias_lib'] = lib
+    if _cloud_ok():
+        try:
+            cloud_store.put(ITEM_ALIAS_KEY, lib)
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
+
+
 def update_diff_reason_library(entries: list):
     """差異理由をライブラリへ蓄積する（同一項目は新しいものを先頭に最大20件）
 
@@ -2036,6 +2084,7 @@ def update_diff_reason_library(entries: list):
             'category': e['category'],
             'reason': e['reason'],
             'diff': e['diff'],
+            'scope': e.get('scope', 'global'),   # project=この案件特有（他案件の参考には出さない）
             'date': now_jst().strftime('%Y-%m-%d'),
         })
         rec['entries'] = rec['entries'][:DIFF_LIBRARY_MAX_ENTRIES]
@@ -2057,7 +2106,8 @@ def past_reason_hint(lib: dict, key: str, current_property: str) -> str:
     if not rec:
         return ""
     others = [e for e in rec.get('entries', [])
-              if e.get('property') != current_property and e.get('reason')]
+              if e.get('property') != current_property and e.get('reason')
+              and e.get('scope', 'global') != 'project']
     if not others:
         return ""
     return " / ".join(
@@ -2593,7 +2643,7 @@ def main():
             st.caption("💾 データ保存: クラウド永続化 有効")
         else:
             st.caption("⚠️ データ保存: 一時保存（再起動で消える場合があります）")
-        st.caption("build 2026-10-26.3")
+        st.caption("build 2026-10-26.5")
 
     # 単価マスタ読み込み
     csv_path = os.path.join(base_dir, "tankamaster_updated.csv")
@@ -3653,7 +3703,10 @@ def main():
                     with st.expander(f"⚠ 読み取り時の注意 {len(actual_warnings)}件", expanded=False):
                         for warn in actual_warnings:
                             st.markdown(f"- {warn}")
-                diff = excel_diff.diff_estimates(estimate, actual)
+                alias_lib = load_item_alias_library()
+                diff = excel_diff.diff_estimates(
+                    estimate, actual, alias_pairs_from_library(alias_lib, current_pid))
+                alias_prop_name = st.session_state['projects'].get(current_pid, {}).get('name', '')
                 ai_total = diff['total_ai']
                 act_total = diff['total_actual']
                 rate_pct = (ai_total - act_total) / act_total * 100 if act_total else 0.0
@@ -3706,42 +3759,151 @@ def main():
                     df_cat.style.format({'AI見積': '{:,}', '実績見積': '{:,}', '差額(AI−実績)': '{:+,}'}),
                     use_container_width=True, hide_index=True)
 
-                with st.expander("明細レベルの差分を見る"):
-                    st.caption(
-                        "同じ品名の明細は実績見積の粒度に合わせて1行にまとめて比較しています"
-                        "（合計金額は変わりません）。")
+                st.markdown("##### 明細の内訳（工事種別をクリックして詳細を見る）")
+                st.caption(
+                    "各工事種別を開くと、明細ごとに「金額が違う／AIにしかない／実績にしかない／一致」が"
+                    "確認できます。同じ品名の明細は実績見積の粒度に合わせて1行にまとめて比較しています"
+                    "（合計金額は変わりません）。")
+                item_diffs = diff.get('item_diffs', {})
+                kind_bg = {DETAIL_KIND_DIFF: '#fff7e6', DETAIL_KIND_AI_ONLY: '#e8f1ff',
+                           DETAIL_KIND_ACTUAL_ONLY: '#ffecec', DETAIL_KIND_SAME: ''}
 
-                    def _qty_label(item: dict, qty_key: str = 'quantity') -> str:
-                        """数量＋単位の表示文字列（数量が無ければ空文字）"""
-                        qty = item.get(qty_key) or 0
-                        if not qty:
-                            return ""
-                        return f"{qty:g}{item.get('unit', '')}"
+                def _detail_row_style(row):
+                    bg = kind_bg.get(row['区分'], '')
+                    return [f'background-color: {bg}' if bg else '' for _ in row]
 
-                    for cat_name, d in diff.get('item_diffs', {}).items():
-                        big = [m for m in d.get('matched', [])
-                               if abs(m['ai_amount'] - m['actual_amount']) >= 10000]
-                        if not (big or d.get('ai_only') or d.get('actual_only')):
-                            continue
-                        st.markdown(f"**{cat_name}**")
-                        for m in big[:15]:
-                            ai_q = _qty_label(m, 'ai_quantity')
-                            ac_q = _qty_label(m, 'actual_quantity')
-                            rows = m.get('ai_rows', 1)
-                            note = f"　※AI{rows}行を集約" if rows > 1 else ""
-                            st.markdown(
-                                f"- {m['ai_name']} ⇔ {m['actual_name']}: "
-                                f"AI {ai_q} {m['ai_amount']:,}円 / "
-                                f"実績 {ac_q} {m['actual_amount']:,}円 "
-                                f"（差 {m['ai_amount'] - m['actual_amount']:+,}円）{note}")
-                        for x in d.get('ai_only', [])[:8]:
-                            st.markdown(
-                                f"- 🟦 AIのみ: {x['name']} "
-                                f"{_qty_label(x)}（{x['amount']:,}円）")
-                        for x in d.get('actual_only', [])[:8]:
-                            st.markdown(
-                                f"- 🟥 実績のみ: {x['name']} "
-                                f"{_qty_label(x)}（{x['amount']:,}円）")
+                proj_notes = load_project_diff_notes(current_pid)
+
+                def _special_names_of(cat_name: str) -> set:
+                    prefix = f"{cat_name}|"
+                    return {k[len(prefix):] for k, v in proj_notes.items()
+                            if k.startswith(prefix) and isinstance(v, dict)
+                            and v.get('category') == PROJECT_SPECIFIC_CATEGORY}
+
+                for cd in diff['category_diffs']:
+                    detail_rows = category_detail_rows(item_diffs.get(cd['name']),
+                                                       _special_names_of(cd['name']))
+                    counts = detail_kind_counts(detail_rows)
+                    with st.expander(detail_header(cd, counts), expanded=False):
+                        if not detail_rows:
+                            st.caption("明細がありません。")
+                        else:
+                            st.dataframe(
+                                pd.DataFrame(detail_rows).style
+                                .apply(_detail_row_style, axis=1)
+                                .format({'AI金額': '{:,}', '実績金額': '{:,}', '差額(AI−実績)': '{:+,}'}),
+                                use_container_width=True, hide_index=True,
+                                height=min(60 + 35 * len(detail_rows), 520))
+                            reg_rows = [r for r in detail_rows
+                                        if r['区分'] in (DETAIL_KIND_AI_ONLY, DETAIL_KIND_ACTUAL_ONLY)]
+                            if reg_rows:
+                                st.markdown(
+                                    "**同じ商品の登録**: 下の表で「AIにしかない」1件と「実績にしかない」1件に"
+                                    "チェックして登録すると、次回から自動で突き合わせます。")
+                                reg_cols = ('区分', '扱い', 'AI品名', 'AI摘要', 'AI金額', '実績品名', '実績摘要', '実績金額')
+                                reg_df = pd.DataFrame([{'選択': False, **{k: r[k] for k in reg_cols}}
+                                                       for r in reg_rows])
+                                edited_reg = st.data_editor(
+                                    reg_df, hide_index=True, use_container_width=True,
+                                    key=f"alias_editor_{current_pid}_{cd['no']}_{len(alias_lib)}",
+                                    disabled=list(reg_cols),
+                                    column_config={'選択': st.column_config.CheckboxColumn('選択', width='small')})
+                                rc1, rc2, rc3 = st.columns([2, 1, 1])
+                                scope_label = rc1.radio(
+                                    "この読み替えは", ["全案件共通（普遍的な表記ゆれ）", "この案件のみ（この案件特有）"],
+                                    horizontal=True, key=f"alias_scope_{current_pid}_{cd['no']}",
+                                    help="日本住建で常に同じ意味なら「全案件共通」、この物件だけの読み替えなら「この案件のみ」。後から一覧で変更できます")
+                                if rc2.button("チェックした2件を同じ商品として登録",
+                                              key=f"alias_reg_{current_pid}_{cd['no']}", type="primary"):
+                                    selected = [r for r in edited_reg.to_dict('records') if r.get('選択')]
+                                    err, ai_row, ac_row = validate_alias_selection(selected)
+                                    if err:
+                                        st.error(err)
+                                    else:
+                                        scope = (ALIAS_SCOPE_PROJECT if scope_label.startswith("この案件")
+                                                 else ALIAS_SCOPE_GLOBAL)
+                                        entry = make_alias_entry(
+                                            ai_row, ac_row, cd['name'], alias_prop_name,
+                                            now_jst().strftime('%Y-%m-%d %H:%M'), scope=scope,
+                                            project_id=current_pid)
+                                        if alias_entry_exists(alias_lib, entry):
+                                            _flash("この組み合わせは登録済みです。", "info")
+                                        else:
+                                            alias_lib.append(entry)
+                                            save_item_alias_library(alias_lib)
+                                            append_project_changelog(
+                                                current_pid, '実績取込',
+                                                f"同じ商品として登録: {entry['ai_name']} ⇔ {entry['actual_name']}"
+                                                f"（{ALIAS_SCOPE_LABEL[scope]}）")
+                                            _flash(f"「{entry['ai_name']}」と「{entry['actual_name']}」を同じ商品として"
+                                                   f"登録しました（{ALIAS_SCOPE_LABEL[scope]}）。")
+                                        st.rerun()
+                                if rc3.button("チェックした行を「この案件特有」として登録",
+                                              key=f"special_reg_{current_pid}_{cd['no']}",
+                                              help="図面に表れない物件固有の項目など、全案件には該当しないもの。"
+                                                   "差異理由に「案件特有」として記録し、他案件の参考には出しません"):
+                                    selected = [r for r in edited_reg.to_dict('records') if r.get('選択')]
+                                    err, rows_sel = validate_special_selection(selected)
+                                    if err:
+                                        st.error(err)
+                                    else:
+                                        new_notes = dict(proj_notes)
+                                        lib_entries = []
+                                        for r in rows_sel:
+                                            nm = special_note_name(r)
+                                            key = diff_note_key(cd['name'], nm)
+                                            prev = new_notes.get(key, {})
+                                            new_notes[key] = {
+                                                'category': PROJECT_SPECIFIC_CATEGORY,
+                                                'reason': prev.get('reason') or '図面に表れない物件固有の項目',
+                                                'scope': 'project',
+                                                'diff': int(r.get('差額(AI−実績)') or 0),
+                                                'updated_at': now_jst().strftime('%Y-%m-%d %H:%M'),
+                                            }
+                                            lib_entries.append({
+                                                'key': key, 'item': nm,
+                                                'category': PROJECT_SPECIFIC_CATEGORY,
+                                                'reason': new_notes[key]['reason'],
+                                                'property': alias_prop_name,
+                                                'diff': new_notes[key]['diff'], 'scope': 'project',
+                                            })
+                                        save_project_diff_notes(current_pid, new_notes)
+                                        update_diff_reason_library(lib_entries)
+                                        append_project_changelog(
+                                            current_pid, '実績取込',
+                                            f"案件特有として登録: " + " / ".join(e['item'] for e in lib_entries))
+                                        _flash(f"{len(rows_sel)}件を「この案件特有（全案件には該当しない）」として登録しました。")
+                                        st.rerun()
+
+                # ===== 登録済みの「同じ商品」一覧（適用範囲の変更・解除） =====
+                visible_aliases = [(i, e) for i, e in enumerate(alias_lib) if alias_applies(e, current_pid)]
+                other_project_aliases = len(alias_lib) - len(visible_aliases)
+                with st.expander(f"登録済みの「同じ商品」（この案件に適用 {len(visible_aliases)}件"
+                                 f"{'・他案件特有 ' + str(other_project_aliases) + '件は非表示' if other_project_aliases else ''}）"):
+                    if not visible_aliases:
+                        st.caption("まだ登録がありません。各工事種別を開いて登録できます。")
+                    for i, e in visible_aliases:
+                        is_project = e.get('scope') == ALIAS_SCOPE_PROJECT
+                        ai_txt = e.get('ai_name', '') + (f"｜{e['ai_summary']}" if e.get('ai_summary') else '')
+                        ac_txt = e.get('actual_name', '') + (f"｜{e['actual_summary']}" if e.get('actual_summary') else '')
+                        ac1, ac2, ac3 = st.columns([5, 1.6, 0.8])
+                        ac1.markdown(
+                            f"AI「{_html.escape(ai_txt)}」 ⇔ 実績「{_html.escape(ac_txt)}」　"
+                            f"<span style='font-size:0.8rem;color:#4a5568;'>{_html.escape(e.get('category', ''))}・"
+                            f"<b>{ALIAS_SCOPE_LABEL.get(e.get('scope'), '全案件共通')}</b>・{e.get('at', '')}・"
+                            f"登録元: {_html.escape(e.get('property', ''))}</span>", unsafe_allow_html=True)
+                        if ac2.button("全案件共通に変更" if is_project else "この案件のみに変更",
+                                      key=f"alias_scope_toggle_{i}"):
+                            alias_lib[i] = {**e, 'scope': ALIAS_SCOPE_GLOBAL if is_project else ALIAS_SCOPE_PROJECT,
+                                            'project_id': e.get('project_id') or current_pid}
+                            save_item_alias_library(alias_lib)
+                            _flash("適用範囲を変更しました。")
+                            st.rerun()
+                        if ac3.button("解除", key=f"alias_del_{i}"):
+                            alias_lib.pop(i)
+                            save_item_alias_library(alias_lib)
+                            _flash("同じ商品の登録を解除しました。")
+                            st.rerun()
 
                 # ===== 差異の理由を記入して学習させる =====
                 st.markdown("")
@@ -3795,6 +3957,9 @@ def main():
                         key = diff_note_key(r['工事種別'], r['品名'])
                         saved = notes.get(key, {})
                         r['分類'] = saved.get('category', '')
+                        r['適用範囲'] = (NOTE_SCOPE_PROJECT if saved.get('scope') == 'project'
+                                     or saved.get('category') == PROJECT_SPECIFIC_CATEGORY
+                                     else NOTE_SCOPE_GLOBAL)
                         r['差異の理由'] = saved.get('reason', '')
                         r['過去の理由（参考）'] = past_reason_hint(lib, key, prop_name)
                     shown = [r for r in note_rows
@@ -3807,6 +3972,10 @@ def main():
                         column_config={
                             '分類': st.column_config.SelectboxColumn(
                                 '分類', options=DIFF_REASON_CATEGORIES, width='small'),
+                            '適用範囲': st.column_config.SelectboxColumn(
+                                '適用範囲', options=[NOTE_SCOPE_GLOBAL, NOTE_SCOPE_PROJECT], width='small',
+                                help="普遍的な理由なら「全案件共通」（他案件の参考に出る）、"
+                                     "この物件だけの事情なら「この案件のみ」"),
                             '差異の理由': st.column_config.TextColumn(
                                 '差異の理由（なぜ金額が違うか）', width='large'),
                             '過去の理由（参考）': st.column_config.TextColumn(
@@ -3829,8 +3998,11 @@ def main():
                             if not reason and not category:
                                 new_notes.pop(key, None)
                                 continue
+                            # 案件特有の分類は常に「この案件のみ」。それ以外は選択に従う
+                            scope = ('project' if category == PROJECT_SPECIFIC_CATEGORY
+                                     or (row.get('適用範囲') or '') == NOTE_SCOPE_PROJECT else 'global')
                             new_notes[key] = {
-                                'category': category, 'reason': reason,
+                                'category': category, 'reason': reason, 'scope': scope,
                                 'diff': int(row['差額']),
                                 'updated_at': now_jst().strftime('%Y-%m-%d %H:%M'),
                             }
@@ -3839,6 +4011,7 @@ def main():
                                     'key': key, 'item': row['品名'],
                                     'category': category, 'reason': reason,
                                     'property': prop_name, 'diff': int(row['差額']),
+                                    'scope': scope,
                                 })
                         save_project_diff_notes(current_pid, new_notes)
                         update_diff_reason_library(lib_entries)
@@ -4472,19 +4645,43 @@ def main():
         # 送信済みフィードバック一覧
         if display_fbs:
             # ステータスフィルター
-            # ステータスは 未対応 → 高井対応済み → 対応完了 / 差し戻し の3段階（2026-08-07 MTG）
-            status_options = ["全て"] + FB_STATUSES
-            fb_filter = st.radio("表示フィルター", status_options, horizontal=True, key="fb_filter")
+            # ステータスは 未対応 → 高井対応済み → 対応完了 / 差し戻し の3段階（2026-08-07 MTG）。
+            # 問い合わせは削除せず保持し、両者の確認が済んだ（対応完了）ものはアーカイブへ移す
+            active_fbs, archived_fbs = partition_feedbacks(display_fbs)
+            view_options = [f"対応中（{len(active_fbs)}）", f"アーカイブ・対応完了（{len(archived_fbs)}）", "全て"]
+            fb_view = st.radio("表示", view_options, horizontal=True, key="fb_archive_view")
             st.caption("流れ: 高井が修正したら「高井対応済み」→ ご確認いただき問題なければ「対応完了」、"
-                       "問題があれば「差し戻し」（コメント必須）にしてください。")
-
-            filtered = display_fbs if fb_filter == "全て" else [
-                fb for fb in display_fbs if normalize_fb_status(fb.get('status')) == fb_filter
+                       "問題があれば「差し戻し」（コメント必須）。対応完了になった問い合わせは"
+                       "アーカイブに残り、いつ何を直したかを後から確認できます。")
+            if fb_view.startswith("対応中"):
+                base_fbs = active_fbs
+                status_options = ["全て"] + ACTIVE_FB_STATUSES
+            elif fb_view.startswith("アーカイブ"):
+                base_fbs = archived_fbs
+                status_options = ["全て"]
+            else:
+                base_fbs = display_fbs
+                status_options = ["全て"] + FB_STATUSES
+            fb_filter = "全て"
+            if len(status_options) > 1:
+                # 表示（対応中／全て）ごとに選択肢が違うので、キーも分けて状態の食い違いを防ぐ
+                fb_filter = st.radio("ステータスで絞り込み", status_options, horizontal=True,
+                                     key="fb_filter_active" if fb_view.startswith("対応中") else "fb_filter_all")
+            filtered = base_fbs if fb_filter == "全て" else [
+                fb for fb in base_fbs if normalize_fb_status(fb.get('status')) == fb_filter
             ]
 
             counts = {s: sum(1 for fb in display_fbs if normalize_fb_status(fb.get('status')) == s)
                       for s in FB_STATUSES}
             st.markdown(f"全 {len(display_fbs)} 件（" + " / ".join(f"{s}: {n}" for s, n in counts.items()) + "）")
+
+            if fb_view.startswith("アーカイブ") and archived_fbs:
+                # 修正履歴: どの修正をいつ出し、いつ確認が取れたかの一覧
+                st.markdown("###### 修正履歴（新しい順）")
+                st.dataframe(pd.DataFrame(release_log_rows(
+                    archived_fbs,
+                    project_name_of=lambda fb: fb.get('_proj_name') or current_pname)),
+                    use_container_width=True, hide_index=True)
 
             for idx, fb in enumerate(filtered if fb_view_mode == "全案件横断表示" else list(reversed(filtered))):
                 if fb_view_mode == "全案件横断表示":
@@ -4505,6 +4702,10 @@ def main():
                 status = normalize_fb_status(fb.get('status'))
                 status_color = fb_status_color(status)
                 status_html = f'<span style="color:{status_color};font-weight:600;">[{status}]</span>'
+                history_html = (
+                    '<br><span style="font-size:0.8rem;color:#4a5568;">履歴: '
+                    + _html.escape(fb_timeline_text(fb)) + '</span>'
+                ) if (fb.get('status_history') or fb_is_archived(fb)) else ''
                 proj_label = f'<span style="background:#e0f2fe;color:#0c4a6e;font-size:0.75rem;font-weight:600;padding:2px 8px;border-radius:4px;margin-right:0.4rem;">{fb_proj_name}</span>' if show_project_name and fb_proj_name else ""
                 st.markdown(
                     f'<div class="feedback-card">'
@@ -4520,6 +4721,7 @@ def main():
                     f'{"<b>対象:</b> " + fb["target"] + "<br>" if fb.get("target") else ""}'
                     f'{fb.get("body") or fb.get("message", "")}'
                     f'{"<br><b>対応メモ（" + status + "）:</b> " + _html.escape(str(fb.get("status_note"))) if fb.get("status_note") else ""}'
+                    f'{history_html}'
                     f'</div>'
                     f'</div>',
                     unsafe_allow_html=True,
@@ -4585,7 +4787,10 @@ def main():
                             _flash(msg, kind)
                             st.rerun()
                 with col_d:
-                    if st.button("削除", key=f"del_fb_{target_pid}_{idx}", type="secondary"):
+                    confirm_del = st.checkbox("削除を確認", key=f"del_ok_{target_pid}_{idx}",
+                                              help="問い合わせの記録は原則残します。誤送信など明らかな場合のみ削除してください")
+                    if st.button("削除", key=f"del_fb_{target_pid}_{idx}", type="secondary",
+                                 disabled=not confirm_del):
                         proj_fbs = load_project_feedbacks(target_pid)
                         for i, pfb in enumerate(proj_fbs):
                             if pfb.get('timestamp') == fb.get('timestamp') and pfb.get('body') == fb.get('body'):
@@ -4596,14 +4801,9 @@ def main():
 
             st.markdown("")
             col1, col2 = st.columns([1, 3])
-            with col1:
-                if fb_view_mode != "全案件横断表示" and current_pid:
-                    if st.button("この案件のFBをクリア", type="secondary"):
-                        save_project_feedbacks(current_pid, [])
-                        st.rerun()
             with col2:
                 csv_fbs = display_fbs
-                fb_csv_data = "日時,案件名,カテゴリ,対象,内容,優先度,送信者,物件名,ステータス\n"
+                fb_csv_data = "日時,案件名,カテゴリ,対象,内容,優先度,送信者,物件名,ステータス,履歴\n"
                 for fb in csv_fbs:
                     body_escaped = (fb.get('body') or fb.get('message', '')).replace('"', '""').replace('\n', ' ')
                     target_escaped = fb.get('target', '').replace('"', '""')
@@ -4611,7 +4811,8 @@ def main():
                     fb_csv_data += (
                         f'"{fb.get("timestamp", "")}","{pname}","{fb.get("category", "未分類")}","{target_escaped}",'
                         f'"{body_escaped}","{fb.get("priority", "通常")}","{fb.get("name", "")}",'
-                        f'"{fb.get("property", "")}","{normalize_fb_status(fb.get("status"))}"\n'
+                        f'"{fb.get("property", "")}","{normalize_fb_status(fb.get("status"))}",'
+                        f'"{fb_timeline_text(fb).replace(chr(34), chr(34) * 2)}"\n'
                     )
                 st.download_button(
                     label="フィードバック一覧をCSVダウンロード",

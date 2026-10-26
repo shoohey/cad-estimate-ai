@@ -546,6 +546,22 @@ def _match_keys(item: dict) -> tuple[str, str]:
     return _normalize_name(name), _normalize_name(name + summary)
 
 
+def item_alias_keys(item: dict) -> set[str]:
+    """同一商品辞書で使う照合キー（名称のみ／名称＋摘要の正規化文字列）"""
+    return {k for k in _match_keys(item) if k}
+
+
+def is_alias_pair(ai: dict, ac: dict, aliases: set | None) -> bool:
+    """利用者が「同じ商品」と登録した組か。aliases は frozenset({key_a, key_b}) の集合。"""
+    if not aliases:
+        return False
+    for a in item_alias_keys(ai):
+        for b in item_alias_keys(ac):
+            if frozenset((a, b)) in aliases:
+                return True
+    return False
+
+
 def _item_similarity(ai: dict, ac: dict) -> float:
     """名称・摘要の組み合わせで最も高い類似度を返す。
 
@@ -595,7 +611,8 @@ def _rollup_items(items: list[dict]) -> list[dict]:
     return [merged[k] for k in order]
 
 
-def _match_items(ai_items: list[dict], actual_items: list[dict]) -> dict:
+def _match_items(ai_items: list[dict], actual_items: list[dict],
+                 aliases: set | None = None) -> dict:
     """種別内の明細同士を名称類似度で対応付ける。
 
     引数はいずれも _rollup_items() で集約済みの辞書リスト。
@@ -604,15 +621,23 @@ def _match_items(ai_items: list[dict], actual_items: list[dict]) -> dict:
     しきい値未満は無理にマッチさせない（保守的）。
     """
     scored = []
+    alias_hits: set[tuple[int, int]] = set()
     for i, ai in enumerate(ai_items):
         for j, ac in enumerate(actual_items):
-            score = _item_similarity(ai, ac)
+            # 利用者が「同じ商品」と登録した組は、名称が似ていなくても最優先で突合する
+            if is_alias_pair(ai, ac, aliases):
+                score = 1.0
+                alias_hits.add((i, j))
+            else:
+                score = _item_similarity(ai, ac)
             if score < ITEM_MATCH_RATIO:
                 continue
             # 同名でも単位・数量が揃う組を優先する（換気システムのように
             # 同じ品名が単位違いで並ぶ種別で、並び順任せの対応付けを避ける）。
             # 加点は順位付けだけに使い、マッチ可否の判定には使わない。
             rank = score
+            if (i, j) in alias_hits:
+                rank += 0.01   # 登録済みの組は同点の自動候補より常に優先
             if _cell_str(ai.get("unit")) == _cell_str(ac.get("unit")):
                 rank += 0.002
             if abs(_to_float(ai.get("quantity")) - _to_float(ac.get("quantity"))) < 1e-6:
@@ -638,6 +663,7 @@ def _match_items(ai_items: list[dict], actual_items: list[dict]) -> dict:
             "actual_quantity": ac["quantity"],
             "unit": ai.get("unit") or ac.get("unit", ""),
             "ai_rows": ai.get("rows", 1),
+            "via_alias": (i, j) in alias_hits,
         })
         used_ai.add(i)
         used_actual.add(j)
@@ -656,12 +682,14 @@ def _match_items(ai_items: list[dict], actual_items: list[dict]) -> dict:
 
 # --- 公開 API: 差分計算 ---------------------------------------------------
 
-def diff_estimates(estimate, actual: dict) -> dict:
+def diff_estimates(estimate, actual: dict, aliases: set | None = None) -> dict:
     """AI概算見積と実績見積パース結果の差分を計算する。
 
     Args:
         estimate: estimate_calculator.Estimate オブジェクト（AI概算見積）。
         actual: parse_actual_estimate() の戻り値（実績見積）。
+        aliases: 利用者が登録した「同じ商品」の組（frozenset({key_a, key_b}) の集合）。
+            名称が似ていなくてもこの組は突合する。
 
     Returns:
         dict: JSONシリアライズ可能な差分構造。
@@ -710,7 +738,7 @@ def diff_estimates(estimate, actual: dict) -> dict:
         actual_items = _rollup_items(
             list(actual_cat["items"])) if actual_cat is not None else []
         if ai_items or actual_items:
-            item_diffs[cat_name] = _match_items(ai_items, actual_items)
+            item_diffs[cat_name] = _match_items(ai_items, actual_items, aliases)
 
     category_diffs.sort(key=lambda d: d["no"])
 

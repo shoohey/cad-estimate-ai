@@ -81,7 +81,8 @@ def _boot(app_dir: str) -> AppTest:
     assert sample_btn, "サンプルボタンが見つからない"
     sample_btn[0].click().run()
     assert not at.exception, [str(e.value) for e in at.exception]
-    assert not at.warning, [w.value for w in at.warning]
+    # サンプル読込が実際に走ったこと（ファイル未検出の警告が出ていない）
+    assert not [w for w in at.warning if "サンプルデータファイル" in w.value], [w.value for w in at.warning]
     assert at.session_state["current_project"] == "sample_furui"
     assert at.session_state["proj_sample_furui_file_name"] == "古居様邸サンプルデータ"
     return at
@@ -170,9 +171,12 @@ class TestFeedbackStatusFlowInApp:
                         "property": "サンプル邸", "status": "未対応", "feedback_id": "fb-test-1",
                         "attachments": []}], f, ensure_ascii=False)
         at = _boot(app_dir)
-        radios = [r for r in at.radio if r.key == "fb_filter"]
+        # 既定の「対応中」表示では、絞り込みは対応中の3ステータスだけ（対応完了はアーカイブ側）
+        views = [r for r in at.radio if r.key == "fb_archive_view"]
+        assert views and list(views[0].options) == ["対応中（1）", "アーカイブ・対応完了（0）", "全て"]
+        radios = [r for r in at.radio if r.key == "fb_filter_active"]
         assert radios, "表示フィルターが無い"
-        assert list(radios[0].options) == ["全て", "未対応", "高井対応済み", "対応完了", "差し戻し"]
+        assert list(radios[0].options) == ["全て", "未対応", "高井対応済み", "差し戻し"]
 
         sel = [s for s in at.selectbox if s.key == "status_fb_sample_furui_0_sel"]
         assert sel, "ステータス変更の選択欄が無い"
