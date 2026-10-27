@@ -55,3 +55,16 @@ def test_non_dict_value_is_ignored(monkeypatch):
     monkeypatch.setattr(ai_client, "_secret_from_env_or_streamlit", lambda k: "")
     _cloud(monkeypatch, ["not", "a", "dict"])
     assert ai_client._get_secret("ANTHROPIC_API_KEY") == ""
+
+
+def test_feedback_handler_reads_mail_settings_from_cloud(monkeypatch):
+    import feedback_handler
+    monkeypatch.setattr(feedback_handler, "_secret_from_env_or_streamlit", lambda k: "")
+    _cloud(monkeypatch, {"FEEDBACK_NOTIFY_TO": "a@example.com, b@example.com", "RESEND_FROM": "noreply@example.com"})
+    assert feedback_handler._get_secret("FEEDBACK_NOTIFY_TO") == "a@example.com, b@example.com"
+    assert feedback_handler._get_secret("RESEND_FROM") == "noreply@example.com"
+    assert feedback_handler._get_secret("RESEND_API_KEY") == ""      # 未登録は空
+    assert feedback_handler._get_secret("SUPABASE_SERVICE_KEY") == ""  # 許可外は読まない
+    # キー未登録なら通知は送らず、その旨を返す（宛先はあっても送信しない）
+    ok, msg = feedback_handler.notify_feedback_status({"body": "x", "category": "c", "email": ""}, "高井対応済み", "n", "p")
+    assert ok is False and "RESEND_API_KEY" in msg

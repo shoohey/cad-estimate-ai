@@ -131,7 +131,10 @@ def delete(key: str) -> None:
 # 公開リポジトリにキーを書かないため、app_store の 'app_secrets' 行（service_role 以外は読めない）
 # から読む。読めるキーは下の許可リストに限る。値は画面・ログに出さないこと。
 APP_SECRETS_KEY = "app_secrets"
-ALLOWED_APP_SECRETS = frozenset({"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "AI_MODEL"})
+ALLOWED_APP_SECRETS = frozenset({
+    "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "AI_MODEL",                  # AI機能
+    "RESEND_API_KEY", "RESEND_FROM", "FEEDBACK_NOTIFY_TO", "FEEDBACK_TO_EMAIL",  # フィードバックのメール通知
+})
 _APP_SECRET_TTL_SEC = 600
 _app_secret_cache: dict = {"at": 0.0, "values": None}
 

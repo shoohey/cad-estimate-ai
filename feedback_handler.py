@@ -224,6 +224,19 @@ def _build_email_html(record: dict[str, Any]) -> str:
 
 
 def _get_secret(key: str) -> str:
+    """環境変数 → Streamlit secrets → クラウドの app_secrets（許可キーのみ）の順で値を取得する。"""
+    val = _secret_from_env_or_streamlit(key)
+    if val:
+        return val
+    try:
+        import cloud_store
+
+        return cloud_store.app_secret(key)
+    except Exception:  # noqa: BLE001 - 取得できなければ未設定として扱う
+        return ""
+
+
+def _secret_from_env_or_streamlit(key: str) -> str:
     """環境変数 → Streamlit secrets の順で値を取得する。どちらにも無ければ空文字を返す。"""
     val = os.environ.get(key)
     if val:
