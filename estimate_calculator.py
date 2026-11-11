@@ -36,6 +36,7 @@ class EstimateItem:
     andpad_vendor: str = ""    # 発注先（細目工種）
     andpad_material: int = 0   # 材料費
     andpad_labor: int = 0      # 施工費
+    andpad_mapping: dict | None = None   # 追加行のANDPAD振り分け（単価マスタの材・工の内訳から）
 
 
 @dataclass

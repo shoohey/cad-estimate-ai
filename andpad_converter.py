@@ -658,6 +658,12 @@ def convert_to_andpad(estimate: Estimate) -> ANDPADBudget:
         for item in category.items:
             mapping = VENDOR_MAPPING.get(item.child_no)
 
+            if mapping is None and getattr(item, 'andpad_mapping', None):
+                # 単価マスタから追加した行: 材・工の内訳から作った振り分け（発注先が空なら工事種別名）
+                raw = item.andpad_mapping
+                mapping = {"vendor": raw.get("vendor") or category.name, "kind": raw.get("kind") or "材",
+                           "parts": [{**p, "vendor": p.get("vendor") or category.name}
+                                     for p in raw.get("parts", []) if isinstance(p, dict)]}
             if mapping is None:
                 # マッピングがない場合は工事種別名を発注先とする
                 mapping = {"vendor": category.name, "kind": "材"}

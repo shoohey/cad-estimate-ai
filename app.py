@@ -39,6 +39,8 @@ from ui_helpers import (proposal_number,
                         alias_library_add, alias_library_remove, alias_library_set_scope, diff_library_remove,
                         design_master_preview, design_breakdown_rows, design_item_to_new_item,
                         search_design_master, validate_alias_pair, parse_quantity_jp,
+                        proposal_value, withdrawn_note_keys, special_note_key, parse_special_note_key,
+                        design_category_no, design_vocabulary,
                         category_detail_rows, detail_kind_counts, detail_header,
                         DETAIL_KIND_DIFF, DETAIL_KIND_AI_ONLY, DETAIL_KIND_ACTUAL_ONLY,
                         DETAIL_KIND_SAME, make_alias_entry, alias_pairs_from_library,
@@ -1006,8 +1008,10 @@ def apply_modifications(estimate: Estimate, mods: dict) -> Estimate:
 
         for new in new_items:
             if new['cat_no'] == cat.no:
+                # 単価マスタから追加した行は、アプリの明細コード（あれば）でANDPADの材工分離を効かせる
                 ni = EstimateItem(
-                    parent_no=cat.no, child_no=0,
+                    parent_no=cat.no, child_no=int(new.get('andpad_code') or 0),
+                    andpad_mapping=new.get('andpad_mapping'),
                     name=new['name'], summary=new.get('summary', ''),
                     quantity=new['quantity'], unit=new['unit'],
                     estimate_price=new['estimate_price'],
@@ -1134,8 +1138,8 @@ def _apply_ai_proposal(estimate_base: Estimate, mods: dict, p: dict) -> str | No
         仕様変更・追加では『円・万・¥』の付いた数字だけを金額とみなし、サイズや型番の数字
         （例: サザナ 1616サイズ）を単価にしない（2026-11-12 監査）。見つからなければ None。
         """
-        v = proposal_number(proposal.get('change_type', ''), proposal.get('proposed'), proposal.get('amount'))
-        return float(v) if v else None
+        # 見つからないときだけ None（「数量を0に」の 0 は値として使う）
+        return proposal_value(proposal.get('change_type', ''), proposal.get('proposed'), proposal.get('amount'))
 
     if ctype == 'add':
         amount = _amount_of(p)
@@ -1804,8 +1808,8 @@ def load_cad_for_project(proj_id: str):
 
 def delete_project_storage(proj_id: str):
     """案件のローカルファイルとクラウドデータを削除する"""
-    for suffix in (".txt", "_data.json", "_feedbacks.json",
-                   "_changelog.json", "_actual.json"):
+    for suffix in (".txt", "_data.json", "_feedbacks.json", "_changelog.json", "_actual.json",
+                   "_actual.xlsx", "_diff_notes.json", "_hidden_feedback.json"):
         p = os.path.join(PROJECTS_DIR, f"{proj_id}{suffix}")
         if os.path.exists(p):
             os.remove(p)
@@ -1817,7 +1821,8 @@ def delete_project_storage(proj_id: str):
     st.session_state.pop(f'_mods_logged_{proj_id}', None)
     if _cloud_ok():
         try:
-            for key_suffix in ("data", "cad", "feedbacks", "changelog", "actual"):
+            for key_suffix in ("data", "cad", "feedbacks", "changelog", "actual", "actual_file",
+                               "diff_notes", "hidden_feedback"):
                 cloud_store.delete(f"proj:{proj_id}:{key_suffix}")
         except cloud_store.CloudStoreError as exc:
             # 障害検知時点でサーキットブレーカーが働くため以降の削除は中断。
@@ -2255,7 +2260,8 @@ def recompute_hidden_stats(projects: dict, prices: dict) -> dict:
         for cat_name, d in diff.get('item_diffs', {}).items():
             for x in d.get('actual_only', []):
                 # 「この案件特有」と登録した行は、他の案件の候補（統計）に入れない（2026-11-12 監査）
-                note = notes.get(diff_note_key(cat_name, x.get('name', ''))) or {}
+                note = (notes.get(special_note_key(cat_name, x.get('name', ''), x.get('summary', '')))
+                        or notes.get(diff_note_key(cat_name, x.get('name', ''))) or {})
                 if note.get('scope') == 'project' or note.get('category') == PROJECT_SPECIFIC_CATEGORY:
                     continue
                 actual_only.append({'category': cat_name, 'name': x.get('name', ''), 'summary': x.get('summary', ''),
@@ -2308,6 +2314,7 @@ def update_diff_reason_library(entries: list):
     """
     if not entries:
         return
+    st.session_state.pop('_diff_lib', None)      # 他の担当者の登録を消さないよう、保存直前に読み直す
     lib = dict(load_diff_reason_library())
     for e in entries:
         rec = lib.get(e['key']) or {"item": e['item'], "entries": []}
@@ -3407,13 +3414,18 @@ def main():
                     dm_bd = design_breakdown_rows(design_rows_all, dm_sel.get('code'))
                     if dm_bd:
                         st.caption("内訳: " + " / ".join(f"{b['name']}（{int(b.get('estimate_price') or 0):,}円）" for b in dm_bd))
-                    dm_default = next((i for i, o in enumerate(mod_cat_options)
-                                       if dm_sel.get('category') and (dm_sel['category'] in o or o.split('. ', 1)[-1] in dm_sel['category'])), 0)
+                    dm_cat_no = design_category_no(dm_sel, [(c.no, c.name) for c in estimate_base.categories if c.no != 22])
+                    dm_default = next((i for i, o in enumerate(mod_cat_options) if int(o.split(".")[0]) == dm_cat_no), 0)
                     dm3, dm4, dm5 = st.columns([2, 1, 1])
-                    dm_cat = dm3.selectbox("追加先の工事種別", mod_cat_options, index=dm_default, key="dm_cat")
+                    # 項目を選び直したら追加先も選び直されるよう、キーに項目のコードを含める
+                    dm_cat = dm3.selectbox("追加先の工事種別", mod_cat_options, index=dm_default,
+                                           key=f"dm_cat_{dm_sel.get('code') or dm_i}")
                     dm_qty = dm4.number_input("数量", min_value=0.01, value=1.0, format="%.2f", key="dm_qty")
+                    if not dm_sel.get('estimate_price'):
+                        st.caption("単価が0円（別途見積）の項目です。追加したあと、上の工事種別の表で単価を入れてください。")
                     if dm5.button("見積に追加", key="dm_add", type="primary"):
-                        ni = design_item_to_new_item(dm_sel, int(dm_cat.split(".")[0]), dm_qty)
+                        ni = design_item_to_new_item(dm_sel, int(dm_cat.split(".")[0]), dm_qty,
+                                                     tanka_rows=tanka_master_rows(csv_path), design_rows=design_rows_all)
                         mods['new_items'].append(ni)
                         persist_project_mods()
                         append_project_changelog(current_pid, '見積修正',
@@ -4096,15 +4108,20 @@ def main():
 
                 def _special_names_of(cat_name: str) -> dict:
                     """この種別で登録済みの扱い {品名: ラベル}（案件特有／除外: 理由）"""
-                    prefix = f"{cat_name}|"
                     out = {}
                     for k, v in proj_notes.items():
-                        if not (k.startswith(prefix) and isinstance(v, dict)):
+                        if not isinstance(v, dict):
+                            continue
+                        kc, kn, ks = parse_special_note_key(k)
+                        if kc != cat_name or not kn:
                             continue
                         if v.get('category') == PROJECT_SPECIFIC_CATEGORY:
-                            out[k[len(prefix):]] = PROJECT_SPECIFIC_LABEL
+                            label = PROJECT_SPECIFIC_LABEL
                         elif v.get('category') == EXCLUDED_CATEGORY:
-                            out[k[len(prefix):]] = f"{EXCLUDED_LABEL}: {str(v.get('reason') or '').split('：')[0][:20]}"
+                            label = f"{EXCLUDED_LABEL}: {str(v.get('reason') or '').split('：')[0][:20]}"
+                        else:
+                            continue
+                        out[(kn, ks) if ks else kn] = label
                     return out
 
                 # 部品のキーは工事種別の番号ではなく並び順で作る。実績にしかない種別は実績側の番号を持つため、
@@ -4177,7 +4194,7 @@ def main():
                                     ai_only_rows = [r for r in reg_rows if r['区分'] == DETAIL_KIND_AI_ONLY]
                                     design_rows = load_design_master().get('rows') or []
                                     tanka_rows = tanka_master_rows(csv_path)
-                                    add_vocab = design_rows or tanka_rows
+                                    add_vocab = design_vocabulary(design_rows) or tanka_rows
 
                                     def _cand_label(sg):
                                         price = (f"・{int(sg['estimate_price']):,}円/{sg.get('unit') or '-'}"
@@ -4222,11 +4239,15 @@ def main():
                                             if bd:
                                                 st.caption("内訳: " + " / ".join(
                                                     f"{b['name']}（{int(b.get('estimate_price') or 0):,}円）" for b in bd))
-                                            if dc3.button("見積に追加", key=f"cand_add_{current_pid}_{ci}"):
+                                            if not sg.get('estimate_price'):
+                                                st.caption("この項目は単価が0円（別途見積）です。見積修正タブで単価を入れて追加してください。")
+                                            if dc3.button("見積に追加", key=f"cand_add_{current_pid}_{ci}",
+                                                          disabled=not sg.get('estimate_price')):
                                                 cat_pairs = [(c.no, c.name) for c in estimate_base.categories]
                                                 ai_cat = next((c for c in estimate_base.categories if c.name == cd['name']), None)
-                                                cat_no = ai_cat.no if ai_cat else hidden_items.resolve_category_no(cd['name'], cat_pairs)
-                                                ni = design_item_to_new_item(sg, cat_no, d_qty)
+                                                cat_no = ai_cat.no if ai_cat else design_category_no(sg, cat_pairs)
+                                                ni = design_item_to_new_item(sg, cat_no, d_qty, tanka_rows=tanka_rows,
+                                                                             design_rows=design_rows)
                                                 mods.setdefault('new_items', []).append(ni)
                                                 set_project_state('mods', mods)
                                                 persist_project_mods()
@@ -4240,13 +4261,23 @@ def main():
                                             st.caption("似ている項目は見つかりませんでした。")
                                         # ---- AI見積の明細と同じ商品として登録する ----
                                         st.markdown("**AI見積の明細と同じ商品として登録**")
+                                        # 登録先は、この工事種別でAI見積が実際に出している明細（名称＋摘要）から選ぶ。
+                                        # 単価マスタの摘要と見積の摘要（CAD由来）が違い、登録しても突き合わない
+                                        # ことがあったため（2026-11-12 反証）
                                         ai_opts = [{'name': r['AI品名'], 'summary': r['AI摘要'],
                                                     'label': f"AIにしかない行: {r['AI品名']}{'｜' + r['AI摘要'] if r['AI摘要'] else ''}"}
                                                    for r in ai_only_rows]
-                                        ai_opts += [{'name': s2['name'], 'summary': s2.get('summary', ''),
-                                                     'label': f"アプリの単価マスタ: {_cand_label(s2)}"}
-                                                    for s2 in master_lookup.suggest_similar(
-                                                        tgt['実績品名'], tgt['実績摘要'], tanka_rows, top_n=5, category=cd['name'])]
+                                        seen_ai = {(o['name'], o['summary']) for o in ai_opts}
+                                        est_cat = next((c for c in estimate.categories if c.name == cd['name']), None)
+                                        est_rows = [{'name': it.name, 'summary': it.summary or '', 'estimate_price': int(it.estimate_price or 0),
+                                                     'unit': it.unit, 'category': cd['name']}
+                                                    for it in (est_cat.items if est_cat else [])]
+                                        for s2 in master_lookup.suggest_similar(tgt['実績品名'], tgt['実績摘要'], est_rows,
+                                                                                top_n=5, category=cd['name']):
+                                            if (s2['name'], s2.get('summary', '')) not in seen_ai:
+                                                seen_ai.add((s2['name'], s2.get('summary', '')))
+                                                ai_opts.append({'name': s2['name'], 'summary': s2.get('summary', ''),
+                                                                'label': f"AI見積の明細: {_cand_label(s2)}"})
                                         if ai_opts:
                                             ac1, ac2 = st.columns([3, 1])
                                             a_i = ac1.selectbox("AI側の名称", list(range(len(ai_opts))),
@@ -4289,7 +4320,8 @@ def main():
                                         lib_entries = []
                                         for r in rows_sel:
                                             nm = special_note_name(r)
-                                            key = diff_note_key(cd['name'], nm)
+                                            sm = (r.get('実績摘要') if r.get('実績品名') else r.get('AI摘要')) or ''
+                                            key = special_note_key(cd['name'], nm, sm)   # 摘要まで含めて同じ品名の別の行と区別
                                             prev = new_notes.get(key, {})
                                             new_notes[key] = {
                                                 'category': PROJECT_SPECIFIC_CATEGORY,
@@ -4331,8 +4363,9 @@ def main():
                                         new_notes = dict(proj_notes)
                                         lib_entries = []
                                         for r in rows_sel:
-                                            nm = _clean_name = (r.get('AI品名') or r.get('実績品名') or '').strip()
-                                            key = diff_note_key(cd['name'], nm)
+                                            nm = (r.get('AI品名') or r.get('実績品名') or '').strip()
+                                            sm = (r.get('AI摘要') if r.get('AI品名') else r.get('実績摘要')) or ''
+                                            key = special_note_key(cd['name'], nm, sm)
                                             new_notes[key] = {
                                                 'category': EXCLUDED_CATEGORY, 'reason': reason_text, 'scope': scope,
                                                 'diff': int(r.get('差額(AI−実績)') or 0),
@@ -4430,7 +4463,8 @@ def main():
                         "未記入のみ表示", value=False, key="diff_note_filter")
                     for r in note_rows:
                         key = diff_note_key(r['工事種別'], r['品名'])
-                        saved = notes.get(key, {})
+                        saved = (notes.get(key)
+                                 or notes.get(special_note_key(r['工事種別'], r['品名'], r.get('摘要', ''))) or {})
                         r['分類'] = saved.get('category', '')
                         r['適用範囲'] = (NOTE_SCOPE_PROJECT if saved.get('scope') == 'project'
                                      or saved.get('category') == PROJECT_SPECIFIC_CATEGORY
@@ -4490,9 +4524,9 @@ def main():
                                 })
                         save_project_diff_notes(current_pid, new_notes)
                         # 理由を消した行・「この案件のみ」に変えた行は、他案件の参考（ライブラリ）からも外す
-                        withdrawn = [k for k in notes if k not in new_notes] + [
-                            k for k, v in new_notes.items() if isinstance(v, dict) and v.get('scope') == 'project']
+                        withdrawn = withdrawn_note_keys(notes, new_notes)
                         if withdrawn:
+                            st.session_state.pop('_diff_lib', None)
                             lib_now = load_diff_reason_library()
                             lib_new = diff_library_remove(lib_now, withdrawn, prop_name)
                             if lib_new != lib_now:
@@ -5054,31 +5088,32 @@ def main():
                     return f if f > 0 and not math.isnan(f) else 0.0
                 except (TypeError, ValueError):
                     return 0.0
-            raw_fa = raw.get('floor_areas') if isinstance(raw.get('floor_areas'), dict) else {}
-
-            def _floor_area(n: int) -> float:
-                for k, v in raw_fa.items():
-                    digits = re.findall(r'\d+', unicodedata.normalize('NFKC', str(k)))
-                    if digits and int(digits[0]) == n:
-                        return _num(v)
-                return 0.0
-            raw_roof = raw.get('roof') if isinstance(raw.get('roof'), dict) else {}
-            raw_floors = int(_num(raw.get('floors')))
+            # 入力欄の初期値は「直した値」（ex['data']）。別の案件を開いている間に入力欄の状態が消えても、
+            # 戻ったときに直した値で作り直す（2026-11-12 反証）
+            cur = ex.get('data') or raw
+            # 階の表記は計算エンジンと同じ正規化（一階→1階、地下1階→B1階）を使う
+            cur_fa = {}
+            for k, v in (cur.get('floor_areas') if isinstance(cur.get('floor_areas'), dict) else {}).items():
+                lab = pdf_estimate.normalize_floor_label(k)
+                if lab and _num(v) > 0:
+                    cur_fa[lab] = cur_fa.get(lab, 0.0) + _num(v)
+            raw_roof = cur.get('roof') if isinstance(cur.get('roof'), dict) else {}
+            raw_floors = int(_num(cur.get('floors')))
             p1, p2, p3 = st.columns(3)
             v_total = p1.number_input("延床面積（㎡）", min_value=0.0, step=0.01,
-                                      value=_num(raw.get('total_floor_area_m2')), key=f"{pdf_key}_pdf_total_{file_key}")
+                                      value=_num(cur.get('total_floor_area_m2')), key=f"{pdf_key}_pdf_total_{file_key}")
             v_floors = p2.number_input("階数", min_value=0, max_value=4, step=1,
                                        value=min(raw_floors, 4), key=f"{pdf_key}_pdf_floors_{file_key}")
             v_build = p3.number_input("建築面積（㎡）", min_value=0.0, step=0.01,
-                                      value=_num(raw.get('building_area_m2')), key=f"{pdf_key}_pdf_build_{file_key}")
+                                      value=_num(cur.get('building_area_m2')), key=f"{pdf_key}_pdf_build_{file_key}")
             if raw_floors > 4:
                 st.warning(f"AIは階数を {raw_floors} と読みました。4階までしか計算できないため、4として扱っています。")
             q1, q2, q3 = st.columns(3)
-            v_f1 = q1.number_input("1階 床面積（㎡）", min_value=0.0, step=0.01, value=_floor_area(1),
+            v_f1 = q1.number_input("1階 床面積（㎡）", min_value=0.0, step=0.01, value=cur_fa.get('1階', 0.0),
                                    key=f"{pdf_key}_pdf_f1_{file_key}")
-            v_f2 = q2.number_input("2階 床面積（㎡）", min_value=0.0, step=0.01, value=_floor_area(2),
+            v_f2 = q2.number_input("2階 床面積（㎡）", min_value=0.0, step=0.01, value=cur_fa.get('2階', 0.0),
                                    key=f"{pdf_key}_pdf_f2_{file_key}")
-            v_perim = q3.number_input("外周長（m）", min_value=0.0, step=0.01, value=_num(raw.get('perimeter_m')),
+            v_perim = q3.number_input("外周長（m）", min_value=0.0, step=0.01, value=_num(cur.get('perimeter_m')),
                                       key=f"{pdf_key}_pdf_perim_{file_key}")
             r1, r2, r3 = st.columns(3)
             v_roof_type = r1.text_input("屋根の種類（例: ガルバリウム鋼板 切妻／瓦 寄棟）",
@@ -5086,27 +5121,36 @@ def main():
             v_roof_area = r2.number_input("屋根面積（㎡）", min_value=0.0, step=0.01, value=_num(raw_roof.get('area_m2')),
                                           key=f"{pdf_key}_pdf_roofarea_{file_key}")
             v_wall = r3.number_input("外壁面積（㎡）", min_value=0.0, step=0.01,
-                                     value=_num(raw.get('exterior_wall_area_m2')), key=f"{pdf_key}_pdf_wall_{file_key}")
+                                     value=_num(cur.get('exterior_wall_area_m2')), key=f"{pdf_key}_pdf_wall_{file_key}")
+
+            # 表の入力: 表の状態があるあいだは同じ入力を使い続け（IDを変えない）、
+            # 状態が無いとき（初回・別の案件から戻ったとき）だけ直した値から作り直す
+            editor_base = ex.setdefault('editor_base', {})
+
+            def _editor_rows(field: str, wkey: str) -> list:
+                if wkey not in st.session_state or field not in editor_base:
+                    editor_base[field] = copy.deepcopy(cur.get(field) or [])
+                return editor_base[field]
             pc1, pc2 = st.columns(2)
             with pc1:
                 st.markdown("**部屋**")
-                rooms_df = pd.DataFrame(raw.get('rooms') or [], columns=['name', 'floor', 'area_m2'])
+                rooms_df = pd.DataFrame(_editor_rows('rooms', f"{pdf_key}_pdf_rooms_{file_key}"),
+                                        columns=['name', 'floor', 'area_m2'])
                 ed_rooms = st.data_editor(rooms_df, num_rows="dynamic", use_container_width=True, hide_index=True,
                                           height=260, key=f"{pdf_key}_pdf_rooms_{file_key}",
                                           column_config={'name': '部屋名', 'floor': '階', 'area_m2': st.column_config.NumberColumn('面積(㎡)', format='%.2f')})
             with pc2:
                 st.markdown("**建具**")
-                fit_df = pd.DataFrame(raw.get('fittings') or [],
+                fit_df = pd.DataFrame(_editor_rows('fittings', f"{pdf_key}_pdf_fit_{file_key}"),
                                       columns=['kind', 'name', 'width_mm', 'height_mm', 'count', 'location'])
                 ed_fit = st.data_editor(fit_df, num_rows="dynamic", use_container_width=True, hide_index=True,
                                         height=260, key=f"{pdf_key}_pdf_fit_{file_key}",
                                         column_config={'kind': '種類', 'name': '名称', 'width_mm': 'W(mm)', 'height_mm': 'H(mm)',
                                                        'count': '数', 'location': '場所'})
             floor_areas = {k: v for k, v in (('1階', v_f1), ('2階', v_f2)) if v > 0}
-            for k, v in raw_fa.items():   # 3階以上をAIが読んでいれば残す
-                digits = re.findall(r'\d+', unicodedata.normalize('NFKC', str(k)))
-                if digits and int(digits[0]) >= 3 and _num(v) > 0:
-                    floor_areas[f"{int(digits[0])}階"] = _num(v)
+            for k, v in cur_fa.items():   # 3階以上・地下・R階などをAIが読んでいれば残す
+                if k not in ('1階', '2階'):
+                    floor_areas[k] = v
             # 直した値で読み取り結果を作る（概算作成・比較はこの値を使う）
             data = {**raw, 'total_floor_area_m2': v_total or None, 'floors': int(v_floors) or None,
                     'building_area_m2': v_build or None, 'floor_areas': floor_areas or None,
@@ -5118,9 +5162,9 @@ def main():
             set_project_state('pdf_extracted', ex)
             data_sig = hashlib.md5(json.dumps(data, sort_keys=True, ensure_ascii=False, default=str).encode('utf-8')).hexdigest()
             # ---- 造作・収納（可動棚・カウンターなど）→ 単価マスタの項目に当てる ----
-            raw_built = raw.get('built_ins') or []
             st.markdown("**造作・収納（可動棚・カウンターなど）**")
-            bi_df = pd.DataFrame(raw_built, columns=['name', 'spec', 'count', 'location'])
+            bi_df = pd.DataFrame(_editor_rows('built_ins', f"{pdf_key}_pdf_builtins_{file_key}"),
+                                 columns=['name', 'spec', 'count', 'location'])
             ed_bi = st.data_editor(bi_df, num_rows="dynamic", use_container_width=True, hide_index=True,
                                    key=f"{pdf_key}_pdf_builtins_{file_key}",
                                    column_config={'name': '名称', 'spec': '寸法・仕様', 'count': '箇所数', 'location': '場所'})
@@ -5128,7 +5172,7 @@ def main():
             data['built_ins'] = built_ins
             ex['data'] = data
             set_project_state('pdf_extracted', ex)
-            bi_vocab = load_design_master().get('rows') or tanka_master_rows(csv_path)
+            bi_vocab = design_vocabulary(load_design_master().get('rows') or []) or tanka_master_rows(csv_path)
             bi_items = []
             cat_pairs_case = [(c.no, c.name) for c in estimate_base.categories]
             for b in built_ins:
@@ -5140,7 +5184,9 @@ def main():
                     qty = float(b.get('count') or 1)
                 except (TypeError, ValueError):
                     qty = 1.0
-                ni = design_item_to_new_item(sg, hidden_items.resolve_category_no(sg.get('category'), cat_pairs_case), qty)
+                ni = design_item_to_new_item(sg, design_category_no(sg, cat_pairs_case), qty,
+                                             tanka_rows=tanka_master_rows(csv_path),
+                                             design_rows=load_design_master().get('rows') or [])
                 ni['built_in_key'] = f"{b.get('name')}|{b.get('spec')}|{b.get('location')}"
                 bi_items.append((b, sg, ni))
             if bi_items:
@@ -5603,6 +5649,7 @@ def main():
                     project_name_of=lambda fb: fb.get('_proj_name') or current_pname)),
                     use_container_width=True, hide_index=True)
 
+            fb_keys_used: set = set()
             for idx, fb in enumerate(filtered if fb_view_mode == "全案件横断表示" else list(reversed(filtered))):
                 if fb_view_mode == "全案件横断表示":
                     fb_proj_id = fb.get('_proj_id', '')
@@ -5675,8 +5722,14 @@ def main():
                 with col_s:
                     # キーは並び順ではなく問い合わせ自体から作る（1件がアーカイブへ移っても次のカードに入力が残らない）
                     fb_uid = fb.get('feedback_id') or hashlib.md5(
-                        f"{fb.get('timestamp', '')}|{fb.get('body') or fb.get('message', '')}".encode('utf-8')).hexdigest()[:12]
+                        f"{fb.get('timestamp', '')}|{fb.get('category', '')}|{fb.get('body') or fb.get('message', '')}"
+                        .encode('utf-8')).hexdigest()[:12]
                     st_key = f"status_fb_{hashlib.md5(str(target_pid).encode('utf-8')).hexdigest()[:8]}_{fb_uid}"
+                    _n = 2
+                    while st_key in fb_keys_used:          # 旧データで日時・本文・カテゴリまで同じ2件があっても止まらない
+                        st_key = f"status_fb_{hashlib.md5(str(target_pid).encode('utf-8')).hexdigest()[:8]}_{fb_uid}_{_n}"
+                        _n += 1
+                    fb_keys_used.add(st_key)
                     next_options = [s for s in FB_STATUSES if s != status]
                     sc1, sc2 = st.columns([1, 2])
                     new_status = sc1.selectbox("変更後のステータス", next_options, key=f"{st_key}_sel")
@@ -5713,9 +5766,10 @@ def main():
                             _flash(msg, kind)
                             st.rerun()
                 with col_d:
-                    confirm_del = st.checkbox("削除を確認", key=f"del_ok_{target_pid}_{idx}",
+                    # 削除のキーも問い合わせごとに固定（並び順だと、1件消すと次の問い合わせが確認済みのまま繰り上がる）
+                    confirm_del = st.checkbox("削除を確認", key=f"{st_key}_delok",
                                               help="問い合わせの記録は原則残します。誤送信など明らかな場合のみ削除してください")
-                    if st.button("削除", key=f"del_fb_{target_pid}_{idx}", type="secondary",
+                    if st.button("削除", key=f"{st_key}_del", type="secondary",
                                  disabled=not confirm_del):
                         proj_fbs = load_project_feedbacks(target_pid)
                         for i, pfb in enumerate(proj_fbs):
@@ -5723,6 +5777,7 @@ def main():
                                 proj_fbs.pop(i)
                                 break
                         save_project_feedbacks(target_pid, proj_fbs)
+                        st.session_state.pop(f"{st_key}_delok", None)
                         st.rerun()
 
             st.markdown("")

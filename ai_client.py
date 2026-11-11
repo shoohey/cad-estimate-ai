@@ -774,7 +774,7 @@ def extract_quantities_from_pdf(pdf_bytes: bytes, filename: str,
     if _pdf_request_bytes(size) > PDF_MAX_REQUEST_BYTES:
         raise AIClientError(
             f"PDF「{filename}」のサイズが {size / (1024 * 1024):.1f}MB で、"
-            f"送れる上限（約{PDF_MAX_RAW_BYTES / (1024 * 1024):.0f}MB）を超えています。"
+            f"送れる上限（{PDF_MAX_RAW_BYTES / (1024 * 1024):.1f}MB）を超えています。"
             "必要な図面ページだけに分割するか、解像度を下げて再試行してください。"
         )
     pages = _count_pdf_pages(pdf_bytes)

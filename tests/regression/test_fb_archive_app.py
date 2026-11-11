@@ -29,7 +29,8 @@ def test_archive_view_and_retention(app_dir):
     assert "まだ直っていない件" in md and "直って確認済みの件" not in md
     # 一括クリアは無い／削除は確認チェックが無いと押せない
     assert not [b for b in at.button if b.label == "この案件のFBをクリア"]
-    del_btn = [b for b in at.button if b.key == "del_fb_sample_furui_0"][0]
+    # 削除ボタンのキーは問い合わせごとに固定（並び順ではない。2026-11-12 反証）
+    del_btn = [b for b in at.button if b.key and b.key.startswith("status_fb_") and b.key.endswith("_a_del")][0]
     assert del_btn.disabled is True
 
     # アーカイブ表示: 完了2件と履歴・修正履歴テーブル
