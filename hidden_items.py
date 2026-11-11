@@ -419,3 +419,18 @@ def to_new_items(candidates: list[dict], categories: list[tuple[int, str]]) -> l
             'hidden_source': _text(cand.get('source')),
         })
     return result
+
+
+def merge_feedback(*feedbacks: dict | None) -> dict:
+    """必要／不要の判定カウントを足し合わせる（全案件共通の判定 ＋ この案件だけの判定）。元は変更しない。"""
+    out: dict = {}
+    for fb in feedbacks:
+        if not isinstance(fb, dict):
+            continue
+        for key, counts in fb.items():
+            if not isinstance(counts, dict):
+                continue
+            cur = out.setdefault(key, {'need': 0, 'unneed': 0})
+            cur['need'] += _nonneg_int(counts.get('need'))
+            cur['unneed'] += _nonneg_int(counts.get('unneed'))
+    return out

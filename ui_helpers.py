@@ -143,9 +143,16 @@ def linked_order_price(old_estimate: Any, old_order: Any, new_estimate: Any,
     return int(round(new_est * ratio))
 
 
+_NUM = r'[0-9０-９]+(?:[.．,，][0-9０-９]+)*'
 _DIMENSION_TOKEN = re.compile(
-    r'(?<![0-9０-９])[A-Za-zＡ-Ｚａ-ｚφΦøØ]{1,2}\s*[0-9０-９]+(?:[.．][0-9０-９]+)?'
-    r'|[0-9０-９]+(?:[.．][0-9０-９]+)?\s*(?:mm|㎜|cm|㎝|ｍｍ)\b'
+    # W2700 / H850 / D650 / φ100 / W:2700 / W＝2700
+    r'(?<![0-9０-９A-Za-zＡ-Ｚａ-ｚ])[A-Za-zＡ-Ｚａ-ｚφΦøØ]{1,2}\s*[:：=＝]?\s*' + _NUM +
+    r'(?:\s*(?:mm|㎜|cm|㎝|ｍｍ|ｃｍ)(?![A-Za-z]))?'
+    # 幅2700 / 間口 1820 / 奥行き650 / 高さ850 / 長さ2700 / 巾900 / 厚み12
+    r'|(?:幅|巾|間口|奥行き?|高さ|長さ|厚み|厚さ)\s*[:：=＝]?\s*' + _NUM +
+    r'(?:\s*(?:mm|㎜|cm|㎝|ｍｍ|ｃｍ)(?![A-Za-z]))?'
+    # 2700mm / 2700mmの / 2700mmタイプ（\b は日本語が続くと効かないので英字だけを除外する）
+    r'|' + _NUM + r'\s*(?:mm|㎜|cm|㎝|ｍｍ|ｃｍ)(?![A-Za-z])'
 )
 
 
@@ -182,6 +189,85 @@ def parse_amount_jp(text: Any) -> float | None:
         return float(m.group(1))
     m = re.search(r'\d+(?:\.\d+)?', s)
     return float(m.group(0)) if m else None
+
+
+def _normalize_digits(text: Any) -> str:
+    s = str(text).replace(',', '').replace('，', '').strip()
+    return s.translate(str.maketrans('０１２３４５６７８９．', '0123456789.'))
+
+
+def parse_money_jp(text: Any) -> float | None:
+    """金額だけを読む: 『円』『万』『¥』が付いた数字だけを金額とみなす（寸法・型番・サイズは無視）。
+
+    2026-11-12 監査: 仕様変更の文『TOTO サザナ 1616サイズ』の 1616 が単価になっていた。
+    """
+    if text is None or isinstance(text, bool):
+        return None
+    if isinstance(text, (int, float)):
+        return None if (isinstance(text, float) and math.isnan(text)) else float(text)
+    s = strip_dimension_tokens(_normalize_digits(text))
+    m = re.search(r'(\d+(?:\.\d+)?)\s*万', s)
+    if m:
+        return float(m.group(1)) * 10000
+    m = re.search(r'[¥￥]\s*(\d+(?:\.\d+)?)', s)
+    if m:
+        return float(m.group(1))
+    m = re.search(r'(\d+(?:\.\d+)?)\s*円', s)
+    if m:
+        return float(m.group(1))
+    return None
+
+
+_QTY_UNITS = (r'台|本|枚|個|箇所|ヶ所|ケ所|カ所|か所|ヵ所|セット|式|組|基|面|段|帖|畳|坪|㎡|m2|ｍ2|平米|'
+              r'm(?![A-Za-z0-9])|ｍ|メートル|ヶ|か所')
+
+
+def parse_quantity_jp(text: Any, allow_bare: bool = False) -> float | None:
+    """数量だけを読む: 『台・本・枚・箇所・㎡・m』などの単位が付いた数字を数量とみなす。
+
+    寸法表記（W2700・2700mm・幅2700・W:2700 など）は先に取り除く。
+    allow_bare=True のときは、単位が無い数字も（寸法を除いたうえで）数量として読む。
+    """
+    if text is None or isinstance(text, bool):
+        return None
+    if isinstance(text, (int, float)):
+        return None if (isinstance(text, float) and math.isnan(text)) else float(text)
+    s = strip_dimension_tokens(_normalize_digits(text))
+    m = re.search(r'(\d+(?:\.\d+)?)\s*(?:' + _QTY_UNITS + ')', s)
+    if m:
+        return float(m.group(1))
+    if allow_bare:
+        m = re.search(r'\d+(?:\.\d+)?', s)
+        return float(m.group(0)) if m else None
+    return None
+
+
+def proposal_number(change_type: str, proposed: Any, amount: Any = None) -> int | float:
+    """打合せ変更の変更案から使う数字（表の『金額(円)』欄の初期値と、反映時の値）を決める。
+
+    - 表で入れた金額（amount > 0）は最優先
+    - 数量変更: 単位付きの数字（無ければ単位なしの数字）を数量として読む
+    - 単価変更: 金額表記（円・万・¥）、無ければ単位なしの数字を金額として読む
+    - 仕様変更・追加: 金額表記（円・万・¥）がある数字だけを金額にする（サイズや型番の数字は使わない）
+    見つからなければ 0。
+    """
+    if isinstance(amount, (int, float)) and not isinstance(amount, bool) and not (
+            isinstance(amount, float) and math.isnan(amount)) and amount > 0:
+        return int(amount) if float(amount).is_integer() else float(amount)
+    ctype = _clean(change_type)
+    if ctype == 'quantity':
+        v = parse_quantity_jp(proposed, allow_bare=True)
+    elif ctype == 'price':
+        v = parse_money_jp(proposed)
+        if v is None:
+            s = strip_dimension_tokens(_normalize_digits(proposed or ''))
+            m = re.search(r'\d+(?:\.\d+)?', s)
+            v = float(m.group(0)) if m else None
+    else:
+        v = parse_money_jp(proposed)
+    if v is None:
+        return 0
+    return int(v) if float(v).is_integer() else v
 
 
 # フィードバックのステータス（2026-08-07 MTG で合意した3段階フロー）
@@ -503,18 +589,34 @@ def alias_applies(entry: dict, project_id: str | None) -> bool:
     return bool(project_id) and _clean(entry.get('project_id')) == _clean(project_id)
 
 
-def alias_pairs_from_library(lib: list | None, project_id: str | None = None) -> set:
-    """辞書エントリ一覧 → 突合に渡す frozenset の集合（名称のみ／名称＋摘要の全組み合わせ）。
+def _alias_side_keys(name: Any, summary: Any, stored_keys: list | None) -> list[str]:
+    """登録した側の照合キー。摘要がある行は『名称＋摘要』だけ、摘要が空なら『名称』だけを使う。
 
+    2026-11-12 監査: 名称だけのキーも登録していたため、同じ品名で摘要だけ違う別の行にも
+    「同じ商品」が効き、チェックした行とは別の行が突き合っていた。
+    """
+    from excel_diff import _normalize_name
+    nm, sm = _clean(name), _clean(summary)
+    if nm:
+        return [_normalize_name(nm + sm)] if sm else [_normalize_name(nm)]
+    return [k for k in (stored_keys or []) if k]
+
+
+def alias_pairs_from_library(lib: list | None, project_id: str | None = None) -> set:
+    """辞書エントリ一覧 → 突合に渡す frozenset の集合。
+
+    摘要がある側は『名称＋摘要』キーだけを使い、同じ品名の別の行に効かないようにする。
     project_id を渡すと、他案件特有のエントリは除外する。
     """
     pairs: set = set()
     for e in lib or []:
         if not alias_applies(e, project_id):
             continue
-        for a in e.get('ai_keys') or []:
-            for b in e.get('actual_keys') or []:
-                if a and b:
+        ai_keys = _alias_side_keys(e.get('ai_name'), e.get('ai_summary'), e.get('ai_keys'))
+        ac_keys = _alias_side_keys(e.get('actual_name'), e.get('actual_summary'), e.get('actual_keys'))
+        for a in ai_keys:
+            for b in ac_keys:
+                if a and b and a != b:
                     pairs.add(frozenset((a, b)))
     return pairs
 

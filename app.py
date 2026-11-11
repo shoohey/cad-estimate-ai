@@ -28,8 +28,10 @@ import equipment_db
 import master_lookup
 import pdf_estimate
 import hidden_items
+import excel_diff
 import html as _html
-from ui_helpers import (project_display_label, project_full_label, merge_proposal_edits,
+from ui_helpers import (proposal_number,
+                        project_display_label, project_full_label, merge_proposal_edits,
                         parse_amount_jp, linked_order_price, FB_STATUSES, FB_STATUS_FIXED,
                         normalize_fb_status, fb_status_color, validate_fb_status_change,
                         apply_fb_status_change, ACTIVE_FB_STATUSES, fb_is_archived,
@@ -1124,11 +1126,13 @@ def _apply_ai_proposal(estimate_base: Estimate, mods: dict, p: dict) -> str | No
     ctype = p.get('change_type', '')
 
     def _amount_of(proposal: dict) -> float | None:
-        """変更後の数値。編集画面の金額列 → proposed文字列の順で拾う"""
-        amt = proposal.get('amount')
-        if isinstance(amt, (int, float)) and amt > 0:
-            return float(amt)
-        return _parse_amount_jp(proposal.get('proposed'))
+        """変更後の数値。編集画面の金額列 → 変更後の文の順で拾う。
+
+        仕様変更・追加では『円・万・¥』の付いた数字だけを金額とみなし、サイズや型番の数字
+        （例: サザナ 1616サイズ）を単価にしない（2026-11-12 監査）。見つからなければ None。
+        """
+        v = proposal_number(proposal.get('change_type', ''), proposal.get('proposed'), proposal.get('amount'))
+        return float(v) if v else None
 
     if ctype == 'add':
         amount = _amount_of(p)
@@ -1144,7 +1148,8 @@ def _apply_ai_proposal(estimate_base: Estimate, mods: dict, p: dict) -> str | No
             'summary': _distinct_summary(p.get('reason', ''), name),
             'quantity': 1.0, 'unit': '式',
             'estimate_price': int(amount or 0),
-            'order_price': 0,
+            # 原価も粗利33%（原価率67%）で入れる。0円だと粗利100%・工務予算0円になる（2026-11-12 監査）
+            'order_price': linked_order_price(0, 0, int(amount or 0)),
         })
         return f"行追加: {name}（{int(amount or 0):,}円）"
 
@@ -2206,6 +2211,22 @@ def save_hidden_feedback(data: dict):
     _save_store_value(HIDDEN_FEEDBACK_KEY, "hidden_item_feedback.json", data)
 
 
+def load_project_hidden_feedback(pid: str) -> dict:
+    """この案件だけの図面外項目の判定（必要／不要）。他の案件の採用確率には入れない"""
+    return _load_store_value(f"proj:{pid}:hidden_feedback", f"{pid}_hidden_feedback.json", {})
+
+
+def save_project_hidden_feedback(pid: str, data: dict):
+    _save_store_value(f"proj:{pid}:hidden_feedback", f"{pid}_hidden_feedback.json", data)
+
+
+def append_hidden_judgment_log(entries: list):
+    """図面外項目の判定の記録（判定・不要の理由・適用範囲・案件）。学習の根拠として残す"""
+    log = list(_load_store_value("hidden_item_judgment_log", "hidden_item_judgment_log.json", []))
+    log.extend(entries or [])
+    _save_store_value("hidden_item_judgment_log", "hidden_item_judgment_log.json", log[-2000:])
+
+
 def recompute_hidden_stats(projects: dict, prices: dict) -> dict:
     """実績見積を取り込んだ全案件から「実績にはあるがAI概算に無い項目」を集計する"""
     alias_lib = load_item_alias_library()
@@ -2220,9 +2241,14 @@ def recompute_hidden_stats(projects: dict, prices: dict) -> dict:
         solar = any('太陽光' in c.get('name', '') and c.get('total', 0) > 0 for c in actual.get('categories', []))
         est = calculate_estimate(cad, prices, include_solar=solar, safety_rate=DEFAULT_SAFETY_RATE_PCT / 100.0)
         diff = excel_diff.diff_estimates(est, actual, alias_pairs_from_library(alias_lib, pid))
+        notes = load_project_diff_notes(pid) or {}
         actual_only = []
         for cat_name, d in diff.get('item_diffs', {}).items():
             for x in d.get('actual_only', []):
+                # 「この案件特有」と登録した行は、他の案件の候補（統計）に入れない（2026-11-12 監査）
+                note = notes.get(diff_note_key(cat_name, x.get('name', ''))) or {}
+                if note.get('scope') == 'project' or note.get('category') == PROJECT_SPECIFIC_CATEGORY:
+                    continue
                 actual_only.append({'category': cat_name, 'name': x.get('name', ''), 'summary': x.get('summary', ''),
                                     'quantity': x.get('quantity', 0), 'unit': x.get('unit', ''),
                                     'amount': int(x.get('amount', 0))})
@@ -3990,7 +4016,9 @@ def main():
                             out[k[len(prefix):]] = f"{EXCLUDED_LABEL}: {str(v.get('reason') or '').split('：')[0][:20]}"
                     return out
 
-                for cd in diff['category_diffs']:
+                # 部品のキーは工事種別の番号ではなく並び順で作る。実績にしかない種別は実績側の番号を持つため、
+                # AI側の種別と番号が重なり重複キーで画面が止まることがあった（2026-11-12 監査）
+                for ci, cd in enumerate(diff['category_diffs']):
                     detail_rows = category_detail_rows(item_diffs.get(cd['name']),
                                                        _special_names_of(cd['name']))
                     counts = detail_kind_counts(detail_rows)
@@ -4015,16 +4043,16 @@ def main():
                                                        for r in reg_rows])
                                 edited_reg = st.data_editor(
                                     reg_df, hide_index=True, use_container_width=True,
-                                    key=f"alias_editor_{current_pid}_{cd['no']}_{len(alias_lib)}",
+                                    key=f"alias_editor_{current_pid}_{ci}_{len(alias_lib)}",
                                     disabled=list(reg_cols),
                                     column_config={'選択': st.column_config.CheckboxColumn('選択', width='small')})
                                 rc1, rc2, rc3 = st.columns([2, 1, 1])
                                 scope_label = rc1.radio(
                                     "この読み替えは", ["全案件共通（普遍的な表記ゆれ）", "この案件のみ（この案件特有）"],
-                                    horizontal=True, key=f"alias_scope_{current_pid}_{cd['no']}",
+                                    horizontal=True, key=f"alias_scope_{current_pid}_{ci}",
                                     help="日本住建で常に同じ意味なら「全案件共通」、この物件だけの読み替えなら「この案件のみ」。後から一覧で変更できます")
                                 if rc2.button("チェックした2件を同じ商品として登録",
-                                              key=f"alias_reg_{current_pid}_{cd['no']}", type="primary"):
+                                              key=f"alias_reg_{current_pid}_{ci}", type="primary"):
                                     selected = [r for r in edited_reg.to_dict('records') if r.get('選択')]
                                     err, ai_row, ac_row = validate_alias_selection(selected)
                                     if err:
@@ -4050,7 +4078,7 @@ def main():
                                         st.rerun()
                                 # 単価マスタから類似候補を拾う（設計部マスタ優先）。重いので要求時のみ計算
                                 if st.checkbox("単価マスタから類似候補を表示（実績にしかない行）",
-                                               key=f"cand_toggle_{current_pid}_{cd['no']}"):
+                                               key=f"cand_toggle_{current_pid}_{ci}"):
                                     vocab = master_vocabulary(csv_path)
                                     ac_rows = [r for r in reg_rows if r['区分'] == DETAIL_KIND_ACTUAL_ONLY][:20]
                                     cand_rows, cand_options = [], {}
@@ -4070,9 +4098,9 @@ def main():
                                         st.dataframe(pd.DataFrame(cand_rows), use_container_width=True, hide_index=True)
                                         mc1, mc2 = st.columns([2, 1])
                                         chosen = mc1.selectbox("AI側（単価マスタ）の名称を選ぶ", list(cand_options.keys()),
-                                                               key=f"cand_pick_{current_pid}_{cd['no']}")
+                                                               key=f"cand_pick_{current_pid}_{ci}")
                                         if mc2.button("チェックした実績明細を、選んだマスタ名と同じ商品として登録",
-                                                      key=f"cand_reg_{current_pid}_{cd['no']}"):
+                                                      key=f"cand_reg_{current_pid}_{ci}"):
                                             selected = [r for r in edited_reg.to_dict('records') if r.get('選択')]
                                             ac_sel = [r for r in selected if r.get('区分') == DETAIL_KIND_ACTUAL_ONLY]
                                             if len(ac_sel) != 1 or len(selected) != 1:
@@ -4100,7 +4128,7 @@ def main():
                                     else:
                                         st.caption("類似候補は見つかりませんでした。")
                                 if rc3.button("チェックした行を「この案件特有」として登録",
-                                              key=f"special_reg_{current_pid}_{cd['no']}",
+                                              key=f"special_reg_{current_pid}_{ci}",
                                               help="図面に表れない物件固有の項目など、全案件には該当しないもの。"
                                                    "差異理由に「案件特有」として記録し、他案件の参考には出しません"):
                                     selected = [r for r in edited_reg.to_dict('records') if r.get('選択')]
@@ -4138,11 +4166,11 @@ def main():
                                 # AIが計上したが不要な項目: 理由（構造・条例など）付きで登録し、学習の材料にする
                                 ex1, ex2, ex3 = st.columns([1.2, 1.8, 1])
                                 ex_reason = ex1.selectbox("不要の理由", EXCLUSION_REASONS,
-                                                          key=f"excl_reason_{current_pid}_{cd['no']}")
+                                                          key=f"excl_reason_{current_pid}_{ci}")
                                 ex_note = ex2.text_input("補足（任意。例: 平屋のため2階分は不要／○○市は△△が条例で必須）",
-                                                         key=f"excl_note_{current_pid}_{cd['no']}")
+                                                         key=f"excl_note_{current_pid}_{ci}")
                                 if ex3.button("チェックした行を「不要（除外）」として登録",
-                                              key=f"excl_reg_{current_pid}_{cd['no']}",
+                                              key=f"excl_reg_{current_pid}_{ci}",
                                               help="AIにしかない／金額が違う行が対象。適用範囲は上の「この読み替えは」の選択に従います"):
                                     selected = [r for r in edited_reg.to_dict('records') if r.get('選択')]
                                     err, rows_sel = validate_exclusion_selection(selected, ex_reason)
@@ -4474,9 +4502,8 @@ def main():
                     editor_epoch = int(get_project_state('ai_proposals_epoch', 0) or 0)
                     prop_rows = []
                     for p in proposals:
-                        amt = p.get('amount')
-                        if not isinstance(amt, (int, float)):
-                            amt = _parse_amount_jp(p.get('proposed')) or 0
+                        # 変更の種類ごとに数字の読み方を変える（仕様変更のサイズ数字を金額にしない）
+                        amt = proposal_number(p.get('change_type', ''), p.get('proposed'), p.get('amount'))
                         prop_rows.append({
                             '反映': (bool(p['apply']) if isinstance(p.get('apply'), bool)
                                      else bool(default_check_ok and p.get('confidence') == 'high')),
@@ -4833,7 +4860,7 @@ def main():
             st.info("ANTHROPIC_API_KEY が未設定のため、図面の読み取りは利用できません。")
         up_pdf = st.file_uploader("図面PDF（平面図・配置図・立面図・建具表など）", type=['pdf'], key="pdf_est_upload")
         pdf_hints = st.text_area(
-            "図面の補足（口頭で聞いた内容。例: 太陽光あり／吹抜あり／ガレージ別棟。AIの読み取りにも使います）",
+            "AI読み取りのヒント（例: 吹抜あり／1階の土間が広い）。見積に項目を足すときは、下の「パターン」で選んでください",
             key="pdf_hints", height=70)
         if up_pdf is not None and st.button("図面を読み取る（AI）", key="btn_pdf_extract", type="primary",
                                             disabled=not pdf_caps.get('text')):
@@ -4841,48 +4868,98 @@ def main():
                 with st.spinner("図面を読み取り中（1〜2分かかることがあります）..."):
                     extracted = ai_client.extract_quantities_from_pdf(up_pdf.getvalue(), up_pdf.name,
                                                                       hints=pdf_hints or "")
-                st.session_state['_pdf_extracted'] = {'file': up_pdf.name, 'data': extracted}
-                st.session_state.pop('_pdf_estimate', None)
+                prev_ex = get_project_state('pdf_extracted') or {}
+                # 読み取り結果は案件ごとに持つ。読み直すたびに番号を変え、前回の画面入力を引き継がない
+                set_project_state('pdf_extracted', {
+                    'file': up_pdf.name, 'raw': extracted, 'data': copy.deepcopy(extracted),
+                    'seq': int(prev_ex.get('seq', 0) or 0) + 1})
+                set_project_state('pdf_estimate', None)
                 st.rerun()
             except Exception as exc:  # noqa: BLE001
                 st.error(f"読み取りに失敗しました: {exc}")
-        ex = st.session_state.get('_pdf_extracted')
+        ex = get_project_state('pdf_extracted')
         if ex:
-            data = ex['data'] or {}
-            st.markdown(f"##### 読み取り結果（{ex['file']}）　確度: {data.get('confidence') or '-'}")
-            st.caption("読み取りが違っていればここで直してください。直した値で概算を作成します（部屋・建具は行の追加・削除もできます）。")
-            pdf_key = re.sub(r'[^0-9A-Za-z_]+', '_', ex['file'])
+            # 表と入力欄にはAIの元の読み取り結果を入れ続け、直した値は ex['data'] にだけ保存する。
+            # 直した値を表の入力に戻すと表のIDが変わり、続けて直した内容が1回おきに消えていた（2026-11-12 監査）
+            raw = ex.get('raw') or ex.get('data') or {}
+            st.markdown(f"##### 読み取り結果（{ex['file']}）　確度: {raw.get('confidence') or '-'}")
+            st.caption("読み取りが違っていればここで直してください。直した値で概算を作成します。"
+                       "0 のままの欄は延床面積からの比率で推定します（部屋・建具は行の追加・削除もできます）。")
+            pdf_key = f"{hashlib.md5(str(current_pid).encode('utf-8')).hexdigest()[:8]}_{int(ex.get('seq', 0) or 0)}"
+            file_key = re.sub(r'[^0-9A-Za-z_]+', '_', ex['file'])
+
+            def _num(v) -> float:
+                try:
+                    f = float(v)
+                    return f if f > 0 and not math.isnan(f) else 0.0
+                except (TypeError, ValueError):
+                    return 0.0
+            raw_fa = raw.get('floor_areas') if isinstance(raw.get('floor_areas'), dict) else {}
+
+            def _floor_area(n: int) -> float:
+                for k, v in raw_fa.items():
+                    digits = re.findall(r'\d+', unicodedata.normalize('NFKC', str(k)))
+                    if digits and int(digits[0]) == n:
+                        return _num(v)
+                return 0.0
+            raw_roof = raw.get('roof') if isinstance(raw.get('roof'), dict) else {}
+            raw_floors = int(_num(raw.get('floors')))
             p1, p2, p3 = st.columns(3)
             v_total = p1.number_input("延床面積（㎡）", min_value=0.0, step=0.01,
-                                      value=float(data.get('total_floor_area_m2') or 0), key=f"pdf_total_{pdf_key}")
+                                      value=_num(raw.get('total_floor_area_m2')), key=f"{pdf_key}_pdf_total_{file_key}")
             v_floors = p2.number_input("階数", min_value=0, max_value=4, step=1,
-                                       value=int(data.get('floors') or 0), key=f"pdf_floors_{pdf_key}")
+                                       value=min(raw_floors, 4), key=f"{pdf_key}_pdf_floors_{file_key}")
             v_build = p3.number_input("建築面積（㎡）", min_value=0.0, step=0.01,
-                                      value=float(data.get('building_area_m2') or 0), key=f"pdf_build_{pdf_key}")
+                                      value=_num(raw.get('building_area_m2')), key=f"{pdf_key}_pdf_build_{file_key}")
+            if raw_floors > 4:
+                st.warning(f"AIは階数を {raw_floors} と読みました。4階までしか計算できないため、4として扱っています。")
+            q1, q2, q3 = st.columns(3)
+            v_f1 = q1.number_input("1階 床面積（㎡）", min_value=0.0, step=0.01, value=_floor_area(1),
+                                   key=f"{pdf_key}_pdf_f1_{file_key}")
+            v_f2 = q2.number_input("2階 床面積（㎡）", min_value=0.0, step=0.01, value=_floor_area(2),
+                                   key=f"{pdf_key}_pdf_f2_{file_key}")
+            v_perim = q3.number_input("外周長（m）", min_value=0.0, step=0.01, value=_num(raw.get('perimeter_m')),
+                                      key=f"{pdf_key}_pdf_perim_{file_key}")
+            r1, r2, r3 = st.columns(3)
+            v_roof_type = r1.text_input("屋根の種類（例: ガルバリウム鋼板 切妻／瓦 寄棟）",
+                                        value=str(raw_roof.get('type') or ''), key=f"{pdf_key}_pdf_rooftype_{file_key}")
+            v_roof_area = r2.number_input("屋根面積（㎡）", min_value=0.0, step=0.01, value=_num(raw_roof.get('area_m2')),
+                                          key=f"{pdf_key}_pdf_roofarea_{file_key}")
+            v_wall = r3.number_input("外壁面積（㎡）", min_value=0.0, step=0.01,
+                                     value=_num(raw.get('exterior_wall_area_m2')), key=f"{pdf_key}_pdf_wall_{file_key}")
             pc1, pc2 = st.columns(2)
             with pc1:
                 st.markdown("**部屋**")
-                rooms_df = pd.DataFrame(data.get('rooms') or [], columns=['name', 'floor', 'area_m2'])
+                rooms_df = pd.DataFrame(raw.get('rooms') or [], columns=['name', 'floor', 'area_m2'])
                 ed_rooms = st.data_editor(rooms_df, num_rows="dynamic", use_container_width=True, hide_index=True,
-                                          height=260, key=f"pdf_rooms_{pdf_key}",
+                                          height=260, key=f"{pdf_key}_pdf_rooms_{file_key}",
                                           column_config={'name': '部屋名', 'floor': '階', 'area_m2': st.column_config.NumberColumn('面積(㎡)', format='%.2f')})
             with pc2:
                 st.markdown("**建具**")
-                fit_df = pd.DataFrame(data.get('fittings') or [],
+                fit_df = pd.DataFrame(raw.get('fittings') or [],
                                       columns=['kind', 'name', 'width_mm', 'height_mm', 'count', 'location'])
                 ed_fit = st.data_editor(fit_df, num_rows="dynamic", use_container_width=True, hide_index=True,
-                                        height=260, key=f"pdf_fit_{pdf_key}",
+                                        height=260, key=f"{pdf_key}_pdf_fit_{file_key}",
                                         column_config={'kind': '種類', 'name': '名称', 'width_mm': 'W(mm)', 'height_mm': 'H(mm)',
                                                        'count': '数', 'location': '場所'})
-            # 編集後の値を読み取り結果に反映（概算作成・比較はこの値を使う）
-            data = {**data, 'total_floor_area_m2': v_total or None, 'floors': int(v_floors) or None,
-                    'building_area_m2': v_build or None,
+            floor_areas = {k: v for k, v in (('1階', v_f1), ('2階', v_f2)) if v > 0}
+            for k, v in raw_fa.items():   # 3階以上をAIが読んでいれば残す
+                digits = re.findall(r'\d+', unicodedata.normalize('NFKC', str(k)))
+                if digits and int(digits[0]) >= 3 and _num(v) > 0:
+                    floor_areas[f"{int(digits[0])}階"] = _num(v)
+            # 直した値で読み取り結果を作る（概算作成・比較はこの値を使う）
+            data = {**raw, 'total_floor_area_m2': v_total or None, 'floors': int(v_floors) or None,
+                    'building_area_m2': v_build or None, 'floor_areas': floor_areas or None,
+                    'perimeter_m': v_perim or None, 'exterior_wall_area_m2': v_wall or None,
+                    'roof': {**raw_roof, 'type': v_roof_type.strip() or None, 'area_m2': v_roof_area or None},
                     'rooms': [r for r in ed_rooms.to_dict('records') if str(r.get('name') or '').strip()],
                     'fittings': [r for r in ed_fit.to_dict('records') if str(r.get('name') or r.get('kind') or '').strip()]}
-            st.session_state['_pdf_extracted']['data'] = data
-            if data.get('notes'):
-                with st.expander(f"読み取り時の注意（{len(data['notes'])}）"):
-                    for n in data['notes']:
+            ex['data'] = data
+            set_project_state('pdf_extracted', ex)
+            data_sig = hashlib.md5(json.dumps(data, sort_keys=True, ensure_ascii=False, default=str).encode('utf-8')).hexdigest()
+            if raw.get('notes'):
+                with st.expander(f"読み取り時の注意（{len(raw['notes'])}）"):
+                    for n in raw['notes']:
                         st.markdown(f"- {n}")
             # ---- 図面に現れない項目（パターン／統計）を見積に反映する ----
             st.markdown("##### 図面に現れない項目を反映する")
@@ -4891,7 +4968,8 @@ def main():
                        "見積後に必要／不要を判定して保存すると、次回の採用確率に反映されます。")
             patterns = load_hidden_patterns()
             hidden_stats = load_hidden_stats()
-            hidden_fb = load_hidden_feedback()
+            # 全案件共通の判定 ＋ この案件だけの判定 を足して採用確率を補正する
+            hidden_fb = hidden_items.merge_feedback(load_hidden_feedback(), load_project_hidden_feedback(current_pid))
             hp1, hp2, hp3 = st.columns([2, 1, 1])
             sel_pattern_names = hp1.multiselect("この図面のパターン", [p['name'] for p in patterns],
                                                 key="pdf_sel_patterns")
@@ -4918,6 +4996,23 @@ def main():
                     '確率': round(c['prob'], 2), '数量': c['quantity'], '単位': c['unit'],
                     '見積単価': c['estimate_price'], '原価': c['order_price']} for c in candidates]),
                     use_container_width=True, hide_index=True, height=min(60 + 35 * len(candidates), 360))
+                # 検証見積だけでなく、この案件の本来の見積（数量TXT由来）にも入れられるようにする
+                if st.button("これらの項目をこの案件の見積（数量TXT由来）に追加", key="btn_hidden_to_case",
+                             help="同じ項目は二重に追加しません。追加した行は「見積修正」タブで直したり消したりできます"):
+                    existing = {it.get('hidden_key') for it in mods.get('new_items', []) if isinstance(it, dict)}
+                    new_rows = [it for it in hidden_items.to_new_items(
+                        candidates, [(c.no, c.name) for c in estimate_base.categories])
+                        if it.get('hidden_key') not in existing]
+                    if new_rows:
+                        mods.setdefault('new_items', []).extend(new_rows)
+                        set_project_state('mods', mods)
+                        persist_project_mods()
+                        append_project_changelog(current_pid, '図面外項目',
+                                                 "見積に追加: " + " / ".join(r['name'] for r in new_rows[:10]))
+                        _flash(f"{len(new_rows)}件をこの案件の見積に追加しました（見積修正タブで確認できます）。")
+                    else:
+                        _flash("追加する新しい項目はありません（すでに追加済みです）。", "info")
+                    st.rerun()
             else:
                 st.caption("反映する図面外の項目はありません（パターン未選択・統計のしきい値未満）。")
 
@@ -4933,13 +5028,16 @@ def main():
                             candidates, [(c.no, c.name) for c in pdf_est.categories])
                         pdf_est = apply_modifications(
                             pdf_est, {'overrides': {}, 'deleted': set(), 'new_items': new_items})
-                    st.session_state['_pdf_estimate'] = {'file': ex['file'], 'est': pdf_est, 'warnings': pdf_warns,
-                                                         'candidates': candidates}
+                    set_project_state('pdf_estimate', {'file': ex['file'], 'est': pdf_est, 'warnings': pdf_warns,
+                                                       'candidates': candidates, 'sig': data_sig})
                     st.rerun()
                 except Exception as exc:  # noqa: BLE001
                     st.error(f"見積の作成に失敗しました: {exc}")
-            pe = st.session_state.get('_pdf_estimate')
+            pe = get_project_state('pdf_estimate')
             if pe and pe.get('file') == ex['file']:
+                if pe.get('sig') != data_sig:
+                    st.warning("読み取り結果を修正したため、下の概算は修正前の値で作ったものです。"
+                               "「この読み取りで概算見積を作成（検証）」をもう一度押してください。")
                 pdf_est = pe['est']
                 pdf_total = int(pdf_est.total_estimate_excl_tax)
                 txt_total = int(estimate.total_estimate_excl_tax)
@@ -4964,27 +5062,51 @@ def main():
                 cands = pe.get('candidates') or []
                 if cands:
                     st.markdown("##### 図面外の項目は必要でしたか？（判定を保存すると学習します）")
+                    st.caption("「不要」のときは理由を選んでください。この家だけの事情（平屋だから・この市の条例で不要 など）なら"
+                               "適用範囲を「この案件のみ」にすると、他の案件の採用確率は下がりません。")
                     judge_df = pd.DataFrame([{
-                        '判定': '未判定', '出どころ': c['source'], '工事種別': c['category'], '品名': c['name'],
+                        '判定': '未判定', '不要の理由': '', '適用範囲': NOTE_SCOPE_GLOBAL,
+                        '出どころ': c['source'], '工事種別': c['category'], '品名': c['name'],
                         '摘要': c['summary'], '確率': round(c['prob'], 2), '見積単価': c['estimate_price']} for c in cands])
                     edited_judge = st.data_editor(
                         judge_df, hide_index=True, use_container_width=True,
-                        key=f"pdf_judge_{ex['file']}_{len(cands)}",
-                        column_config={'判定': st.column_config.SelectboxColumn('判定', options=['未判定', '必要', '不要'], width='small')},
+                        key=f"{pdf_key}_pdf_judge_{file_key}_{len(cands)}",
+                        column_config={
+                            '判定': st.column_config.SelectboxColumn('判定', options=['未判定', '必要', '不要'], width='small'),
+                            '不要の理由': st.column_config.SelectboxColumn('不要の理由', options=[''] + EXCLUSION_REASONS),
+                            '適用範囲': st.column_config.SelectboxColumn(
+                                '適用範囲', options=[NOTE_SCOPE_GLOBAL, NOTE_SCOPE_PROJECT], width='small')},
                         disabled=['出どころ', '工事種別', '品名', '摘要', '確率', '見積単価'])
                     jc1, jc2, jc3 = st.columns([1, 1.4, 1.6])
                     if jc1.button("判定を保存して学習", key="btn_save_judgments", type="primary"):
-                        judgments = [{'key': c['key'], 'judgment': row.get('判定')}
-                                     for c, (_, row) in zip(cands, edited_judge.iterrows())]
-                        decided = [j for j in judgments if j['judgment'] in ('必要', '不要')]
-                        if not decided:
+                        rows = [(c, row) for c, (_, row) in zip(cands, edited_judge.iterrows())
+                                if row.get('判定') in ('必要', '不要')]
+                        missing_reason = [c['name'] for c, row in rows if row.get('判定') == '不要' and not row.get('不要の理由')]
+                        if not rows:
                             st.error("「必要」か「不要」を1件以上選んでください")
+                        elif missing_reason:
+                            st.error("「不要」の行は理由を選んでください: " + " / ".join(missing_reason[:5]))
                         else:
-                            save_hidden_feedback(hidden_items.record_judgments(load_hidden_feedback(), decided))
+                            glob = [{'key': c['key'], 'judgment': row['判定']} for c, row in rows
+                                    if row.get('適用範囲') != NOTE_SCOPE_PROJECT]
+                            proj = [{'key': c['key'], 'judgment': row['判定']} for c, row in rows
+                                    if row.get('適用範囲') == NOTE_SCOPE_PROJECT]
+                            if glob:
+                                save_hidden_feedback(hidden_items.record_judgments(load_hidden_feedback(), glob))
+                            if proj:
+                                save_project_hidden_feedback(current_pid, hidden_items.record_judgments(
+                                    load_project_hidden_feedback(current_pid), proj))
+                            append_hidden_judgment_log([{
+                                'key': c['key'], 'name': c['name'], 'category': c['category'],
+                                'judgment': row['判定'], 'reason': row.get('不要の理由') or '',
+                                'scope': 'project' if row.get('適用範囲') == NOTE_SCOPE_PROJECT else 'global',
+                                'project_id': current_pid, 'property': project_full_label(st.session_state['projects'].get(current_pid, {})),
+                                'at': now_jst().strftime('%Y-%m-%d %H:%M')} for c, row in rows])
+                            n_need = sum(1 for _, row in rows if row['判定'] == '必要')
                             append_project_changelog(current_pid, '実績取込',
-                                                     f"図面外項目の判定を学習: 必要{sum(1 for j in decided if j['judgment'] == '必要')}件 / "
-                                                     f"不要{sum(1 for j in decided if j['judgment'] == '不要')}件")
-                            _flash(f"{len(decided)}件の判定を保存しました。次回の採用確率に反映されます。")
+                                                     f"図面外項目の判定を学習: 必要{n_need}件 / 不要{len(rows) - n_need}件"
+                                                     f"（この案件のみ {len(proj)}件）")
+                            _flash(f"{len(rows)}件の判定を保存しました。次回の採用確率に反映されます。")
                             st.rerun()
                     pat_name = jc2.text_input("「必要」の項目で新しいパターンを作る（名前）", key="pdf_new_pattern_name",
                                               placeholder="例: 太陽光＋蓄電池セット")
@@ -5338,7 +5460,10 @@ def main():
                 target_pid = fb.get('_proj_id', current_pid) if fb_view_mode == "全案件横断表示" else current_pid
                 col_s, col_d = st.columns([3, 1])
                 with col_s:
-                    st_key = f"status_fb_{target_pid}_{idx}"
+                    # キーは並び順ではなく問い合わせ自体から作る（1件がアーカイブへ移っても次のカードに入力が残らない）
+                    fb_uid = fb.get('feedback_id') or hashlib.md5(
+                        f"{fb.get('timestamp', '')}|{fb.get('body') or fb.get('message', '')}".encode('utf-8')).hexdigest()[:12]
+                    st_key = f"status_fb_{hashlib.md5(str(target_pid).encode('utf-8')).hexdigest()[:8]}_{fb_uid}"
                     next_options = [s for s in FB_STATUSES if s != status]
                     sc1, sc2 = st.columns([1, 2])
                     new_status = sc1.selectbox("変更後のステータス", next_options, key=f"{st_key}_sel")
@@ -5369,6 +5494,9 @@ def main():
                                 sent, note_msg = notify_feedback_status(updated, new_status, status_note, fb_proj_name)
                                 msg += " " + note_msg
                                 kind = "success" if sent else "info"
+                            # 更新した問い合わせの入力欄を空に戻す
+                            for suffix in ("_sel", "_note"):
+                                st.session_state.pop(f"{st_key}{suffix}", None)
                             _flash(msg, kind)
                             st.rerun()
                 with col_d:

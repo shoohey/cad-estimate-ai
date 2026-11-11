@@ -182,23 +182,24 @@ class TestFeedbackStatusFlowInApp:
         assert radios, "表示フィルターが無い"
         assert list(radios[0].options) == ["全て", "未対応", "着手中", "高井対応済み", "差し戻し"]
 
-        sel = [s for s in at.selectbox if s.key == "status_fb_sample_furui_0_sel"]
+        # ステータス変更欄のキーは問い合わせごとに固定（並び順ではない。2026-11-12 監査）
+        sel = [s for s in at.selectbox if s.key and s.key.startswith("status_fb_") and s.key.endswith("_fb-test-1_sel")]
         assert sel, "ステータス変更の選択欄が無い"
         assert list(sel[0].options) == ["着手中", "高井対応済み", "対応完了", "差し戻し"]
 
         # 差し戻しはコメント必須
         sel[0].select("差し戻し")
-        [b for b in at.button if b.key == "status_fb_sample_furui_0"][0].click().run()
+        [b for b in at.button if b.key and b.key.startswith("status_fb_") and b.key.endswith("_fb-test-1")][0].click().run()
         assert not at.exception, [str(e.value) for e in at.exception]
         assert any("コメント" in e.value for e in at.error)
         with open(fb_path, encoding="utf-8") as f:
             assert json.load(f)[0]["status"] == "未対応"
 
         # 高井対応済み + 変更箇所 → 保存され履歴が残る（メールは未設定なので送らない）
-        sel = [s for s in at.selectbox if s.key == "status_fb_sample_furui_0_sel"][0]
+        sel = [s for s in at.selectbox if s.key and s.key.startswith("status_fb_") and s.key.endswith("_fb-test-1_sel")][0]
         sel.select("高井対応済み")
-        [t for t in at.text_input if t.key == "status_fb_sample_furui_0_note"][0].input("全て選択／全て解除ボタンを追加")
-        [b for b in at.button if b.key == "status_fb_sample_furui_0"][0].click().run()
+        [t for t in at.text_input if t.key and t.key.startswith("status_fb_") and t.key.endswith("_fb-test-1_note")][0].input("全て選択／全て解除ボタンを追加")
+        [b for b in at.button if b.key and b.key.startswith("status_fb_") and b.key.endswith("_fb-test-1")][0].click().run()
         assert not at.exception, [str(e.value) for e in at.exception]
         with open(fb_path, encoding="utf-8") as f:
             saved = json.load(f)[0]

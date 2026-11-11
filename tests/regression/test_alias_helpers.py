@@ -30,7 +30,10 @@ class TestAliasEntry:
         lib = [g, p_other, p_mine, 'junk', None]
         pairs = alias_pairs_from_library(lib, 'mine')
         assert frozenset(('x', 'y')) not in pairs and frozenset(('p', 'q')) in pairs
-        assert frozenset(('sgl鋼板たてひら葺', '平板瓦葺切妻寄棟')) in pairs
+        # 摘要がある行は「名称＋摘要」キーだけで登録する（2026-11-12 監査: 名称だけのキーだと
+        # 同じ品名で摘要違いの別の行にも効いていた）
+        assert frozenset(('sgl鋼板たてひら葺ニスクカラーpro唐草棟含む', '平板瓦葺切妻寄棟セラムff程度標準勾配')) in pairs
+        assert frozenset(('sgl鋼板たてひら葺', '平板瓦葺切妻寄棟')) not in pairs
         assert alias_applies(p_other, 'mine') is False and alias_applies(p_other, 'other') is True
         assert alias_applies(g, None) is True and alias_applies(p_mine, None) is False
         assert alias_pairs_from_library(None) == set()
@@ -52,14 +55,18 @@ class TestAliasEntry:
 
 class TestAliasMatching:
     def test_alias_forces_match_even_when_names_differ(self):
-        ai = [{'name': 'SGL鋼板 たてひら葺', 'summary': 'ﾆｽｸｶﾗｰPro', 'quantity': 1, 'unit': '式', 'amount': 681671}]
-        ac = [{'name': '平板瓦葺（切妻/寄棟）', 'summary': 'ｾﾗﾑFF程度', 'quantity': 1, 'unit': '式', 'amount': 691272}]
+        # 登録は明細表の行から行うので、辞書の摘要と明細の摘要は同じになる
+        ai = [{'name': 'SGL鋼板 たてひら葺', 'summary': 'ﾆｽｸｶﾗｰPro ※唐草･棟含む', 'quantity': 1, 'unit': '式', 'amount': 681671}]
+        ac = [{'name': '平板瓦葺（切妻/寄棟）', 'summary': 'ｾﾗﾑFF程度　標準勾配', 'quantity': 1, 'unit': '式', 'amount': 691272},
+              {'name': '平板瓦葺（切妻/寄棟）', 'summary': '別仕様', 'quantity': 1, 'unit': '式', 'amount': 681000}]
         base = excel_diff._match_items(ai, ac)
         assert not base['matched'] and base['ai_only'] and base['actual_only']
         pairs = alias_pairs_from_library([make_alias_entry(AI_ROW, AC_ROW, '屋根工事', 'A邸', 'd')])
         out = excel_diff._match_items(ai, ac, pairs)
         assert len(out['matched']) == 1 and out['matched'][0]['via_alias'] is True
-        assert out['matched'][0]['diff'] == 681671 - 691272 and not out['ai_only'] and not out['actual_only']
+        assert out['matched'][0]['diff'] == 681671 - 691272 and not out['ai_only']
+        # 同じ品名で摘要が違う行は、金額が近くても登録した組の相手にはならない
+        assert [x['summary'] for x in out['actual_only']] == ['別仕様']
 
     def test_alias_beats_fuzzy_candidate(self):
         ai = [{'name': '鋼板屋根', 'summary': '', 'quantity': 1, 'unit': '式', 'amount': 100}]
