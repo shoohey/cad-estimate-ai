@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from typing import Any
 
 
@@ -701,3 +702,76 @@ def diff_library_remove(lib: dict | None, keys, property_name: str) -> dict:
         if entries:
             out[key] = {**rec, 'entries': entries}
     return out
+
+
+# ---------------------------------------------------------------- 設計部の単価マスタを見積に使う（2026-11-12 監査）
+DESIGN_PREVIEW_COLUMNS = [
+    ('code', 'コード'), ('category', '工事種別'), ('group', '分類'), ('name', '名称'), ('summary', '摘要'),
+    ('unit', '単位'), ('estimate_price', '見積単価（販価）'), ('order_price', '発注単価（設計原価）'),
+    ('cost_kind', '材工区分'), ('breakdown_of', '内訳の親'), ('row_no', '行'),
+]
+
+
+def design_master_preview(rows: list | None, limit: int = 50) -> list[dict]:
+    """取込プレビュー用に日本語の列名へ置き換えた行（英語の内部キーを画面に出さない）"""
+    out = []
+    for r in (rows or [])[:limit]:
+        if isinstance(r, dict):
+            out.append({jp: r.get(k, '') for k, jp in DESIGN_PREVIEW_COLUMNS})
+    return out
+
+
+def design_breakdown_rows(rows: list | None, code: Any) -> list[dict]:
+    """親項目の内訳（内訳①②＝材・工の分離）の行。コードが無ければ空。"""
+    code = _clean(code)
+    if not code:
+        return []
+    return [r for r in rows or [] if isinstance(r, dict) and _clean(r.get('breakdown_of')) == code]
+
+
+def search_design_master(rows: list | None, query: Any, limit: int = 20) -> list[dict]:
+    """品名検索（部分一致）。内訳行は除く。見つからなければ空（呼び出し側で類似検索に回す）。"""
+    q = unicodedata.normalize('NFKC', _clean(query)).lower().replace(' ', '').replace('　', '')
+    if not q:
+        return []
+    out = []
+    for r in rows or []:
+        if not isinstance(r, dict) or _clean(r.get('breakdown_of')):
+            continue
+        text = unicodedata.normalize('NFKC', f"{r.get('name', '')}{r.get('summary', '')}").lower()
+        if q in text.replace(' ', '').replace('　', ''):
+            out.append({'name': _clean(r.get('name')), 'summary': _clean(r.get('summary')),
+                        'category': _clean(r.get('category')), 'unit': _clean(r.get('unit')),
+                        'estimate_price': int(r.get('estimate_price') or 0), 'order_price': int(r.get('order_price') or 0),
+                        'code': _clean(r.get('code')), 'cost_kind': _clean(r.get('cost_kind')), 'score': 1.0,
+                        'reason': '品名に一致'})
+            if len(out) >= limit:
+                break
+    return out
+
+
+def design_item_to_new_item(sg: dict, cat_no: int, quantity: Any) -> dict:
+    """単価マスタの項目を見積の追加行（mods['new_items'] の形）にする。原価が無ければ粗利33%で入れる。"""
+    try:
+        qty = float(quantity)
+    except (TypeError, ValueError):
+        qty = 0.0
+    if not qty or qty <= 0 or math.isnan(qty):
+        qty = 1.0
+    est = int(sg.get('estimate_price') or 0)
+    cost = int(sg.get('order_price') or 0) or linked_order_price(0, 0, est)
+    code = _clean(sg.get('code'))
+    return {'cat_no': int(cat_no), 'name': _clean(sg.get('name')), 'summary': _clean(sg.get('summary')),
+            'quantity': qty, 'unit': _clean(sg.get('unit')) or '式', 'estimate_price': est, 'order_price': cost,
+            'source': f"設計部単価マスタ {code}".strip()}
+
+
+def validate_alias_pair(ai_name: Any, ai_summary: Any, actual_name: Any, actual_summary: Any) -> str | None:
+    """「同じ商品」として登録してよい組か。両側が同じ表記なら登録しても意味がないので止める。"""
+    from excel_diff import _normalize_name
+    if not _clean(ai_name) or not _clean(actual_name):
+        return 'AI側と実績側の名称を両方選んでください'
+    if _normalize_name(_clean(ai_name) + _clean(ai_summary)) == _normalize_name(_clean(actual_name) + _clean(actual_summary)):
+        return ('AI側と実績側が同じ表記なので、登録しても突き合わせは変わりません。'
+                'AIの明細に無い項目なら「見積に追加」を使ってください')
+    return None

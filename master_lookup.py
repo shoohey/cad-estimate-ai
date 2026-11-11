@@ -518,10 +518,13 @@ def suggest_similar(name: str, summary: str, master_rows: list[dict], top_n: int
     out = []
     for score, _flag, _order, row, reason in cands[:top_n]:
         price, _ = _parse_price(row.get('estimate_price'))
+        cost, _ = _parse_price(row.get('order_price'))
         out.append({
             'name': _cell_text(row.get('name')), 'summary': _cell_text(row.get('summary')),
             'category': _cell_text(row.get('category')), 'unit': _cell_text(row.get('unit')),
             'estimate_price': price, 'score': round(score, 3), 'reason': reason,
+            # 見積に追加するときに使う（設計原価・コード・材工区分）
+            'order_price': cost, 'code': _cell_text(row.get('code')), 'cost_kind': _cell_text(row.get('cost_kind')),
         })
     return out
 

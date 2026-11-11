@@ -37,6 +37,8 @@ from ui_helpers import (proposal_number,
                         apply_fb_status_change, ACTIVE_FB_STATUSES, fb_is_archived,
                         partition_feedbacks, fb_timeline_text, release_log_rows,
                         alias_library_add, alias_library_remove, alias_library_set_scope, diff_library_remove,
+                        design_master_preview, design_breakdown_rows, design_item_to_new_item,
+                        search_design_master, validate_alias_pair, parse_quantity_jp,
                         category_detail_rows, detail_kind_counts, detail_header,
                         DETAIL_KIND_DIFF, DETAIL_KIND_AI_ONLY, DETAIL_KIND_ACTUAL_ONLY,
                         DETAIL_KIND_SAME, make_alias_entry, alias_pairs_from_library,
@@ -2266,11 +2268,8 @@ def recompute_hidden_stats(projects: dict, prices: dict) -> dict:
     return data
 
 
-def master_vocabulary(csv_path: str) -> list:
-    """類似候補に使うマスタ行。設計部の単価マスタがあればそれ、無ければアプリの単価マスタ"""
-    design = load_design_master()
-    if design.get('rows'):
-        return design['rows']
+def tanka_master_rows(csv_path: str) -> list:
+    """アプリの単価マスタ（tankamaster_updated.csv）の行。AI見積が実際に出す名称の一覧でもある"""
     if '_tanka_master_rows' not in st.session_state:
         try:
             with open(csv_path, 'rb') as f:
@@ -2279,6 +2278,14 @@ def master_vocabulary(csv_path: str) -> list:
             rows = []
         st.session_state['_tanka_master_rows'] = rows
     return st.session_state['_tanka_master_rows']
+
+
+def master_vocabulary(csv_path: str) -> list:
+    """類似候補に使うマスタ行。設計部の単価マスタがあればそれ、無ければアプリの単価マスタ"""
+    design = load_design_master()
+    if design.get('rows'):
+        return design['rows']
+    return tanka_master_rows(csv_path)
 
 
 def save_diff_reason_library(lib: dict):
@@ -3355,6 +3362,68 @@ def main():
 
         st.divider()
 
+        # 図面に現れない項目（パターン）を、PDFを読み取らなくても入れられるようにする（2026-11-12 監査）
+        mod_patterns = load_hidden_patterns()
+        st.markdown("#### 図面に現れない項目（パターン）から追加")
+        if mod_patterns:
+            mp1, mp2 = st.columns([3, 1])
+            sel_mod_patterns = mp1.multiselect("この案件のパターン", [p['name'] for p in mod_patterns], key="mod_patterns",
+                                               help="口頭で聞いた仕様のセットです。「PDF見積（検証）」タブの「パターンの管理」で登録・編集できます")
+            if mp2.button("選んだパターンの項目を見積に追加", key="btn_mod_patterns", disabled=not sel_mod_patterns):
+                pat_cands = hidden_items.build_candidates([], 1.01, [p for p in mod_patterns if p['name'] in sel_mod_patterns])
+                existing = {it.get('hidden_key') for it in mods['new_items'] if isinstance(it, dict)}
+                new_rows = [it for it in hidden_items.to_new_items(pat_cands, [(c.no, c.name) for c in estimate_base.categories])
+                            if it.get('hidden_key') not in existing]
+                if new_rows:
+                    mods['new_items'].extend(new_rows)
+                    persist_project_mods()
+                    append_project_changelog(current_pid, '図面外項目',
+                                             f"パターン（{'・'.join(sel_mod_patterns)}）から追加: " + " / ".join(r['name'] for r in new_rows[:10]))
+                    _flash(f"{len(new_rows)}件を追加しました。")
+                else:
+                    _flash("追加する新しい項目はありません（すでに追加済みです）。", "info")
+                st.rerun()
+        else:
+            st.caption("パターンはまだありません。「PDF見積（検証）」タブの「パターンの管理」で登録できます。")
+        st.divider()
+
+        # 設計部の単価マスタから追加（図面に出ない造作・可動棚などを、33％販価と設計原価のまま入れる）
+        design_rows_all = load_design_master().get('rows') or []
+        if design_rows_all:
+            st.markdown("#### 設計部の単価マスタから追加")
+            st.caption("図面に出ない造作（可動棚・カウンターなど）は、ここで選ぶと販価（33％）と設計原価が入ります。")
+            dm1, dm2 = st.columns([1, 2])
+            dm_q = dm1.text_input("品名で検索", key="dm_search", placeholder="例: 可動棚 / カウンター / 深基礎")
+            if dm_q.strip():
+                dm_sugg = (search_design_master(design_rows_all, dm_q, limit=20)
+                           or master_lookup.suggest_similar(dm_q.strip(), '', design_rows_all, top_n=10))
+                if dm_sugg:
+                    dm_i = dm2.selectbox(
+                        "項目", list(range(len(dm_sugg))), key="dm_pick",
+                        format_func=lambda i: (f"{dm_sugg[i]['name']}{'｜' + dm_sugg[i]['summary'] if dm_sugg[i].get('summary') else ''}"
+                                               f"（{int(dm_sugg[i].get('estimate_price') or 0):,}円/{dm_sugg[i].get('unit') or '-'}・"
+                                               f"{dm_sugg[i].get('category') or '-'}）"))
+                    dm_sel = dm_sugg[dm_i]
+                    dm_bd = design_breakdown_rows(design_rows_all, dm_sel.get('code'))
+                    if dm_bd:
+                        st.caption("内訳: " + " / ".join(f"{b['name']}（{int(b.get('estimate_price') or 0):,}円）" for b in dm_bd))
+                    dm_default = next((i for i, o in enumerate(mod_cat_options)
+                                       if dm_sel.get('category') and (dm_sel['category'] in o or o.split('. ', 1)[-1] in dm_sel['category'])), 0)
+                    dm3, dm4, dm5 = st.columns([2, 1, 1])
+                    dm_cat = dm3.selectbox("追加先の工事種別", mod_cat_options, index=dm_default, key="dm_cat")
+                    dm_qty = dm4.number_input("数量", min_value=0.01, value=1.0, format="%.2f", key="dm_qty")
+                    if dm5.button("見積に追加", key="dm_add", type="primary"):
+                        ni = design_item_to_new_item(dm_sel, int(dm_cat.split(".")[0]), dm_qty)
+                        mods['new_items'].append(ni)
+                        persist_project_mods()
+                        append_project_changelog(current_pid, '見積修正',
+                                                 f"単価マスタから追加: {ni['name']}（{ni['quantity']:g}{ni['unit']} × {ni['estimate_price']:,}円）")
+                        _flash(f"「{ni['name']}」を追加しました。")
+                        st.rerun()
+                else:
+                    dm2.caption("見つかりませんでした。別の言葉で検索してください。")
+            st.divider()
+
         # 新規項目追加
         st.markdown("#### 新規項目の追加")
         with st.form("new_item_form"):
@@ -4099,57 +4168,114 @@ def main():
                                             _flash(f"「{entry['ai_name']}」と「{entry['actual_name']}」を同じ商品として"
                                                    f"登録しました（{ALIAS_SCOPE_LABEL[scope]}）。")
                                         st.rerun()
-                                # 単価マスタから類似候補を拾う（設計部マスタ優先）。重いので要求時のみ計算
+                                # 単価マスタから類似候補を拾う。重いので要求時のみ計算（2026-11-12 監査で作り直し）
+                                #  - 設計部マスタ（無ければアプリの単価マスタ）の項目は「見積に追加」する
+                                #  - 「同じ商品」の登録先は、AI見積が実際に出す名称（AIにしかない行・アプリの単価マスタ）から選ぶ
                                 if st.checkbox("単価マスタから類似候補を表示（実績にしかない行）",
                                                key=f"cand_toggle_{current_pid}_{ci}"):
-                                    vocab = master_vocabulary(csv_path)
                                     ac_rows = [r for r in reg_rows if r['区分'] == DETAIL_KIND_ACTUAL_ONLY][:20]
-                                    cand_rows, cand_options = [], {}
-                                    for r in ac_rows:
-                                        sugg = master_lookup.suggest_similar(
-                                            r['実績品名'], r['実績摘要'], vocab, top_n=3, category=cd['name'])
-                                        labels = []
-                                        for sg in sugg:
-                                            lab = f"{sg['name']}{'｜' + sg['summary'] if sg.get('summary') else ''}"
-                                            labels.append(f"{lab}（{sg['score']:.2f}）")
-                                            cand_options.setdefault(lab, sg)
-                                        cand_rows.append({'実績品名': r['実績品名'], '実績摘要': r['実績摘要'],
-                                                          '候補1': labels[0] if len(labels) > 0 else '',
-                                                          '候補2': labels[1] if len(labels) > 1 else '',
-                                                          '候補3': labels[2] if len(labels) > 2 else ''})
-                                    if cand_rows:
-                                        st.dataframe(pd.DataFrame(cand_rows), use_container_width=True, hide_index=True)
-                                        mc1, mc2 = st.columns([2, 1])
-                                        chosen = mc1.selectbox("AI側（単価マスタ）の名称を選ぶ", list(cand_options.keys()),
-                                                               key=f"cand_pick_{current_pid}_{ci}")
-                                        if mc2.button("チェックした実績明細を、選んだマスタ名と同じ商品として登録",
-                                                      key=f"cand_reg_{current_pid}_{ci}"):
-                                            selected = [r for r in edited_reg.to_dict('records') if r.get('選択')]
-                                            ac_sel = [r for r in selected if r.get('区分') == DETAIL_KIND_ACTUAL_ONLY]
-                                            if len(ac_sel) != 1 or len(selected) != 1:
-                                                st.error("「実績にしかない」行を1件だけチェックしてください")
-                                            else:
-                                                sg = cand_options[chosen]
-                                                scope = (ALIAS_SCOPE_PROJECT if scope_label.startswith("この案件")
-                                                         else ALIAS_SCOPE_GLOBAL)
-                                                entry = make_alias_entry(
-                                                    {'AI品名': sg['name'], 'AI摘要': sg.get('summary', '')}, ac_sel[0],
-                                                    cd['name'], alias_prop_name, now_jst().strftime('%Y-%m-%d %H:%M'),
-                                                    scope=scope, project_id=current_pid)
-                                                latest_lib, added = alias_library_add(load_item_alias_library(fresh=True), entry)
-                                                if not added:
-                                                    _flash("この組み合わせは登録済みです。", "info")
-                                                else:
-                                                    save_item_alias_library(latest_lib)
-                                                    append_project_changelog(
-                                                        current_pid, '実績取込',
-                                                        f"同じ商品として登録（単価マスタ）: {entry['ai_name']} ⇔ {entry['actual_name']}"
-                                                        f"（{ALIAS_SCOPE_LABEL[scope]}）")
-                                                    _flash(f"「{entry['ai_name']}」と「{entry['actual_name']}」を同じ商品として"
-                                                           f"登録しました（{ALIAS_SCOPE_LABEL[scope]}）。")
-                                                st.rerun()
+                                    ai_only_rows = [r for r in reg_rows if r['区分'] == DETAIL_KIND_AI_ONLY]
+                                    design_rows = load_design_master().get('rows') or []
+                                    tanka_rows = tanka_master_rows(csv_path)
+                                    add_vocab = design_rows or tanka_rows
+
+                                    def _cand_label(sg):
+                                        price = (f"・{int(sg['estimate_price']):,}円/{sg.get('unit') or '-'}"
+                                                 if sg.get('estimate_price') else '')
+                                        return (f"{sg['name']}{'｜' + sg['summary'] if sg.get('summary') else ''}"
+                                                f"（{sg.get('score', 0):.2f}{price}）")
+                                    if not ac_rows:
+                                        st.caption("実績にしかない行はありません。")
                                     else:
-                                        st.caption("類似候補は見つかりませんでした。")
+                                        cand_rows = []
+                                        for r in ac_rows:
+                                            sugg = master_lookup.suggest_similar(
+                                                r['実績品名'], r['実績摘要'], add_vocab, top_n=3, category=cd['name'])
+                                            labels = [_cand_label(sg) for sg in sugg]
+                                            cand_rows.append({'実績品名': r['実績品名'], '実績摘要': r['実績摘要'],
+                                                              '実績数量': r.get('実績数量', ''),
+                                                              '候補1': labels[0] if len(labels) > 0 else '',
+                                                              '候補2': labels[1] if len(labels) > 1 else '',
+                                                              '候補3': labels[2] if len(labels) > 2 else ''})
+                                        st.dataframe(pd.DataFrame(cand_rows), use_container_width=True, hide_index=True)
+                                        tgt_labels = [f"{r['実績品名']}｜{r['実績摘要']}" if r['実績摘要'] else r['実績品名']
+                                                      for r in ac_rows]
+                                        tgt_i = st.selectbox("対象の実績明細", list(range(len(ac_rows))),
+                                                             format_func=lambda i: tgt_labels[i],
+                                                             key=f"cand_target_{current_pid}_{ci}")
+                                        tgt = ac_rows[tgt_i]
+                                        # ---- 単価マスタの項目を、この案件の見積に追加する ----
+                                        st.markdown("**設計部の単価マスタから見積に追加**" if design_rows
+                                                    else "**単価マスタから見積に追加**")
+                                        d_sugg = master_lookup.suggest_similar(
+                                            tgt['実績品名'], tgt['実績摘要'], add_vocab, top_n=5, category=cd['name'])
+                                        if d_sugg:
+                                            dc1, dc2, dc3 = st.columns([3, 1, 1])
+                                            d_i = dc1.selectbox("追加する項目", list(range(len(d_sugg))),
+                                                                format_func=lambda i: _cand_label(d_sugg[i]),
+                                                                key=f"cand_pick_{current_pid}_{ci}")
+                                            sg = d_sugg[d_i]
+                                            qty0 = parse_quantity_jp(tgt.get('実績数量'), allow_bare=True) or 1.0
+                                            d_qty = dc2.number_input("数量", min_value=0.01, value=float(qty0),
+                                                                     key=f"cand_qty_{current_pid}_{ci}_{tgt_i}")
+                                            bd = design_breakdown_rows(design_rows, sg.get('code')) if design_rows else []
+                                            if bd:
+                                                st.caption("内訳: " + " / ".join(
+                                                    f"{b['name']}（{int(b.get('estimate_price') or 0):,}円）" for b in bd))
+                                            if dc3.button("見積に追加", key=f"cand_add_{current_pid}_{ci}"):
+                                                cat_pairs = [(c.no, c.name) for c in estimate_base.categories]
+                                                ai_cat = next((c for c in estimate_base.categories if c.name == cd['name']), None)
+                                                cat_no = ai_cat.no if ai_cat else hidden_items.resolve_category_no(cd['name'], cat_pairs)
+                                                ni = design_item_to_new_item(sg, cat_no, d_qty)
+                                                mods.setdefault('new_items', []).append(ni)
+                                                set_project_state('mods', mods)
+                                                persist_project_mods()
+                                                append_project_changelog(
+                                                    current_pid, '見積修正',
+                                                    f"単価マスタから追加: {ni['name']}（{ni['quantity']:g}{ni['unit']} × "
+                                                    f"{ni['estimate_price']:,}円）")
+                                                _flash(f"「{ni['name']}」をこの案件の見積に追加しました（見積修正タブで直せます）。")
+                                                st.rerun()
+                                        else:
+                                            st.caption("似ている項目は見つかりませんでした。")
+                                        # ---- AI見積の明細と同じ商品として登録する ----
+                                        st.markdown("**AI見積の明細と同じ商品として登録**")
+                                        ai_opts = [{'name': r['AI品名'], 'summary': r['AI摘要'],
+                                                    'label': f"AIにしかない行: {r['AI品名']}{'｜' + r['AI摘要'] if r['AI摘要'] else ''}"}
+                                                   for r in ai_only_rows]
+                                        ai_opts += [{'name': s2['name'], 'summary': s2.get('summary', ''),
+                                                     'label': f"アプリの単価マスタ: {_cand_label(s2)}"}
+                                                    for s2 in master_lookup.suggest_similar(
+                                                        tgt['実績品名'], tgt['実績摘要'], tanka_rows, top_n=5, category=cd['name'])]
+                                        if ai_opts:
+                                            ac1, ac2 = st.columns([3, 1])
+                                            a_i = ac1.selectbox("AI側の名称", list(range(len(ai_opts))),
+                                                                format_func=lambda i: ai_opts[i]['label'],
+                                                                key=f"cand_ai_{current_pid}_{ci}")
+                                            if ac2.button("同じ商品として登録", key=f"cand_reg_{current_pid}_{ci}"):
+                                                o = ai_opts[a_i]
+                                                err = validate_alias_pair(o['name'], o['summary'], tgt['実績品名'], tgt['実績摘要'])
+                                                if err:
+                                                    st.error(err)
+                                                else:
+                                                    scope = (ALIAS_SCOPE_PROJECT if scope_label.startswith("この案件")
+                                                             else ALIAS_SCOPE_GLOBAL)
+                                                    entry = make_alias_entry(
+                                                        {'AI品名': o['name'], 'AI摘要': o['summary']}, tgt,
+                                                        cd['name'], alias_prop_name, now_jst().strftime('%Y-%m-%d %H:%M'),
+                                                        scope=scope, project_id=current_pid)
+                                                    latest_lib, added = alias_library_add(load_item_alias_library(fresh=True), entry)
+                                                    if not added:
+                                                        _flash("この組み合わせは登録済みです。", "info")
+                                                    else:
+                                                        save_item_alias_library(latest_lib)
+                                                        append_project_changelog(
+                                                            current_pid, '実績取込',
+                                                            f"同じ商品として登録（単価マスタ）: {entry['ai_name']} ⇔ {entry['actual_name']}"
+                                                            f"（{ALIAS_SCOPE_LABEL[scope]}）")
+                                                        _flash(f"「{entry['ai_name']}」と「{entry['actual_name']}」を同じ商品として"
+                                                               f"登録しました（{ALIAS_SCOPE_LABEL[scope]}）。")
+                                                    st.rerun()
                                 if rc3.button("チェックした行を「この案件特有」として登録",
                                               key=f"special_reg_{current_pid}_{ci}",
                                               help="図面に表れない物件固有の項目など、全案件には該当しないもの。"
@@ -4822,7 +4948,7 @@ def main():
         m1.metric("設計部 単価マスタ", f"{len(design.get('rows', []))} 行",
                   help=f"{design.get('file', '')} {design.get('at', '')}".strip() or None)
         m2.metric("同じ商品 辞書", f"{len(alias_lib_m)} 件")
-        m3.metric("アプリ内 単価マスタ", f"{len(master_vocabulary(csv_path)) if not design.get('rows') else len(st.session_state.get('_tanka_master_rows') or [])} 行")
+        m3.metric("アプリ内 単価マスタ", f"{len(tanka_master_rows(csv_path))} 行")
 
         col_m, col_a = st.columns(2)
         with col_m:
@@ -4833,7 +4959,10 @@ def main():
                 rows_m, errs_m = master_lookup.parse_price_master(up_master.getvalue(), up_master.name)
                 st.caption(f"読み取り: {len(rows_m)} 行" + (f"（読めなかった行 {len(errs_m)}）" if errs_m else ""))
                 if rows_m:
-                    st.dataframe(pd.DataFrame(rows_m[:50]), use_container_width=True, hide_index=True, height=240)
+                    st.caption("見積単価には販価の列（30％と33％があるときは33％）、発注単価には原価（設計原価）の列を使います。"
+                               "「内訳の親」があるのは材・工の内訳行で、似ている項目の候補には出しません。")
+                    st.dataframe(pd.DataFrame(design_master_preview(rows_m)), use_container_width=True,
+                                 hide_index=True, height=240)
                     if st.button("この単価マスタを保存して類似候補に使う", key="btn_save_design_master", type="primary"):
                         save_design_master({'rows': rows_m, 'file': up_master.name,
                                             'at': now_jst().strftime('%Y-%m-%d %H:%M')})
@@ -4988,6 +5117,55 @@ def main():
             ex['data'] = data
             set_project_state('pdf_extracted', ex)
             data_sig = hashlib.md5(json.dumps(data, sort_keys=True, ensure_ascii=False, default=str).encode('utf-8')).hexdigest()
+            # ---- 造作・収納（可動棚・カウンターなど）→ 単価マスタの項目に当てる ----
+            raw_built = raw.get('built_ins') or []
+            st.markdown("**造作・収納（可動棚・カウンターなど）**")
+            bi_df = pd.DataFrame(raw_built, columns=['name', 'spec', 'count', 'location'])
+            ed_bi = st.data_editor(bi_df, num_rows="dynamic", use_container_width=True, hide_index=True,
+                                   key=f"{pdf_key}_pdf_builtins_{file_key}",
+                                   column_config={'name': '名称', 'spec': '寸法・仕様', 'count': '箇所数', 'location': '場所'})
+            built_ins = [r for r in ed_bi.to_dict('records') if str(r.get('name') or '').strip()]
+            data['built_ins'] = built_ins
+            ex['data'] = data
+            set_project_state('pdf_extracted', ex)
+            bi_vocab = load_design_master().get('rows') or tanka_master_rows(csv_path)
+            bi_items = []
+            cat_pairs_case = [(c.no, c.name) for c in estimate_base.categories]
+            for b in built_ins:
+                sg = next(iter(master_lookup.suggest_similar(str(b.get('name') or ''), str(b.get('spec') or ''),
+                                                             bi_vocab, top_n=1)), None)
+                if not sg or sg.get('score', 0) < 0.5:
+                    continue
+                try:
+                    qty = float(b.get('count') or 1)
+                except (TypeError, ValueError):
+                    qty = 1.0
+                ni = design_item_to_new_item(sg, hidden_items.resolve_category_no(sg.get('category'), cat_pairs_case), qty)
+                ni['built_in_key'] = f"{b.get('name')}|{b.get('spec')}|{b.get('location')}"
+                bi_items.append((b, sg, ni))
+            if bi_items:
+                st.dataframe(pd.DataFrame([{
+                    '図面の造作': f"{b.get('name')} {b.get('spec') or ''}".strip(), '箇所数': ni['quantity'],
+                    '単価マスタの項目': f"{sg['name']}{'｜' + sg['summary'] if sg.get('summary') else ''}",
+                    '一致度': round(sg.get('score', 0), 2), '見積単価': ni['estimate_price'], '原価': ni['order_price']}
+                    for b, sg, ni in bi_items]), use_container_width=True, hide_index=True)
+                if st.button("造作をこの案件の見積（数量TXT由来）に追加", key="btn_builtins_to_case",
+                             help="同じ造作は二重に追加しません。追加した行は「見積修正」タブで直したり消したりできます"):
+                    existing = {it.get('built_in_key') for it in mods.get('new_items', []) if isinstance(it, dict)}
+                    new_rows = [ni for _, _, ni in bi_items if ni['built_in_key'] not in existing]
+                    if new_rows:
+                        mods.setdefault('new_items', []).extend(new_rows)
+                        set_project_state('mods', mods)
+                        persist_project_mods()
+                        append_project_changelog(current_pid, '図面外項目',
+                                                 "図面の造作を見積に追加: " + " / ".join(r['name'] for r in new_rows[:10]))
+                        _flash(f"{len(new_rows)}件の造作をこの案件の見積に追加しました（見積修正タブで確認できます）。")
+                    else:
+                        _flash("追加する新しい造作はありません（すでに追加済みです）。", "info")
+                    st.rerun()
+            elif built_ins:
+                st.caption("単価マスタに似ている項目が見つからない造作です。見積修正タブで手入力してください。")
+            data_sig = hashlib.md5(json.dumps(data, sort_keys=True, ensure_ascii=False, default=str).encode('utf-8')).hexdigest()
             if raw.get('notes'):
                 with st.expander(f"読み取り時の注意（{len(raw['notes'])}）"):
                     for n in raw['notes']:
@@ -5054,11 +5232,14 @@ def main():
                         include_adjustment=include_adjustment, include_solar=include_solar,
                         safety_rate=safety_rate_pct / 100.0,
                         include_custom_furniture=include_custom_furniture)
+                    pdf_new_items = []
                     if candidates:
-                        new_items = hidden_items.to_new_items(
+                        pdf_new_items += hidden_items.to_new_items(
                             candidates, [(c.no, c.name) for c in pdf_est.categories])
+                    pdf_new_items += [ni for _, _, ni in bi_items]   # 図面の造作（単価マスタの項目）
+                    if pdf_new_items:
                         pdf_est = apply_modifications(
-                            pdf_est, {'overrides': {}, 'deleted': set(), 'new_items': new_items})
+                            pdf_est, {'overrides': {}, 'deleted': set(), 'new_items': pdf_new_items})
                     set_project_state('pdf_estimate', {'file': ex['file'], 'est': pdf_est, 'warnings': pdf_warns,
                                                        'candidates': candidates, 'sig': data_sig})
                     st.rerun()

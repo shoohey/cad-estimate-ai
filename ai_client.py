@@ -271,7 +271,7 @@ def _run_change_extraction(system: str, user_text: str) -> list[dict[str, Any]]:
 EXTRACTION_KEYS = (
     "property_name", "structure", "floors", "total_floor_area_m2", "floor_areas",
     "building_area_m2", "perimeter_m", "rooms", "fittings", "roof",
-    "exterior_wall_area_m2", "notes", "confidence", "source_pages",
+    "exterior_wall_area_m2", "notes", "confidence", "source_pages", "built_ins",
 )
 
 _NUMBER_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
@@ -391,6 +391,22 @@ def normalize_extraction(raw: Any) -> dict[str, Any]:
             "location": _to_text(f.get("location")),
         })
 
+    # 造作・収納（可動棚・カウンター・カップボード等）。単価マスタの項目に当てて見積に入れる（2026-11-12）
+    built_ins: list[dict[str, Any]] = []
+    for b in _as_list(raw.get("built_ins")):
+        if not isinstance(b, dict):
+            continue
+        name = _to_text(b.get("name"))
+        if not name:
+            continue
+        count = _to_int(b.get("count"))
+        built_ins.append({
+            "name": name,
+            "spec": _to_text(b.get("spec")),
+            "count": count if count is not None and count >= 1 else 1,
+            "location": _to_text(b.get("location")),
+        })
+
     roof_raw = raw.get("roof") if isinstance(raw.get("roof"), dict) else {}
     roof = {
         "type": _to_text(roof_raw.get("type")),
@@ -422,6 +438,7 @@ def normalize_extraction(raw: Any) -> dict[str, Any]:
         "notes": notes,
         "confidence": confidence,
         "source_pages": sorted(pages),
+        "built_ins": built_ins,
     }
 
 
@@ -469,6 +486,7 @@ _PDF_EXTRACTION_SYSTEM = """\
 - 延床面積・階別面積・建築面積は面積表 (求積表) の記載を最優先し、部屋面積の合計から求めた場合は notes に明記する。
 - バルコニー・ポーチ・小屋裏収納・吹抜など延床面積に算入しない部分は rooms に含めてよいが、floor_areas には含めない。
 - 建具は建具表があればそれに従い、無ければ平面図の記号から数える。同一仕様はまとめて count に本数を入れる。
+- 可動棚・カウンター・カップボード・ニッチ・枕棚パイプなどの造作・収納は built_ins に入れる（建具に含めない）。W・H・幅などの寸法は spec に書き、count には箇所数だけを入れる。
 - 複数ページにまたがる場合は、根拠としたページ番号 (1始まり) を source_pages に列挙する。
 
 出力は必ず以下のキーを全て持つJSONオブジェクトのみとし、説明文・前置き・コードフェンスは付けないこと:
@@ -490,7 +508,10 @@ _PDF_EXTRACTION_SYSTEM = """\
   "exterior_wall_area_m2": 外壁面積 m² (number | null),
   "notes": [読み取り上の注意・換算・不確かな点 (string)],
   "confidence": "high" | "medium" | "low",
-  "source_pages": [根拠ページ番号 (integer)]
+  "source_pages": [根拠ページ番号 (integer)],
+  "built_ins": [{"name": 造作・収納の名称 (例 "可動棚", "カウンター", "カップボード", "ニッチ", "枕棚+パイプ"),
+                 "spec": 寸法・仕様 (例 "W4.5尺 5枚") ※寸法は数量にしない (string | null),
+                 "count": 箇所数 (integer), "location": 場所 (例 "WIC", "洗面") | null}]
 }"""
 
 _RETRY_INSTRUCTION_OBJECT = (
