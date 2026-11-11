@@ -314,8 +314,12 @@ def _parse_master_table(rows: list[list[Any]], errors: list[str]) -> list[dict] 
         # 内訳行（「内訳①: [材] …」や親コード + '-1'）は親項目の材／工の内訳。
         # 候補の語彙には親だけを使うため breakdown_of に親コードを残す
         breakdown_of = ''
-        if re.match(r'^\s*内訳', name) or (last_parent_code and code and re.fullmatch(re.escape(last_parent_code) + r'-\d+', code)):
-            breakdown_of = last_parent_code
+        is_bd_name = bool(re.match(r'^\s*内訳', name))
+        if is_bd_name or (last_parent_code and code and re.fullmatch(re.escape(last_parent_code) + r'-\d+', code)):
+            # 内訳行の親は、コードが「親コード-数字」ならその親コード。直前の親と違うコード（親の行が無い内訳）を
+            # 直前の親に付けない（6-MK-023-1 が 6-MK-018 の内訳になっていた。2026-11-12 反証）
+            pm = re.fullmatch(r'(.+)-\d+', code) if code else None
+            breakdown_of = pm.group(1) if (pm and is_bd_name) else last_parent_code
         else:
             last_parent_code = code or last_parent_code
         out.append({

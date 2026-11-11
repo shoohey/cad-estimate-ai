@@ -103,7 +103,7 @@ def merge_proposal_edits(proposals: list[dict] | None,
                                                   p.get('change_type'))
         if '変更後の内容' in row:
             p['proposed'] = _clean(row.get('変更後の内容'))
-        init = proposal_table_values(prop) if isinstance(prop, dict) else {'金額(円)': 0, '数量': None}
+        init = _auto_table_values(prop) if isinstance(prop, dict) else {'金額(円)': 0, '数量': None}
         if '金額(円)' in row:
             p['amount'] = _to_int_amount(row.get('金額(円)'), p.get('amount'))
             # 表に自動で入れた初期値のままなら「自動」の印を付け、あとで内容を直したときに読み直す
@@ -207,22 +207,24 @@ def _drop_commas_in_numbers(s: str) -> str:
     return re.sub(r'(?<=\d),(?=\d{3}(?!\d))', '', s)
 
 
-def _after_change(s: str) -> str:
+def _after_change(s: str, usable=None) -> str:
     """『A→B』『AからBに』『AをBに』『変更後 B』の形なら、変更後（B）の部分だけを返す。
 
     2026-11-12 反証: 『UB 26万→371,500円』で変更前の 26万 を採用していた。
-    後ろに数字が無いとき（『2階から1階に移設』の後ろ側など）は元の文を使う。
+    usable(後ろ側) が偽のとき（その種類で使える数字が後ろに無い: 『UB 371,500円をサザナ1620に』の
+    1620 は金額ではない）は、文全体を返す。usable を省くと「後ろに数字があるか」で判定する。
     """
+    ok = usable or (lambda t: bool(re.search(r'\d', t)))
     parts = re.split(r'→|⇒|⇨|➡|->|=>|＞', s)
-    if len(parts) > 1 and re.search(r'\d', parts[-1]):
-        return parts[-1]
+    if len(parts) > 1:
+        return parts[-1] if ok(parts[-1]) else s
     m = re.search(r'変更後\s*[:：は]?\s*(.+)$', s)
-    if m and re.search(r'\d', m.group(1)):
+    if m and ok(m.group(1)):
         return m.group(1)
     for word in ('から', 'より', 'を'):
         idx = s.rfind(word)
         if idx > 0 and re.search(r'\d', s[:idx]) and re.search(r'\d', s[idx + len(word):]):
-            return s[idx + len(word):]
+            return s[idx + len(word):] if ok(s[idx + len(word):]) else s
     return s
 
 
@@ -248,8 +250,8 @@ def _money_candidates(s: str) -> list[tuple[int, int, float]]:
         v = float(m.group(1).replace(',', '')) * 10000
         v += float(m.group(2) or 0) * 1000 + float(m.group(3) or 0) * 100 + float((m.group(4) or '0').replace(',', ''))
         _add(m, v)
-    for m in re.finditer(r'(?<![0-9.,])(\d+(?:\.\d+)?)\s*千(?:\s*(\d+)\s*百)?\s*円', s):
-        _add(m, float(m.group(1)) * 1000 + float(m.group(2) or 0) * 100)
+    for m in re.finditer(r'(?<![0-9.,])(' + num + r')\s*千(?:\s*(\d+)\s*百)?\s*円', s):
+        _add(m, float(m.group(1).replace(',', '')) * 1000 + float(m.group(2) or 0) * 100)
     for m in re.finditer(r'[¥￥]\s*(' + num + r')', s):
         _add(m, float(m.group(1).replace(',', '')))
     for m in re.finditer(r'(?<![0-9.,])(' + num + r')\s*円', s):
@@ -266,8 +268,13 @@ def _prep(text: Any) -> str:
     return _MODEL_TOKEN.sub(' ', s)
 
 
-_DELTA_UP_AFTER = re.compile(r'\s*(?:の)?(?:アップ|ＵＰ|UP|up|増し?|プラス|高く)')
-_DELTA_DOWN_AFTER = re.compile(r'\s*(?:の)?(?:ダウン|DOWN|down|減|マイナス|安く|値引き?|引き)')
+_KATA_NEXT = r'(?![ァ-ヶーｦ-ﾟ])'
+_DELTA_UP_AFTER = re.compile(r'\s*(?:の)?(?:(?:アップ|プラス)' + _KATA_NEXT + r'|ＵＰ|UP\b|up\b|増し?|高く)')
+_DELTA_DOWN_AFTER = re.compile(r'\s*(?:の)?(?:(?:ダウン|マイナス)' + _KATA_NEXT + r'|DOWN\b|down\b|減|安く|値引き?|引き)')
+# 金額の直前（区切り記号・空白・¥まで）にある語だけで増減額と判断する。
+# 『値引き後 350,000円』『差額なし 371,500円』『値下げして35万円に』『プラスチック製 12,000円』は絶対額（2026-11-12 反証）
+_DELTA_DOWN_BEFORE = re.compile(r'(?:減額|値引き?|値下げ|マイナス' + _KATA_NEXT + r')\s*[:：は]?\s*[¥￥]?\s*$')
+_DELTA_UP_BEFORE = re.compile(r'(?:差額|増額|値上げ|追加費用|追加金額|プラス' + _KATA_NEXT + r')\s*[:：は]?\s*[¥￥]?\s*$')
 
 
 def _delta_sign(s: str, start: int, end: int) -> int:
@@ -282,9 +289,9 @@ def _delta_sign(s: str, start: int, end: int) -> int:
         return 1
     if _DELTA_DOWN_AFTER.match(after):
         return -1
-    if re.search(r'減額|値引き?|値下げ|マイナス', before):
+    if _DELTA_DOWN_BEFORE.search(before):
         return -1
-    if re.search(r'差額|増額|値上げ|追加費用|追加金額|プラス', before):
+    if _DELTA_UP_BEFORE.search(before):
         return 1
     return 0
 
@@ -355,7 +362,7 @@ def proposal_delta(change_type: str, proposed: Any) -> float | None:
     """単価変更・仕様変更の文が増減額（差額 +85,000円・△50,000円・2万円アップ）なら符号付きの額、違えば None"""
     if _clean(change_type) not in ('price', 'spec') or proposed is None:
         return None
-    s = _after_change(_prep(proposed))
+    s = _after_change(_prep(proposed), lambda t: bool(_money_candidates(t)))
     cands = _money_candidates(s)
     if not cands:
         return None
@@ -384,7 +391,15 @@ def proposal_value(change_type: str, proposed: Any, amount: Any = None) -> float
         return parse_quantity_jp(_after_change(_normalize_digits(proposed, keep_commas=True)), allow_bare=True)
     if ctype == 'remove':
         return None
-    s = _after_change(_prep(proposed))
+    pre = _prep(proposed)
+
+    def _usable(t: str) -> bool:
+        # 後ろ側に金額があれば後ろ側。単価変更で文全体に金額が無いときは、後ろ側の単位なしの数字でもよい
+        if _money_candidates(t):
+            return True
+        return (ctype == 'price' and not _money_candidates(pre)
+                and _bare_number(_NON_PRICE_NUMBER.sub(' ', _drop_commas_in_numbers(t)), last=True) is not None)
+    s = _after_change(pre, _usable)
     cands = _money_candidates(s)
     if cands:
         start, end, value = cands[0]
@@ -434,6 +449,11 @@ def proposal_table_values(p: dict) -> dict:
     return {'金額(円)': int(v) if v else 0, '数量': None}
 
 
+def _auto_table_values(p: dict) -> dict:
+    """利用者が表に入れた数字を除いて、変更後の内容だけから作った初期値"""
+    return proposal_table_values({**p, 'amount': None, 'amount_auto': True, 'quantity_value': None, 'quantity_auto': True})
+
+
 def _same_number(a: Any, b: Any) -> bool:
     x, y = _num_or_none(a), _num_or_none(b)
     if x is None or y is None:
@@ -449,7 +469,8 @@ def proposal_from_row(p: dict, row: dict, label_to_ctype: dict) -> dict:
     """
     ctype = label_to_ctype.get(_clean(row.get('変更の種類')), p.get('change_type') or 'spec')
     proposed = _clean(row.get('変更後の内容'))
-    init = proposal_table_values(p)
+    # 比べる基準は「元の文から自動で読んだ値」。全て選択で保存した利用者の数字は、ここと違うので利用者の数字として残る
+    init = _auto_table_values(p)
     if ctype == 'quantity':
         val = _num_or_none(row.get('数量'))
         init_val = init['数量'] if p.get('change_type') == 'quantity' else None
@@ -998,9 +1019,11 @@ def design_item_to_new_item(sg: dict, cat_no: int, quantity: Any, tanka_rows: li
 def _andpad_hint(sg: dict, tanka_rows: list | None, design_rows: list | None) -> dict:
     """ANDPADの振り分けの手がかり。
 
-    順番: アプリの明細コードそのもの → 取付費・手間・工事費の行は「工」 → 設計部マスタの内訳①②（材・工）
-    → アプリの単価マスタで名称がほぼ同じ明細（0.9以上で、2番目と0.05以上の差・単位も一致）。
-    名称が近いだけの明細の振り分けを使うと、取付費が材料になることがあった（2026-11-12 反証）。
+    順番: アプリの明細コードそのもの → 取付費・手間・工事費の行は「工」
+    → アプリの単価マスタで名称がほぼ同じ明細（0.9以上・単位も一致。上位2件の発注先が違うときだけ0.05以上の差を求める）
+    → 設計部マスタの内訳①②（材・工の比率）。
+    名称が近いだけの明細で取付費が材料になる（反証2回目）、名称が一致するのに内訳を先に見て発注先を失う
+    （反証3回目）の両方を避ける順番（2026-11-12）。
     """
     try:
         from andpad_converter import VENDOR_MAPPING
@@ -1012,37 +1035,47 @@ def _andpad_hint(sg: dict, tanka_rows: list | None, design_rows: list | None) ->
     name = _clean(sg.get('name'))
     if _clean(sg.get('cost_kind')) in ('工事費', '工') or re.search(r'取付費|取付け費|手間|施工費|工賃|設置費', name):
         return {'andpad_mapping': {'vendor': '', 'kind': '工'}}
+    if tanka_rows:
+        try:
+            import master_lookup
+            cands = master_lookup.suggest_similar(name, _clean(sg.get('summary')), tanka_rows, top_n=3)
+        except Exception:  # noqa: BLE001
+            cands = []
+        cands = [c for c in cands if _clean(c.get('code')).isdigit() and int(_clean(c.get('code'))) in VENDOR_MAPPING]
+        if cands:
+            best = cands[0]
+
+            def _vk(c):
+                m = VENDOR_MAPPING.get(int(_clean(c.get('code')))) or {}
+                return (m.get('vendor'), m.get('kind'))
+            close_rival = (len(cands) > 1 and best['score'] - cands[1]['score'] < 0.05 and _vk(cands[1]) != _vk(best))
+            # 近い候補（0.15以内）がすべて同じ発注先なら、0.85以上でもその発注先にする（UB 1618 → UB 1616 のシステムバス）
+            same_family = all(_vk(c) == _vk(best) for c in cands if best['score'] - c['score'] < 0.15)
+            unit_ok = (not _clean(sg.get('unit')) or not _clean(best.get('unit'))
+                       or unicodedata.normalize('NFKC', _clean(sg.get('unit')))
+                       == unicodedata.normalize('NFKC', _clean(best.get('unit'))))
+            score = best.get('score', 0)
+            if unit_ok and ((score >= 0.9 and not close_rival) or (score >= 0.85 and same_family)):
+                return {'andpad_code': int(_clean(best.get('code')))}
     parts = design_breakdown_rows(design_rows, code) if (design_rows and code) else []
     if parts:
         def _amt(r):
             try:
-                return max(int(r.get('order_price') or 0), 0)
+                return int(r.get('order_price') or 0)
             except (TypeError, ValueError):
                 return 0
-        total = sum(_amt(r) for r in parts)
-        labor = sum(_amt(r) for r in parts
+        # 分母は親の発注単価（内訳の符号付きの合計）。＜標準差額＞のマイナス行を0円にすると工が少なく出る
+        try:
+            total = int(sg.get('order_price') or 0) or sum(_amt(r) for r in parts)
+        except (TypeError, ValueError):
+            total = sum(_amt(r) for r in parts)
+        labor = sum(max(_amt(r), 0) for r in parts
                     if '[工]' in _clean(r.get('name')) or _clean(r.get('cost_kind')) in ('工事費', '工'))
         if total > 0 and 0 < labor < total:
             return {'andpad_mapping': {'vendor': '', 'kind': '材',
                                        'parts': [{'vendor': '', 'kind': '工', 'ratio': labor / total, 'note': '施工費分'}]}}
-        if total > 0 and labor == total:
+        if total > 0 and labor >= total:
             return {'andpad_mapping': {'vendor': '', 'kind': '工'}}
-    if tanka_rows:
-        try:
-            import master_lookup
-            cands = master_lookup.suggest_similar(name, _clean(sg.get('summary')), tanka_rows, top_n=2)
-        except Exception:  # noqa: BLE001
-            cands = []
-        if cands:
-            best = cands[0]
-            second = cands[1]['score'] if len(cands) > 1 else 0.0
-            unit_ok = (not _clean(sg.get('unit')) or not _clean(best.get('unit'))
-                       or unicodedata.normalize('NFKC', _clean(sg.get('unit')))
-                       == unicodedata.normalize('NFKC', _clean(best.get('unit'))))
-            bcode = _clean(best.get('code'))
-            if (best.get('score', 0) >= 0.9 and best['score'] - second >= 0.05 and unit_ok
-                    and bcode.isdigit() and int(bcode) in VENDOR_MAPPING):
-                return {'andpad_code': int(bcode)}
     return {}
 
 
@@ -1234,39 +1267,47 @@ def withdrawn_note_keys(old_notes: dict | None, new_notes: dict | None) -> list[
 
 # 設計部マスタの「種別」（可動棚・キッチン・サッシ…）から見積の工事種別を決めるための対応
 _DESIGN_CATEGORY_HINTS = [
-    # 品名・種別の手がかり → 工事種別名に含まれる語。上ほど優先（短い語が別の種別名に含まれる誤判定を避ける）
-    (('太陽光', 'ソーラー', 'ｿｰﾗｰ', 'パワコン'), '太陽光'),
-    (('蓄電池', 'ドアホン', 'ﾄﾞｱﾎﾝ', 'インターホン', 'ｲﾝﾀｰﾎﾝ', 'カメラ', 'ｶﾒﾗ', 'モニター', 'ﾓﾆﾀｰ', '電気', '照明',
-      'コンセント', 'ｺﾝｾﾝﾄ', 'スイッチ', 'ｽｲｯﾁ', 'LAN', 'テレビ', 'ﾃﾚﾋﾞ', '分電盤', 'EV充電'), '電気'),
-    (('エアコン', 'ｴｱｺﾝ'), 'エアコン'),
+    # 品名・種別の手がかり → 工事種別名に含まれる語。上ほど優先（短い語が別の種別名に含まれる誤判定を避ける）。
+    # 行き先は実績8物件とアプリの単価マスタに合わせる（可動棚=内部建具、カウンター=造作家具、ニッチ・階段・床材=木工）
+    (('太陽光', 'ソーラー', 'パワコン'), '太陽光'),
+    (('カーテンBOX', 'カーテンボックス', '折上げ', '折上', '間接照明', 'ニッチ', '枕棚', '框', '階段', 'フローリング',
+      '無垢床', '床材', '窓枠', '造作', '大工', '木工', '下地'), '木工'),
+    (('カウンター', '家具'), '造作家具'),
+    (('物干', '床下点検', '点検口', '雑工事'), '雑工事'),
+    (('蓄電池', 'ドアホン', 'インターホン', 'カメラ', 'モニター', '電気', '照明', 'コンセント', 'スイッチ', 'LAN',
+      'テレビ', '分電盤', 'EV充電'), '電気'),
+    (('エアコン',), 'エアコン'),
     (('換気',), '換気'),
-    (('屋根', '瓦', '葺', 'ルーフィング', 'ﾙｰﾌｨﾝｸﾞ'), '屋根'),
+    (('屋根', '瓦', '葺', 'ルーフィング'), '屋根'),
     (('樋', '板金', '水切'), '板金'),
-    (('畳', 'クロス', 'ｸﾛｽ', 'フローリング', 'ﾌﾛｰﾘﾝｸﾞ', 'クッションフロア', 'ｸｯｼｮﾝﾌﾛｱ', '内装'), '内装'),
-    (('キッチン', 'ｷｯﾁﾝ', 'UB', 'ユニットバス', 'ﾕﾆｯﾄﾊﾞｽ', 'トイレ', 'ﾄｲﾚ', '洗面', '給湯', 'エコキュート', 'ｴｺｷｭｰﾄ',
-      '住宅設備', 'カップボード', 'ｶｯﾌﾟﾎﾞｰﾄﾞ', '乾燥機', '食洗機', 'コンロ', 'ｺﾝﾛ', 'レンジフード'), '住宅設備'),
-    (('給排水', '配管', '洗濯パン', '洗濯ﾊﾟﾝ', '水栓', '散水'), '給排水'),
-    (('家具',), '造作家具'),
-    (('サッシ', 'ｻｯｼ', '玄関', '窓', '外部建具', 'シャッター', 'ｼｬｯﾀｰ', '網戸'), '外部建具'),
-    (('可動棚', '棚', 'カウンター', 'ｶｳﾝﾀｰ', '収納', '内部建具', 'ドア', 'ﾄﾞｱ', '建具', '引戸', '引込', '片開', '片引',
-      '折戸', 'クローゼット', 'ｸﾛｰｾﾞｯﾄ', 'アウトセット', 'ｱｳﾄｾｯﾄ'), '内部建具'),
-    (('外壁', 'サイディング', 'ｻｲﾃﾞｨﾝｸﾞ', '外装'), '外装'),
+    (('畳', 'クロス', 'クッションフロア', '内装'), '内装'),
+    # 建具は「トイレ」「洗面」を含む名前（引込み戸トイレ・中折れドア 洗面タイプ）でも建具
+    (('サッシ', '玄関ドア', '勝手口', '窓', '外部建具', 'シャッター', '網戸'), '外部建具'),
+    (('引込み戸', '引込戸', '片引戸', '片引き戸', '引戸', '引き戸', '開き戸', '中折れ', '折戸', 'アウトセット', 'ハイドア',
+      '内部建具', '建具'), '内部建具'),
+    (('キッチン', 'UB', 'ユニットバス', 'トイレ', '洗面', '給湯', 'エコキュート', '住宅設備', 'カップボード', '乾燥機',
+      '食洗機', 'コンロ', 'レンジフード'), '住宅設備'),
+    (('給排水', '配管', '洗濯パン', '水栓', '散水'), '給排水'),
+    (('玄関', 'スマートロック'), '外部建具'),
+    (('可動棚', '棚', '収納', 'ドア', '片開', 'クローゼット'), '内部建具'),
+    (('外壁', 'サイディング', '外装'), '外装'),
     (('塗装',), '塗装'),
     (('断熱',), '断熱'),
-    (('階段', '造作', '大工', '木工', '下地'), '木工'),
-    (('左官', 'モルタル', 'ﾓﾙﾀﾙ'), '左官'),
-    (('タイル', 'ﾀｲﾙ'), 'タイル'),
+    (('左官', 'モルタル'), '左官'),
+    (('タイル',), 'タイル'),
     (('基礎',), '基礎'),
-    (('デッキ', 'ﾃﾞｯｷ', 'カーポート', 'ｶｰﾎﾟｰﾄ', '外構', 'フェンス', 'ﾌｪﾝｽ', '屋外'), '屋外付帯'),
+    (('デッキ', 'カーポート', '外構', 'フェンス', '屋外'), '屋外付帯'),
     (('仮設', '足場'), '仮設'),
 ]
 
 
-def design_category_no(sg: dict, categories: list, default: int = 21) -> int:
-    """単価マスタの項目を見積のどの工事種別に入れるか（分類 → 種別 → 品名の手がかり → 雑工事）。
+def design_category_no(sg: dict, categories: list, default: int = 21, tanka_rows: list | None = None) -> int:
+    """単価マスタの項目を見積のどの工事種別に入れるか。
 
-    本番の設計部マスタの「種別」は 可動棚・キッチン・サッシ などで工事種別名と一致しないため、
-    追加先の初期値が『1. 仮設工事』になっていた（2026-11-12 反証）。
+    順番: アプリの単価マスタに名称がほぼ同じ明細（0.9以上）があればその工事種別 → 種別名が工事種別名と一致
+    → 種別・品名の手がかり → 分類（6.内装オプション工事 など）→ 分類の手がかり → 雑工事。
+    本番の設計部マスタの分類は「内装オプション工事」のように大きく、可動棚・カウンター・ニッチまで
+    内装工事になっていたため、分類は最後に使う（2026-11-12 反証）。
     """
     from excel_diff import _normalize_name
     pairs = [(int(no), _clean(name)) for no, name in (categories or []) if _clean(name)]
@@ -1282,19 +1323,42 @@ def design_category_no(sg: dict, categories: list, default: int = 21) -> int:
                 return no
         for no, name in pairs:
             nn = _normalize_name(name)
-            if nn and (t in nn or nn in t) and len(t) >= 2:
+            # 2文字の語（造作・内装）は別の工事種別名の一部に当たりやすい（造作→造作家具工事）ので3文字以上だけ
+            if nn and (t in nn or nn in t) and len(t) >= 3:
                 return no
         return None
-    for text in (sg.get('group'), sg.get('category')):
-        no = _find(text or '')
-        if no is not None:
-            return no
-    hay = f"{_clean(sg.get('group'))} {_clean(sg.get('category'))} {_clean(sg.get('name'))}"
-    for words, target in _DESIGN_CATEGORY_HINTS:
-        if any(w in hay for w in words):
-            for no, name in pairs:
-                if target in name:
-                    return no
+
+    def _hint(text: str):
+        hay = unicodedata.normalize('NFKC', text)
+        for words, target in _DESIGN_CATEGORY_HINTS:
+            if any(unicodedata.normalize('NFKC', w) in hay for w in words):
+                for no, name in pairs:
+                    if target in name:
+                        return no
+        return None
+    if tanka_rows and _clean(sg.get('name')):
+        try:
+            import master_lookup
+            best = next(iter(master_lookup.suggest_similar(_clean(sg.get('name')), _clean(sg.get('summary')),
+                                                           tanka_rows, top_n=1)), None)
+        except Exception:  # noqa: BLE001
+            best = None
+        if best and best.get('score', 0) >= 0.9:
+            no = _find(best.get('category') or '')
+            if no is not None:
+                return no
+    no = _find(sg.get('category') or '')
+    if no is not None:
+        return no
+    no = _hint(f"{_clean(sg.get('category'))} {_clean(sg.get('name'))}")
+    if no is not None:
+        return no
+    no = _find(sg.get('group') or '')
+    if no is not None:
+        return no
+    no = _hint(_clean(sg.get('group')))
+    if no is not None:
+        return no
     return default if any(no == default for no, _ in pairs) else pairs[0][0]
 
 
@@ -1310,3 +1374,99 @@ def is_design_header_row(r: dict) -> bool:
 def design_vocabulary(rows: list | None) -> list:
     """類似候補に使う行（内訳行と0円の見出し行を除く）"""
     return [r for r in rows or [] if isinstance(r, dict) and not _clean(r.get('breakdown_of')) and not is_design_header_row(r)]
+
+
+def split_legacy_note(notes: dict | None, category: Any, name: Any, summaries) -> dict:
+    """旧形式『工事種別|品名』の理由を、その品名の各行の『工事種別|品名|摘要』へ移した新しい辞書を返す。
+
+    ドリルダウンで1行だけ登録し直したとき、旧キーが表から見えないまま残って
+    取り下げが止まる・古い理由が戻る、を防ぐ（2026-11-12 反証）。すでに新しいキーがある行はそのまま。
+    """
+    out = dict(notes or {})
+    legacy = f"{_clean(category)}|{_clean(name)}"
+    if legacy not in out:
+        return out
+    val = out.pop(legacy)
+    for sm in summaries or ['']:
+        k = special_note_key(category, name, sm)
+        if k not in out and isinstance(val, dict):
+            out[k] = dict(val)
+    return out
+
+
+def apply_note_table(notes: dict | None, rows: list | None, all_row_keys, now: str) -> tuple[dict, list]:
+    """差異理由の表の保存。新しい差異理由の辞書と、ライブラリへ入れる候補を返す。
+
+    rows: 表に出ていた行（'_key' は読んだキー）。all_row_keys: 表の全行（絞り込みで隠れた行も）が読んだキー。
+    - 旧形式（品名だけ）のキーを読んでいた行は、その行の『工事種別|品名|摘要』へ書き分ける
+      （同じ品名の2行目の編集が捨てられていた。2026-11-12 反証）。旧キーは、読んでいた行が全部表に出ていたときだけ消す
+    - 同じキーの行が複数あるときは、読み込んだ値から変わった行を優先する
+    """
+    from collections import Counter
+    new = dict(notes or {})
+    loaded = dict(notes or {})
+    readers = Counter(all_row_keys or [])
+    groups: dict[str, list] = {}
+    shown_legacy = Counter()
+    for r in rows or []:
+        key = _clean(r.get('_key')) or special_note_key(r.get('工事種別'), r.get('品名'), r.get('摘要'))
+        if not is_summary_note_key(key):
+            shown_legacy[key] += 1
+            key = special_note_key(r.get('工事種別'), r.get('品名'), r.get('摘要'))
+        groups.setdefault(key, []).append((r, _clean(r.get('_key')) or key))
+
+    def _vals(r):
+        cat = _clean(r.get('分類'))
+        scope = ('project' if cat == PROJECT_SPECIFIC_CATEGORY or _clean(r.get('適用範囲')) == NOTE_SCOPE_PROJECT
+                 else 'global')
+        return cat, _clean(r.get('差異の理由')), scope
+
+    entries = []
+    for key, items in groups.items():
+        def _changed(item):
+            r, src = item
+            old = loaded.get(src) or {}
+            cat, reason, scope = _vals(r)
+            return (cat, reason) != (_clean(old.get('category')), _clean(old.get('reason'))) or (
+                (cat or reason) and scope != (old.get('scope') or 'global'))
+        changed = [it for it in items if _changed(it)]
+        r, _src = (changed or items)[0]
+        cat, reason, scope = _vals(r)
+        if not reason and not cat:
+            new.pop(key, None)
+            continue
+        try:
+            diff = int(r.get('差額') or 0)
+        except (TypeError, ValueError):
+            diff = 0
+        new[key] = {'category': cat, 'reason': reason, 'scope': scope, 'diff': diff, 'updated_at': now}
+        if reason:
+            entries.append({'key': note_library_key(key), 'item': _clean(r.get('品名')), 'category': cat,
+                            'reason': reason, 'diff': diff, 'scope': scope})
+    for lk, n in shown_legacy.items():
+        if readers.get(lk, 0) <= n:
+            new.pop(lk, None)
+    return new, entries
+
+
+def detail_row_note_target(row: dict) -> tuple[str, str]:
+    """明細の1行を差異理由・案件特有・除外に登録するときの (品名, 摘要)。AI側があればAI側（差異理由の表と同じ）"""
+    if _clean(row.get('AI品名')):
+        return _clean(row.get('AI品名')), _clean(row.get('AI摘要'))
+    return _clean(row.get('実績品名')), _clean(row.get('実績摘要'))
+
+
+def split_legacy_for_rows(notes: dict | None, category: Any, row: dict, detail_rows: list | None) -> dict:
+    """登録しようとしている行の品名（AI名・実績名）に旧形式の理由があれば、その種別の同じ品名の各行へ移す"""
+    out = dict(notes or {})
+    rows = [r for r in detail_rows or [] if isinstance(r, dict)]
+    for nm in {_clean(row.get('AI品名')), _clean(row.get('実績品名'))} - {''}:
+        sums = []
+        for r in rows:
+            tn, ts = detail_row_note_target(r)
+            if tn == nm:
+                sums.append(ts)
+            elif _clean(r.get('実績品名')) == nm:
+                sums.append(_clean(r.get('実績摘要')))   # 名称の違う組（同じ商品）の実績側。扱いの表示が実績側で引くため
+        out = split_legacy_note(out, category, nm, sums or [''])
+    return out

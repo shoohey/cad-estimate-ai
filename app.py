@@ -42,7 +42,8 @@ from ui_helpers import (proposal_number,
                         proposal_value, withdrawn_note_keys, special_note_key, parse_special_note_key,
                         proposal_delta, proposal_table_values, proposal_from_row,
                         is_summary_note_key, note_library_key, resolve_note_key, library_keys_to_withdraw,
-                        find_feedback_index, clean_editor_records, pdf_floor_areas,
+                        find_feedback_index, clean_editor_records, pdf_floor_areas, apply_note_table, split_legacy_note,
+                        detail_row_note_target, split_legacy_for_rows,
                         design_category_no, design_vocabulary,
                         category_detail_rows, detail_kind_counts, detail_header,
                         DETAIL_KIND_DIFF, DETAIL_KIND_AI_ONLY, DETAIL_KIND_ACTUAL_ONLY,
@@ -3435,7 +3436,8 @@ def main():
                     dm_bd = design_breakdown_rows(design_rows_all, dm_sel.get('code'))
                     if dm_bd:
                         st.caption("内訳: " + " / ".join(f"{b['name']}（{int(b.get('estimate_price') or 0):,}円）" for b in dm_bd))
-                    dm_cat_no = design_category_no(dm_sel, [(c.no, c.name) for c in estimate_base.categories if c.no != 22])
+                    dm_cat_no = design_category_no(dm_sel, [(c.no, c.name) for c in estimate_base.categories if c.no != 22],
+                                                   tanka_rows=tanka_master_rows(csv_path))
                     dm_default = next((i for i, o in enumerate(mod_cat_options) if int(o.split(".")[0]) == dm_cat_no), 0)
                     dm3, dm4, dm5 = st.columns([2, 1, 1])
                     # 項目を選び直したら追加先も選び直されるよう、キーは項目ごとに変える
@@ -4279,7 +4281,7 @@ def main():
                                                           disabled=not sg.get('estimate_price')):
                                                 cat_pairs = [(c.no, c.name) for c in estimate_base.categories]
                                                 ai_cat = next((c for c in estimate_base.categories if c.name == cd['name']), None)
-                                                cat_no = ai_cat.no if ai_cat else design_category_no(sg, cat_pairs)
+                                                cat_no = ai_cat.no if ai_cat else design_category_no(sg, cat_pairs, tanka_rows=tanka_rows)
                                                 ni = design_item_to_new_item(sg, cat_no, d_qty, tanka_rows=tanka_rows,
                                                                              design_rows=design_rows)
                                                 mods.setdefault('new_items', []).append(ni)
@@ -4356,9 +4358,11 @@ def main():
                                         new_notes = dict(proj_notes)
                                         lib_entries = []
                                         for r in rows_sel:
-                                            nm = special_note_name(r)
-                                            sm = (r.get('実績摘要') if r.get('実績品名') else r.get('AI摘要')) or ''
-                                            key = special_note_key(cd['name'], nm, sm)   # 摘要まで含めて同じ品名の別の行と区別
+                                            # 旧形式（品名だけ）の理由は同じ品名の各行へ移してから登録する（書いた理由を引き継ぐ・
+                                            # 見えない旧キーが残って取り下げが止まるのを防ぐ。2026-11-12 反証）
+                                            new_notes = split_legacy_for_rows(new_notes, cd['name'], r, detail_rows)
+                                            nm, sm = detail_row_note_target(r)   # 差異理由の表と同じキー（AI側があればAI側）
+                                            key = special_note_key(cd['name'], nm, sm)
                                             prev = new_notes.get(key, {})
                                             new_notes[key] = {
                                                 'category': PROJECT_SPECIFIC_CATEGORY,
@@ -4400,8 +4404,8 @@ def main():
                                         new_notes = dict(proj_notes)
                                         lib_entries = []
                                         for r in rows_sel:
-                                            nm = (r.get('AI品名') or r.get('実績品名') or '').strip()
-                                            sm = (r.get('AI摘要') if r.get('AI品名') else r.get('実績摘要')) or ''
+                                            new_notes = split_legacy_for_rows(new_notes, cd['name'], r, detail_rows)
+                                            nm, sm = detail_row_note_target(r)
                                             key = special_note_key(cd['name'], nm, sm)
                                             new_notes[key] = {
                                                 'category': EXCLUDED_CATEGORY, 'reason': reason_text, 'scope': scope,
@@ -4540,46 +4544,35 @@ def main():
                     )
                     if st.button("差異の理由を保存して学習させる", type="primary",
                                  key="save_diff_notes"):
-                        new_notes = dict(notes)
-                        lib_entries = []
-                        # 同じキーの行が複数あるとき（旧形式の品名だけの登録）は、理由の入った最初の行を使う
-                        # （後ろの空の行で消さない）
-                        rows_by_key = {}
-                        for _, row in edited.iterrows():
-                            key = row.get('_key') or special_note_key(row['工事種別'], row['品名'], row.get('摘要', ''))
-                            filled = bool((row.get('差異の理由') or '').strip() or (row.get('分類') or '').strip())
-                            if key not in rows_by_key or (filled and not rows_by_key[key][1]):
-                                rows_by_key[key] = (row, filled)
-                        for key, (row, _filled) in rows_by_key.items():
-                            reason = (row.get('差異の理由') or '').strip()
-                            category = (row.get('分類') or '').strip()
-                            if not reason and not category:
-                                new_notes.pop(key, None)
-                                continue
-                            # 案件特有の分類は常に「この案件のみ」。それ以外は選択に従う
-                            scope = ('project' if category == PROJECT_SPECIFIC_CATEGORY
-                                     or (row.get('適用範囲') or '') == NOTE_SCOPE_PROJECT else 'global')
-                            new_notes[key] = {
-                                'category': category, 'reason': reason, 'scope': scope,
-                                'diff': int(row['差額']),
-                                'updated_at': now_jst().strftime('%Y-%m-%d %H:%M'),
-                            }
-                            if reason:
-                                lib_entries.append({
-                                    'key': note_library_key(key), 'item': row['品名'],
-                                    'category': category, 'reason': reason,
-                                    'property': prop_name, 'diff': int(row['差額']),
-                                    'scope': scope,
-                                })
+                        # 旧形式（品名だけ）のキーを読んでいた行は、その行の『工事種別|品名|摘要』へ書き分ける。
+                        # 同じキーの行が複数あるときは、読み込んだ値から変わった行を優先する（2026-11-12 反証）
+                        new_notes, raw_entries = apply_note_table(
+                            notes, edited.to_dict('records'), [r['_key'] for r in note_rows],
+                            now_jst().strftime('%Y-%m-%d %H:%M'))
+                        lib_entries = [{**e, 'property': prop_name} for e in raw_entries]
                         save_project_diff_notes(current_pid, new_notes)
                         # 理由を消した行・「この案件のみ」に変えた行は、他案件の参考（ライブラリ）からも外す
-                        withdrawn = library_keys_to_withdraw(withdrawn_note_keys(notes, new_notes), new_notes)
+                        withdrawn_proj = withdrawn_note_keys(notes, new_notes)
+                        withdrawn = library_keys_to_withdraw(withdrawn_proj, new_notes)
                         if withdrawn:
                             st.session_state.pop('_diff_lib', None)
                             lib_now = load_diff_reason_library()
                             lib_new = diff_library_remove(lib_now, withdrawn, prop_name)
                             if lib_new != lib_now:
                                 save_diff_reason_library(lib_new)
+                        # 同じ品名の別の行に理由が残っていて取り下げなかった項目は、残っている理由で書き直す
+                        # （取り下げた文が他案件の参考に残らないように）
+                        kept_lib = {note_library_key(k) for k in withdrawn_proj} - set(withdrawn)
+                        have = {e['key'] for e in lib_entries}
+                        for k, v in new_notes.items():
+                            lk = note_library_key(k)
+                            if (lk in kept_lib and lk not in have and isinstance(v, dict) and v.get('reason')
+                                    and v.get('scope') != 'project'):
+                                lib_entries.append({'key': lk, 'item': parse_special_note_key(k)[1],
+                                                    'category': v.get('category', ''), 'reason': v['reason'],
+                                                    'property': prop_name, 'diff': int(v.get('diff') or 0),
+                                                    'scope': 'global'})
+                                have.add(lk)
                         update_diff_reason_library([e for e in lib_entries if e.get('scope') != 'project'])
                         append_project_changelog(
                             current_pid, '実績取込',
@@ -5246,7 +5239,7 @@ def main():
                     qty = float(b.get('count') or 1)
                 except (TypeError, ValueError):
                     qty = 1.0
-                ni = design_item_to_new_item(sg, design_category_no(sg, cat_pairs_case), qty,
+                ni = design_item_to_new_item(sg, design_category_no(sg, cat_pairs_case, tanka_rows=tanka_master_rows(csv_path)), qty,
                                              tanka_rows=tanka_master_rows(csv_path),
                                              design_rows=load_design_master().get('rows') or [])
                 ni['built_in_key'] = f"{b.get('name')}|{b.get('spec')}|{b.get('location')}"
