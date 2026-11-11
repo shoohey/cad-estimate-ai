@@ -36,6 +36,7 @@ from ui_helpers import (proposal_number,
                         normalize_fb_status, fb_status_color, validate_fb_status_change,
                         apply_fb_status_change, ACTIVE_FB_STATUSES, fb_is_archived,
                         partition_feedbacks, fb_timeline_text, release_log_rows,
+                        alias_library_add, alias_library_remove, alias_library_set_scope, diff_library_remove,
                         category_detail_rows, detail_kind_counts, detail_header,
                         DETAIL_KIND_DIFF, DETAIL_KIND_AI_ONLY, DETAIL_KIND_ACTUAL_ONLY,
                         DETAIL_KIND_SAME, make_alias_entry, alias_pairs_from_library,
@@ -2076,8 +2077,14 @@ def load_diff_reason_library() -> dict:
 ITEM_ALIAS_KEY = "item_alias_library"   # 「同じ商品」の名寄せ辞書（全案件横断・案件特有分も同居）
 
 
-def load_item_alias_library() -> list:
-    """利用者が登録した「AI明細 ⇔ 実績明細 は同じ商品」の辞書を読み込む"""
+def load_item_alias_library(fresh: bool = False) -> list:
+    """利用者が登録した「AI明細 ⇔ 実績明細 は同じ商品」の辞書を読み込む。
+
+    fresh=True はセッションのキャッシュを使わずに読み直す（登録・解除の保存直前に使い、
+    その間に別の担当者が登録した組を消さないようにする。2026-11-12 監査）。
+    """
+    if fresh:
+        st.session_state.pop('_alias_lib', None)
     if '_alias_lib' in st.session_state:
         return st.session_state['_alias_lib']
     result = None
@@ -2272,6 +2279,19 @@ def master_vocabulary(csv_path: str) -> list:
             rows = []
         st.session_state['_tanka_master_rows'] = rows
     return st.session_state['_tanka_master_rows']
+
+
+def save_diff_reason_library(lib: dict):
+    """差異理由ライブラリを丸ごと保存する（理由の取り消しに使う）"""
+    st.session_state['_diff_lib'] = lib
+    path = os.path.join(PROJECTS_DIR, "diff_reason_library.json")
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(lib, f, ensure_ascii=False, indent=2)
+    if _cloud_ok():
+        try:
+            cloud_store.put(DIFF_LIBRARY_KEY, lib)
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
 
 
 def update_diff_reason_library(entries: list):
@@ -3898,9 +3918,11 @@ def main():
 
             if st.button("最新の内容に更新", key="reload_actual",
                          help="他の担当者が保存した実績見積・差異理由をサーバーから読み直します"):
-                for cache_key in ('_actual_cache', '_diffnote_cache', '_fb_cache'):
+                for cache_key in ('_actual_cache', '_diffnote_cache', '_fb_cache', '_alias_lib', '_design_master',
+                                  '_diff_lib', '_actual_file_cache'):
                     st.session_state.pop(cache_key, None)
-                st.session_state.pop('_diff_lib', None)
+                for cache_key in [k for k in st.session_state.keys() if str(k).startswith('_store_')]:
+                    st.session_state.pop(cache_key, None)
                 _flash("サーバーの最新内容を読み込みました。")
                 st.rerun()
 
@@ -4038,7 +4060,8 @@ def main():
                                 st.markdown(
                                     "**同じ商品の登録**: 下の表で「AIにしかない」1件と「実績にしかない」1件に"
                                     "チェックして登録すると、次回から自動で突き合わせます。")
-                                reg_cols = ('区分', '扱い', 'AI品名', 'AI摘要', 'AI金額', '実績品名', '実績摘要', '実績金額')
+                                reg_cols = ('区分', '扱い', 'AI品名', 'AI摘要', 'AI金額', '実績品名', '実績摘要', '実績金額',
+                                            '差額(AI−実績)')
                                 reg_df = pd.DataFrame([{'選択': False, **{k: r[k] for k in reg_cols}}
                                                        for r in reg_rows])
                                 edited_reg = st.data_editor(
@@ -4064,11 +4087,11 @@ def main():
                                             ai_row, ac_row, cd['name'], alias_prop_name,
                                             now_jst().strftime('%Y-%m-%d %H:%M'), scope=scope,
                                             project_id=current_pid)
-                                        if alias_entry_exists(alias_lib, entry):
+                                        latest_lib, added = alias_library_add(load_item_alias_library(fresh=True), entry)
+                                        if not added:
                                             _flash("この組み合わせは登録済みです。", "info")
                                         else:
-                                            alias_lib.append(entry)
-                                            save_item_alias_library(alias_lib)
+                                            save_item_alias_library(latest_lib)
                                             append_project_changelog(
                                                 current_pid, '実績取込',
                                                 f"同じ商品として登録: {entry['ai_name']} ⇔ {entry['actual_name']}"
@@ -4113,11 +4136,11 @@ def main():
                                                     {'AI品名': sg['name'], 'AI摘要': sg.get('summary', '')}, ac_sel[0],
                                                     cd['name'], alias_prop_name, now_jst().strftime('%Y-%m-%d %H:%M'),
                                                     scope=scope, project_id=current_pid)
-                                                if alias_entry_exists(alias_lib, entry):
+                                                latest_lib, added = alias_library_add(load_item_alias_library(fresh=True), entry)
+                                                if not added:
                                                     _flash("この組み合わせは登録済みです。", "info")
                                                 else:
-                                                    alias_lib.append(entry)
-                                                    save_item_alias_library(alias_lib)
+                                                    save_item_alias_library(latest_lib)
                                                     append_project_changelog(
                                                         current_pid, '実績取込',
                                                         f"同じ商品として登録（単価マスタ）: {entry['ai_name']} ⇔ {entry['actual_name']}"
@@ -4220,14 +4243,14 @@ def main():
                             f"登録元: {_html.escape(e.get('property', ''))}</span>", unsafe_allow_html=True)
                         if ac2.button("全案件共通に変更" if is_project else "この案件のみに変更",
                                       key=f"alias_scope_toggle_{i}"):
-                            alias_lib[i] = {**e, 'scope': ALIAS_SCOPE_GLOBAL if is_project else ALIAS_SCOPE_PROJECT,
-                                            'project_id': e.get('project_id') or current_pid}
-                            save_item_alias_library(alias_lib)
+                            save_item_alias_library(alias_library_set_scope(
+                                load_item_alias_library(fresh=True), e,
+                                ALIAS_SCOPE_GLOBAL if is_project else ALIAS_SCOPE_PROJECT, current_pid))
                             _flash("適用範囲を変更しました。")
                             st.rerun()
                         if ac3.button("解除", key=f"alias_del_{i}"):
-                            alias_lib.pop(i)
-                            save_item_alias_library(alias_lib)
+                            # 並び順ではなく中身で特定して消す（その間に他の登録が増えても別の組を消さない）
+                            save_item_alias_library(alias_library_remove(load_item_alias_library(fresh=True), e))
                             _flash("同じ商品の登録を解除しました。")
                             st.rerun()
 
@@ -4340,7 +4363,15 @@ def main():
                                     'scope': scope,
                                 })
                         save_project_diff_notes(current_pid, new_notes)
-                        update_diff_reason_library(lib_entries)
+                        # 理由を消した行・「この案件のみ」に変えた行は、他案件の参考（ライブラリ）からも外す
+                        withdrawn = [k for k in notes if k not in new_notes] + [
+                            k for k, v in new_notes.items() if isinstance(v, dict) and v.get('scope') == 'project']
+                        if withdrawn:
+                            lib_now = load_diff_reason_library()
+                            lib_new = diff_library_remove(lib_now, withdrawn, prop_name)
+                            if lib_new != lib_now:
+                                save_diff_reason_library(lib_new)
+                        update_diff_reason_library([e for e in lib_entries if e.get('scope') != 'project'])
                         append_project_changelog(
                             current_pid, '実績取込',
                             f"差異理由を{len(lib_entries)}件登録（学習データへ蓄積）")
@@ -4840,7 +4871,7 @@ def main():
                         '適用範囲': ALIAS_SCOPE_LABEL.get(e.get('scope'), '全案件共通')} for e in entries_a[:100]]),
                         use_container_width=True, hide_index=True, height=240)
                     if st.button("この対応表を「同じ商品」辞書に追加", key="btn_merge_alias_table", type="primary"):
-                        new_lib, added = master_lookup.merge_alias_entries(alias_lib_m, entries_a)
+                        new_lib, added = master_lookup.merge_alias_entries(load_item_alias_library(fresh=True), entries_a)
                         save_item_alias_library(new_lib)
                         append_project_changelog(current_pid, '実績取込', f"対応表を取込: {added}件を同じ商品辞書に追加")
                         _flash(f"対応表から {added} 件を辞書に追加しました（重複 {len(entries_a) - added} 件は除外）。")
@@ -5325,7 +5356,8 @@ def main():
         st.markdown(
             "- 送信されたフィードバックは **案件ごとにサーバー上のファイルに保存** されます（ブラウザを閉じても消えません）\n"
             "- 開発チームがフィードバックを確認し、**単価マスタの修正・計算ロジックの改善・画面変更** などをシステムに反映します\n"
-            "- 対応状況はこの画面で確認できます（未対応 → 対応済み）\n"
+            "- 対応状況はこの画面で確認できます（未対応 → 着手中 → 高井対応済み → 対応完了／差し戻し）\n"
+            "- 対応完了になったものはアーカイブに移り、受付からの経緯をすべて履歴で見られます\n"
             "- 「全案件横断表示」で全案件のフィードバックをまとめて確認できます\n"
             "- フィードバック一覧はCSVでダウンロードして共有することもできます"
         )
@@ -5357,9 +5389,9 @@ def main():
             active_fbs, archived_fbs = partition_feedbacks(display_fbs)
             view_options = [f"対応中（{len(active_fbs)}）", f"アーカイブ・対応完了（{len(archived_fbs)}）", "全て"]
             fb_view = st.radio("表示", view_options, horizontal=True, key="fb_archive_view")
-            st.caption("流れ: 高井が修正したら「高井対応済み」→ ご確認いただき問題なければ「対応完了」、"
-                       "問題があれば「差し戻し」（コメント必須）。対応完了になった問い合わせは"
-                       "アーカイブに残り、いつ何を直したかを後から確認できます。")
+            st.caption("流れ: 高井が取りかかったら「着手中」、修正したら「高井対応済み」（変更箇所を記入）→ "
+                       "ご確認いただき問題なければ「対応完了」、問題があれば「差し戻し」（コメント必須）。"
+                       "対応完了になった問い合わせはアーカイブに残り、受付からの経緯をすべて確認できます。")
             if fb_view.startswith("対応中"):
                 base_fbs = active_fbs
                 status_options = ["全て"] + ACTIVE_FB_STATUSES

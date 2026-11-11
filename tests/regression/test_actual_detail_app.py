@@ -24,7 +24,8 @@ def test_category_drilldown_shows_item_kinds(app_dir):
     assert "円" in h
 
     # 展開内の表には区分列があり、4区分のいずれか
-    tables = [d.value for d in at.dataframe if "区分" in list(d.value.columns) and "差額(AI−実績)" in list(d.value.columns)]
+    tables = [d.value for d in at.dataframe if "区分" in list(d.value.columns) and "差額(AI−実績)" in list(d.value.columns)
+              and "選択" not in list(d.value.columns)]   # 登録用の表（選択列あり）は明細の表ではない
     assert tables, "明細の表が無い"
     kinds = set()
     for t in tables:
@@ -61,7 +62,8 @@ def test_alias_and_project_specific_are_reflected(app_dir):
                                      "scope": "project", "diff": -188485}}, f, ensure_ascii=False)
     at = _boot(app_dir)
     assert not at.exception, [str(e.value) for e in at.exception]
-    tables = [d.value for d in at.dataframe if "区分" in list(d.value.columns) and "差額(AI−実績)" in list(d.value.columns)]
+    tables = [d.value for d in at.dataframe if "区分" in list(d.value.columns) and "差額(AI−実績)" in list(d.value.columns)
+              and "選択" not in list(d.value.columns)]   # 登録用の表（選択列あり）は明細の表ではない
     rows = [r for t in tables for _, r in t.iterrows()]
     roof = [r for r in rows if r["AI品名"] == "SGL鋼板 たてひら葺"]
     assert roof and bool(roof[0]["登録済"]) is True and roof[0]["区分"] == "金額が違う"

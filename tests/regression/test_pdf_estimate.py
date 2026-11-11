@@ -577,7 +577,8 @@ class TestExtractQuantitiesFromPdf:
         too_big = b"%PDF-1.4\n" + b"\0" * ai_client.PDF_MAX_BYTES
         with pytest.raises(AIClientError) as exc:
             ai_client.extract_quantities_from_pdf(too_big, "big.pdf")
-        assert "32MB" in str(exc.value) and "big.pdf" in str(exc.value)
+        # 上限は base64 後のサイズで判定する（元のPDFで約23.8MB。2026-11-12 監査）
+        assert "上限" in str(exc.value) and "big.pdf" in str(exc.value)
         assert fake.calls == []
 
     def test_page_limit(self, monkeypatch, fake_env):

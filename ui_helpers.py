@@ -366,16 +366,20 @@ def fb_timeline(fb: dict) -> dict:
 
 
 def fb_timeline_text(fb: dict) -> str:
-    """カードに出す1行の履歴。例: 受付 08/04 → 高井対応済み 10/26（変更箇所）→ 対応完了 10/27"""
-    t = fb_timeline(fb)
-    parts = [f"受付 {t['received']}" if t['received'] else "受付 -"]
-    if t['returned_at'] and (not t['fixed_at'] or t['returned_at'] > t['fixed_at']):
-        parts.append(f"差し戻し {t['returned_at']}" + (f"（{t['returned_note']}）" if t['returned_note'] else ""))
-    if t['fixed_at']:
-        parts.append(f"高井対応済み {t['fixed_at']}" + (f"（{t['fixed_note']}）" if t['fixed_note'] else ""))
-    if t['done_at']:
-        parts.append(f"対応完了 {t['done_at']}" + (f"（{t['done_note']}）" if t['done_note'] else ""))
-    elif t['legacy']:
+    """カードに出す1行の履歴。受付から今までの変更を、起きた順に全部並べる。
+
+    例: 受付 08/04 → 着手中 10/26（試行中）→ 高井対応済み 10/26（変更箇所）→ 差し戻し 10/27（理由）→ …
+    2026-11-12 監査: 最新の1件ずつしか出さず、着手中や1回目の修正・差し戻しの経緯が見えなかった。
+    """
+    fb = fb or {}
+    received = _clean(fb.get('timestamp'))
+    parts = [f"受付 {received}" if received else "受付 -"]
+    events = [ev for ev in (fb.get('status_history') or []) if isinstance(ev, dict) and _clean(ev.get('status'))]
+    for ev in events:
+        st = normalize_fb_status(ev.get('status'))
+        at, note = _clean(ev.get('at')), _clean(ev.get('note'))
+        parts.append(f"{st} {at}".strip() + (f"（{note}）" if note else ""))
+    if not events and fb_is_archived(fb):
         parts.append("対応完了（以前のデータ・日時記録なし）")
     return " → ".join(parts)
 
@@ -395,6 +399,7 @@ def release_log_rows(fbs: list | None, project_name_of=None) -> list[dict]:
             'カテゴリ': _clean(fb.get('category')),
             '受付': t['received'],
             'ご指摘': _clean(fb.get('body') or fb.get('message'))[:60],
+            '経緯': fb_timeline_text(fb),
         })
     rows.sort(key=lambda r: (r['対応完了'] if r['対応完了'] != '旧データ' else '', r['受付']), reverse=True)
     return rows
@@ -478,7 +483,10 @@ def category_detail_rows(item_diff: dict | None, special_names=None) -> list[dic
                      '実績数量': _qty_text(x.get('quantity'), x.get('unit')), '実績金額': amt,
                      '差額(AI−実績)': -amt, '登録済': False})
     for r in rows:
-        r['扱い'] = special.get(r['実績品名']) or special.get(r['AI品名']) or ''
+        # 案件特有・除外は「AIにしかない／実績にしかない／金額が違う」行に登録するもの。
+        # 同じ品名の「一致」行にまで付けない（2026-11-12 監査）
+        r['扱い'] = '' if r['区分'] == DETAIL_KIND_SAME else (
+            special.get(r['実績品名']) or special.get(r['AI品名']) or '')
     rows.sort(key=lambda r: (DETAIL_KIND_ORDER.index(r['区分']), -abs(r['差額(AI−実績)'])))
     return rows
 
@@ -639,3 +647,57 @@ def validate_alias_selection(selected_rows: list[dict]) -> tuple[str | None, dic
     if len(ai_rows) != 1 or len(ac_rows) != 1:
         return f'「AIにしかない」を1件、「実績にしかない」を1件チェックしてください（現在 AI {len(ai_rows)}件・実績 {len(ac_rows)}件）', None, None
     return None, ai_rows[0], ac_rows[0]
+
+
+# ---------------------------------------------------------------- 共有データの更新（複数人で使っても消えないように）
+def _same_alias(a: dict, b: dict) -> bool:
+    return (isinstance(a, dict) and isinstance(b, dict)
+            and list(a.get('ai_keys') or []) == list(b.get('ai_keys') or [])
+            and list(a.get('actual_keys') or []) == list(b.get('actual_keys') or []))
+
+
+def alias_library_add(latest: list | None, entry: dict) -> tuple[list, bool]:
+    """保存直前に読み直した最新の辞書へ1件足した新しい一覧と、足したかどうかを返す。
+
+    2026-11-12 監査: 画面を開いた時点の古い一覧に足して丸ごと保存していたため、
+    その間に別の担当者が登録した組が消えていた。
+    """
+    lib = [e for e in (latest or []) if isinstance(e, dict)]
+    if any(_same_alias(e, entry) for e in lib):
+        return lib, False
+    return lib + [entry], True
+
+
+def alias_library_remove(latest: list | None, entry: dict) -> list:
+    """最新の辞書から、指定した組（並び順ではなく中身で特定）を取り除いた一覧を返す。"""
+    return [e for e in (latest or []) if isinstance(e, dict) and not _same_alias(e, entry)]
+
+
+def alias_library_set_scope(latest: list | None, entry: dict, scope: str, project_id: str) -> list:
+    """最新の辞書の中で、指定した組の適用範囲だけを変えた一覧を返す。"""
+    out = []
+    for e in latest or []:
+        if not isinstance(e, dict):
+            continue
+        if _same_alias(e, entry):
+            e = {**e, 'scope': scope if scope in ALIAS_SCOPE_LABEL else ALIAS_SCOPE_GLOBAL,
+                 'project_id': _clean(e.get('project_id')) or _clean(project_id)}
+        out.append(e)
+    return out
+
+
+def diff_library_remove(lib: dict | None, keys, property_name: str) -> dict:
+    """差異理由ライブラリから、この案件（property）が登録した理由を取り除いた新しい辞書を返す。
+
+    差異理由を消しても他案件の「過去の理由（参考）」に残り続けていた（2026-11-12 監査）。
+    """
+    out: dict = {}
+    drop = set(keys or [])
+    for key, rec in (lib or {}).items():
+        if key not in drop or not isinstance(rec, dict):
+            out[key] = rec
+            continue
+        entries = [e for e in rec.get('entries', []) if not (isinstance(e, dict) and e.get('property') == property_name)]
+        if entries:
+            out[key] = {**rec, 'entries': entries}
+    return out

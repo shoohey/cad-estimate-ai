@@ -43,7 +43,17 @@ PDF_TIMEOUT_SEC = 300    # PDF図面の数量抽出 (Anthropic・ページ数が
 MAX_TOKENS = 8000
 
 # PDF document ブロックの上限 (Anthropic Messages API の制約)
-PDF_MAX_BYTES = 32 * 1024 * 1024   # 32MB
+PDF_MAX_BYTES = 32 * 1024 * 1024   # 32MB（API のリクエスト全体の上限。互換のため残す）
+PDF_MAX_REQUEST_BYTES = PDF_MAX_BYTES - 256 * 1024   # 指示文などの分を残した、PDF本体（base64）に使える量
+
+
+def _pdf_request_bytes(raw_size: int) -> int:
+    """PDF を base64 にしたときのバイト数（3バイト→4文字）"""
+    return 4 * ((int(raw_size) + 2) // 3)
+
+
+# 元のPDFで送れる上限（base64 にすると約4/3倍になるため、およそ23.8MB）
+PDF_MAX_RAW_BYTES = (PDF_MAX_REQUEST_BYTES // 4) * 3
 PDF_MAX_PAGES = 100
 
 # 変更案スキーマの許容値
@@ -739,10 +749,11 @@ def extract_quantities_from_pdf(pdf_bytes: bytes, filename: str,
     if not pdf_bytes:
         raise AIClientError("PDFデータが空です。")
     size = len(pdf_bytes)
-    if size > PDF_MAX_BYTES:
+    # API の上限はリクエスト全体（base64 後）で決まるので、元のPDFは約23.8MBまでしか送れない（2026-11-12 監査）
+    if _pdf_request_bytes(size) > PDF_MAX_REQUEST_BYTES:
         raise AIClientError(
             f"PDF「{filename}」のサイズが {size / (1024 * 1024):.1f}MB で、"
-            f"上限 {PDF_MAX_BYTES // (1024 * 1024)}MB を超えています。"
+            f"送れる上限（約{PDF_MAX_RAW_BYTES / (1024 * 1024):.0f}MB）を超えています。"
             "必要な図面ページだけに分割するか、解像度を下げて再試行してください。"
         )
     pages = _count_pdf_pages(pdf_bytes)

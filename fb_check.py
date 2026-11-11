@@ -45,7 +45,7 @@ def main():
     for _, st, *_ in rows:
         counts[st] = counts.get(st, 0) + 1
     print("件数:", " / ".join(f"{k}: {v}" for k, v in counts.items()) or "0")
-    todo = [x for x in rows if show_all or x[1] in ("未対応", "差し戻し")]
+    todo = [x for x in rows if show_all or x[1] in ("未対応", "着手中", "差し戻し")]
     if not todo:
         print("対応待ちはありません。")
         return
