@@ -103,8 +103,15 @@ def merge_proposal_edits(proposals: list[dict] | None,
                                                   p.get('change_type'))
         if '変更後の内容' in row:
             p['proposed'] = _clean(row.get('変更後の内容'))
+        init = proposal_table_values(prop) if isinstance(prop, dict) else {'金額(円)': 0, '数量': None}
         if '金額(円)' in row:
             p['amount'] = _to_int_amount(row.get('金額(円)'), p.get('amount'))
+            # 表に自動で入れた初期値のままなら「自動」の印を付け、あとで内容を直したときに読み直す
+            p['amount_auto'] = _same_number(row.get('金額(円)'), init['金額(円)'])
+        if '数量' in row:
+            q = _num_or_none(row.get('数量'))
+            p['quantity_value'] = q
+            p['quantity_auto'] = _same_number(q, init['数量'])
         if '根拠' in row:
             p['reason'] = _clean(row.get('根拠'))
 
@@ -146,21 +153,38 @@ def linked_order_price(old_estimate: Any, old_order: Any, new_estimate: Any,
 
 _NUM = r'[0-9０-９]+(?:[.．,，][0-9０-９]+)*'
 _MM = r'\s*(?:mm|㎜|cm|㎝|ｍｍ|ｃｍ)(?![A-Za-z])'
-# 数字の直後が「円・万・¥」（金額）や「m・メートル」（長さの数量）なら寸法ではない
-_NOT_MONEY_OR_METER = r'(?![0-9０-９.．,，])(?!\s*(?:円|万|¥|￥|[mｍ](?![mｍ])|メートル))'
+_METER_UNIT = r'\s*(?:[mｍ](?![mｍA-Za-z])|メートル)'
+# 個数の単位（台・本・枚…）。長さ・面積（m・㎡）より優先して数量とみなす
+_COUNT_UNITS = (r'人工|箇所|ヶ所|ケ所|カ所|か所|ヵ所|ヶ(?!月)|セット|台|本|枚|個|式|組|基|面|段|灯|梱|缶|巻|脚|丁|袋|束|口')
+# 長さ・面積・体積の単位
+_MEASURE_UNITS = (r'帖|畳|坪|㎡|㎥|平米|立米|[mｍMＭ][2２²]|[mｍMＭ][3３³]|メートル|[mｍMＭ](?![mｍMＭA-Za-z0-9])')
+# 数字の直後が金額（円・万・¥）や個数の単位なら寸法ではない
+_NOT_VALUE = r'(?![0-9０-９.．,，])(?!\s*(?:円|万|千円|¥|￥|' + _COUNT_UNITS + r'))'
+_NOT_METER = r'(?!\s*(?:[mｍMＭ](?![mｍA-Za-z])|メートル))'
+_NO_ALNUM_BEFORE = r'(?<![0-9０-９A-Za-zＡ-Ｚａ-ｚ])'
 _DIMENSION_TOKEN = re.compile(
-    # W2700 / H850 / D650 / φ100 / UB1616（英字1〜2文字＋数字）
-    r'(?<![0-9０-９A-Za-zＡ-Ｚａ-ｚ])[A-Za-zＡ-Ｚａ-ｚφΦøØ]{1,2}\s*' + _NUM + r'(?:' + _MM + r'|' + _NOT_MONEY_OR_METER + r')'
-    # W:2700 / W＝2700（区切り付きは寸法記号1文字だけ。UB：400,000円 のような略号＋金額は消さない）
-    r'|(?<![0-9０-９A-Za-zＡ-Ｚａ-ｚ])[WHDLwhdlＷＨＤＬφΦ]\s*[:：=＝]\s*' + _NUM + r'(?:' + _MM + r'|' + _NOT_MONEY_OR_METER + r')'
-    # 幅2700 / 間口 1820 / 奥行き650 / 高さ850（長さ12m のような m 単位の数量は消さない）
-    r'|(?:幅|巾|間口|奥行き?|高さ|厚み|厚さ)\s*[:：=＝]?\s*' + _NUM + r'(?:' + _MM + r'|' + _NOT_MONEY_OR_METER + r')'
+    # W2700 / H 850 / D:650 / φ100 / W 1.8m（幅・高さ・奥行は m 単位でも寸法）
+    _NO_ALNUM_BEFORE + r'[WHDwhdＷＨＤφΦøØ]\s*[:：=＝]?\s*' + _NUM + r'(?:' + _MM + r'|' + _METER_UNIT + r')?' + _NOT_VALUE
+    # L2700 / L=2700mm（L=12m のような m 単位は長さの数量なので残す）
+    + r'|' + _NO_ALNUM_BEFORE + r'[LlＬ]\s*[:：=＝]?\s*' + _NUM + r'(?:' + _MM + r'|' + _NOT_METER + r')' + _NOT_VALUE
+    # 幅2700 / 間口 1.82m / 奥行き650 / 高さ2.4m
+    + r'|(?:幅|巾|間口|奥行き?|高さ|厚み|厚さ)\s*[:：=＝]?\s*' + _NUM + r'(?:' + _MM + r'|' + _METER_UNIT + r')?' + _NOT_VALUE
+    # 長さ2700 / 長さ2700mm（長さ12m は数量なので残す）
+    + r'|長さ\s*[:：=＝]?\s*' + _NUM + r'(?:' + _MM + r'|' + _NOT_METER + r')' + _NOT_VALUE
+    # UB1616 / R100 のような英字1〜2文字に直結した数字（空白を挟むと寸法とみなさない: UB 2台・WC 128000。x3枚 の x は掛け数）
+    + r'|' + _NO_ALNUM_BEFORE + r'[A-WYZa-wyzＡ-Ｚａ-ｚ]{1,2}' + _NUM + r'(?:' + _MM + r')?' + _NOT_METER + _NOT_VALUE
     # 2700mm / 2700mmの / 2700mmタイプ
-    r'|' + _NUM + _MM
+    + r'|' + _NUM + _MM
 )
 # 型番（TKS05305JA・XCH1601RWS・TCF8GM・SC419a）。単位の無い数字を拾うときに先に消す
 _MODEL_TOKEN = re.compile(
     r'(?<![0-9A-Za-z])(?:[A-Za-z]{2,}[0-9][A-Za-z0-9-]*|[A-Za-z][0-9]+[A-Za-z][A-Za-z0-9-]*|[0-9]+[A-Za-z]{2,}[A-Za-z0-9-]*)')
+# 単価とみなさない数字（単位・階・容量・電圧・型・サイズの付いた数字）
+_NON_PRICE_NUMBER = re.compile(
+    r'(?<![0-9.])\d+(?:\.\d+)?\s*(?:' + _COUNT_UNITS + r'|' + _MEASURE_UNITS
+    + r'|階|[FＦ](?![A-Za-z])|[LVWAＬＶＷＡ](?![A-Za-z])|kW|KW|kw|kVA|型|サイズ|タイプ|%|％|年|ヶ月|か月|日|号|人|歳)'
+    r'|(?:型|サイズ|タイプ|No\.?|№)\s*\d+')
+_FLOOR_NUMBER = re.compile(r'(?<![0-9.])\d+\s*(?:階|[FＦ](?![A-Za-z]))')
 
 
 def strip_dimension_tokens(text: str) -> str:
@@ -168,34 +192,10 @@ def strip_dimension_tokens(text: str) -> str:
 
     2026-08-07 MTG: カップボード「W2700」の 2700 を数量 2700 と誤認識していた。
     アルファベット（W/H/D 等）や単位 mm が付いた数値はサイズであり数量・金額ではない。
+    2026-11-12: 『UB 2台』『WC 128000』の略号＋空白＋数字、『長さ12m』『L=12m』の m 単位の数量、
+    『UB：400,000円』の金額は消さない。
     """
     return _DIMENSION_TOKEN.sub(' ', str(text or ''))
-
-
-def parse_amount_jp(text: Any) -> float | None:
-    """『150万』『1,500,000円』『2台』等の文字列から数値を取り出す（寸法表記は無視）。
-
-    優先順位: 「〜万」 → 「〜円」 → 寸法を除いた最初の数値。
-    """
-    if text is None:
-        return None
-    if isinstance(text, bool):
-        return None
-    if isinstance(text, (int, float)):
-        if isinstance(text, float) and math.isnan(text):
-            return None
-        return float(text)
-    s = str(text).replace(',', '').replace('，', '').strip()
-    s = s.translate(str.maketrans('０１２３４５６７８９．', '0123456789.'))
-    s = strip_dimension_tokens(s)
-    m = re.search(r'(\d+(?:\.\d+)?)\s*万', s)
-    if m:
-        return float(m.group(1)) * 10000
-    m = re.search(r'(\d+(?:\.\d+)?)\s*円', s)
-    if m:
-        return float(m.group(1))
-    m = re.search(r'\d+(?:\.\d+)?', s)
-    return float(m.group(0)) if m else None
 
 
 def _normalize_digits(text: Any, keep_commas: bool = False) -> str:
@@ -207,90 +207,264 @@ def _drop_commas_in_numbers(s: str) -> str:
     return re.sub(r'(?<=\d),(?=\d{3}(?!\d))', '', s)
 
 
-def _bare_number(s: str) -> float | None:
-    """寸法・型番を除いたあとの、単位の無い最初の数字"""
-    s = _MODEL_TOKEN.sub(' ', s)
-    m = re.search(r'(?<![0-9.])\d+(?:\.\d+)?', s)
-    return float(m.group(0)) if m else None
+def _after_change(s: str) -> str:
+    """『A→B』『AからBに』『AをBに』『変更後 B』の形なら、変更後（B）の部分だけを返す。
+
+    2026-11-12 反証: 『UB 26万→371,500円』で変更前の 26万 を採用していた。
+    後ろに数字が無いとき（『2階から1階に移設』の後ろ側など）は元の文を使う。
+    """
+    parts = re.split(r'→|⇒|⇨|➡|->|=>|＞', s)
+    if len(parts) > 1 and re.search(r'\d', parts[-1]):
+        return parts[-1]
+    m = re.search(r'変更後\s*[:：は]?\s*(.+)$', s)
+    if m and re.search(r'\d', m.group(1)):
+        return m.group(1)
+    for word in ('から', 'より', 'を'):
+        idx = s.rfind(word)
+        if idx > 0 and re.search(r'\d', s[:idx]) and re.search(r'\d', s[idx + len(word):]):
+            return s[idx + len(word):]
+    return s
+
+
+def _money_candidates(s: str) -> list[tuple[int, int, float]]:
+    """金額らしい数字を (開始, 終了, 値) で返す（位置順）。
+
+    9万8千円・51万4300円・1万2千5百円・98千円・8.5万円・¥371,500・514,300円・1,500,000 を読む。
+    """
+    taken: list[tuple[int, int]] = []
+    out: list[tuple[int, int, float]] = []
+
+    def _free(a: int, b: int) -> bool:
+        return all(b <= x or a >= y for x, y in taken)
+
+    def _add(m, value: float):
+        if _free(m.start(), m.end()):
+            taken.append((m.start(), m.end()))
+            out.append((m.start(), m.end(), value))
+    num = r'\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?'
+    for m in re.finditer(r'(?<![0-9.,])(' + num + r')\s*万(?:\s*(\d+(?:\.\d+)?)\s*千)?(?:\s*(\d+)\s*百)?'
+                         r'(?:(\d{1,3}(?:,\d{3})|\d{1,4})(?![0-9.,])(?!\s*(?:' + _COUNT_UNITS + r'|' + _MEASURE_UNITS + r')))?'
+                         r'(?:\s*円)?', s):
+        v = float(m.group(1).replace(',', '')) * 10000
+        v += float(m.group(2) or 0) * 1000 + float(m.group(3) or 0) * 100 + float((m.group(4) or '0').replace(',', ''))
+        _add(m, v)
+    for m in re.finditer(r'(?<![0-9.,])(\d+(?:\.\d+)?)\s*千(?:\s*(\d+)\s*百)?\s*円', s):
+        _add(m, float(m.group(1)) * 1000 + float(m.group(2) or 0) * 100)
+    for m in re.finditer(r'[¥￥]\s*(' + num + r')', s):
+        _add(m, float(m.group(1).replace(',', '')))
+    for m in re.finditer(r'(?<![0-9.,])(' + num + r')\s*円', s):
+        _add(m, float(m.group(1).replace(',', '')))
+    # 桁区切りのある数字は金額とみなす（1616・2550 のような区切りの無い数字は除く）
+    for m in re.finditer(r'(?<![0-9A-Za-z.,])\d{1,3}(?:,\d{3})+(?![0-9,])', s):
+        _add(m, float(m.group(0).replace(',', '')))
+    return sorted(out)
+
+
+def _prep(text: Any) -> str:
+    """数字を半角にし、寸法と型番を消した文（桁区切りのカンマは残す）"""
+    s = strip_dimension_tokens(_normalize_digits(text, keep_commas=True))
+    return _MODEL_TOKEN.sub(' ', s)
+
+
+_DELTA_UP_AFTER = re.compile(r'\s*(?:の)?(?:アップ|ＵＰ|UP|up|増し?|プラス|高く)')
+_DELTA_DOWN_AFTER = re.compile(r'\s*(?:の)?(?:ダウン|DOWN|down|減|マイナス|安く|値引き?|引き)')
+
+
+def _delta_sign(s: str, start: int, end: int) -> int:
+    """金額が増減額（差額）として書かれていれば +1／-1、絶対額なら 0"""
+    before = s[:start]
+    if re.search(r'[+＋]\s*[¥￥]?\s*$', before):
+        return 1
+    if re.search(r'(?:[△▲−－]|(?:^|[\s(（:：、])-)\s*[¥￥]?\s*$', before):
+        return -1
+    after = s[end:end + 8]
+    if _DELTA_UP_AFTER.match(after):
+        return 1
+    if _DELTA_DOWN_AFTER.match(after):
+        return -1
+    if re.search(r'減額|値引き?|値下げ|マイナス', before):
+        return -1
+    if re.search(r'差額|増額|値上げ|追加費用|追加金額|プラス', before):
+        return 1
+    return 0
 
 
 def parse_money_jp(text: Any) -> float | None:
-    """金額だけを読む: 『円』『万』『¥』が付いた数字、または桁区切り（1,500,000）の数字を金額とみなす。
+    """金額だけを読む: 『円』『万』『千円』『¥』が付いた数字、または桁区切り（1,500,000）の数字を金額とみなす。
 
     寸法（W2700・2700mm）・型番（XCH1601RWS）・サイズ（サザナ 1616サイズ）の数字は金額にしない。
-    2026-11-12 監査: 仕様変更の文の 1616 が単価になっていた。
+    2026-11-12 監査: 仕様変更の文の 1616 が単価になっていた。反証: 9万8千円 を 90,000円 と読んでいた。
     """
     if text is None or isinstance(text, bool):
         return None
     if isinstance(text, (int, float)):
         return None if (isinstance(text, float) and math.isnan(text)) else float(text)
-    raw = strip_dimension_tokens(_normalize_digits(text, keep_commas=True))
-    s = _drop_commas_in_numbers(raw)
-    m = re.search(r'(\d+(?:\.\d+)?)\s*万', s)
-    if m:
-        return float(m.group(1)) * 10000
-    m = re.search(r'[¥￥]\s*(\d+(?:\.\d+)?)', s)
-    if m:
-        return float(m.group(1))
-    m = re.search(r'(\d+(?:\.\d+)?)\s*円', s)
-    if m:
-        return float(m.group(1))
-    # 桁区切りのある数字は金額とみなす（1616・2550 のような区切りの無い数字は除く）
-    m = re.search(r'(?<![0-9A-Za-z.])\d{1,3}(?:,\d{3})+(?![0-9])', _MODEL_TOKEN.sub(' ', raw))
-    if m:
-        return float(m.group(0).replace(',', ''))
-    return None
+    cands = _money_candidates(_prep(text))
+    return cands[0][2] if cands else None
 
 
-_QTY_UNITS = (r'台|本|枚|個|箇所|ヶ所|ケ所|カ所|か所|ヵ所|セット|式|組|基|面|段|帖|畳|坪|㎡|m2|ｍ2|平米|'
-              r'm(?![A-Za-z0-9])|ｍ|メートル|ヶ')
+def parse_amount_jp(text: Any) -> float | None:
+    """『150万』『1,500,000円』『2台』等の文字列から数値を取り出す（寸法表記は無視）。
+
+    優先順位: 金額表記（万・千円・円・¥・桁区切り） → 寸法を除いた最初の数値。
+    """
+    if text is None or isinstance(text, bool):
+        return None
+    if isinstance(text, (int, float)):
+        return None if (isinstance(text, float) and math.isnan(text)) else float(text)
+    v = parse_money_jp(text)
+    if v is not None:
+        return v
+    s = _drop_commas_in_numbers(strip_dimension_tokens(_normalize_digits(text, keep_commas=True)))
+    m = re.search(r'\d+(?:\.\d+)?', s)
+    return float(m.group(0)) if m else None
+
+
+def _bare_number(s: str, last: bool = False) -> float | None:
+    """寸法・型番・階数を除いたあとの、単位の無い数字（既定は最初、last=True で最後）"""
+    s = _FLOOR_NUMBER.sub(' ', _MODEL_TOKEN.sub(' ', s))
+    found = re.findall(r'(?<![0-9.])\d+(?:\.\d+)?', s)
+    if not found:
+        return None
+    return float(found[-1] if last else found[0])
 
 
 def parse_quantity_jp(text: Any, allow_bare: bool = False) -> float | None:
-    """数量だけを読む: 『台・本・枚・箇所・㎡・m』などの単位が付いた数字を数量とみなす。
+    """数量だけを読む: 『台・本・枚・箇所・人工』などの個数の単位を優先し、無ければ『㎡・m・㎥』の数字。
 
-    寸法表記（W2700・2700mm・幅2700・W:2700 など）は先に取り除く。
-    allow_bare=True のときは、単位が無い数字も（寸法と型番を除いたうえで）数量として読む。
+    寸法表記（W2700・2700mm・幅2700・高さ2.4m など）は先に取り除く。
+    allow_bare=True のときは、単位が無い数字も（寸法・型番・階数を除いたうえで）数量として読む。
     """
     if text is None or isinstance(text, bool):
         return None
     if isinstance(text, (int, float)):
         return None if (isinstance(text, float) and math.isnan(text)) else float(text)
     s = _drop_commas_in_numbers(strip_dimension_tokens(_normalize_digits(text, keep_commas=True)))
-    m = re.search(r'(?<![0-9.A-Za-z])(\d+(?:\.\d+)?)\s*(?:' + _QTY_UNITS + ')', _MODEL_TOKEN.sub(' ', s))
+    # 個数: 英字の直後でもよい（LED5台・x3枚・2F5台）
+    m = re.search(r'(?<![0-9.])(\d+(?:\.\d+)?)\s*(?:' + _COUNT_UNITS + ')', s)
+    if m:
+        return float(m.group(1))
+    # 長さ・面積: 型番の一部（AB12M）を拾わないよう英字の直後は除く
+    m = re.search(r'(?<![0-9.A-Za-z])(\d+(?:\.\d+)?)\s*(?:' + _MEASURE_UNITS + ')', s)
     if m:
         return float(m.group(1))
     return _bare_number(s) if allow_bare else None
 
 
+def proposal_delta(change_type: str, proposed: Any) -> float | None:
+    """単価変更・仕様変更の文が増減額（差額 +85,000円・△50,000円・2万円アップ）なら符号付きの額、違えば None"""
+    if _clean(change_type) not in ('price', 'spec') or proposed is None:
+        return None
+    s = _after_change(_prep(proposed))
+    cands = _money_candidates(s)
+    if not cands:
+        return None
+    start, end, value = cands[0]
+    sign = _delta_sign(s, start, end)
+    return sign * value if sign else None
+
+
 def proposal_value(change_type: str, proposed: Any, amount: Any = None) -> float | None:
     """打合せ変更の変更案から使う数字。見つからなければ None（0 と読めたときは 0.0）。
 
-    - 表で入れた金額（amount > 0）は最優先
-    - 数量変更: 単位付きの数字（無ければ単位なしの数字）
-    - 単価変更: 金額表記（円・万・¥・桁区切り）、無ければ単位なしの数字
-    - 仕様変更・追加: 金額表記（円・万・¥・桁区切り）だけ（サイズや型番の数字は使わない）
+    - 表で入れた数字（amount > 0）は最優先
+    - 『A→B』『AからBに』の形なら変更後（B）だけを読む
+    - 数量変更: 個数の単位 → 長さ・面積の単位 → 単位なしの数字（階数・寸法・型番は除く）
+    - 単価変更: 金額表記（円・万・¥・桁区切り）、無ければ単位なしの数字（単位・階・容量の付いた数字を除いた最後の数字）
+    - 仕様変更・追加: 金額表記だけ（サイズや型番の数字は使わない）
+    - 増減額（差額 +85,000円・△50,000円）は絶対額ではないので None（proposal_delta で読む）
     """
     if isinstance(amount, (int, float)) and not isinstance(amount, bool) and not (
             isinstance(amount, float) and math.isnan(amount)) and amount > 0:
         return float(amount)
+    if proposed is None:
+        return None
     ctype = _clean(change_type)
     if ctype == 'quantity':
-        return parse_quantity_jp(proposed, allow_bare=True)
+        return parse_quantity_jp(_after_change(_normalize_digits(proposed, keep_commas=True)), allow_bare=True)
+    if ctype == 'remove':
+        return None
+    s = _after_change(_prep(proposed))
+    cands = _money_candidates(s)
+    if cands:
+        start, end, value = cands[0]
+        if ctype in ('price', 'spec') and _delta_sign(s, start, end):
+            return None
+        return value
     if ctype == 'price':
-        v = parse_money_jp(proposed)
-        if v is None and proposed is not None:
-            v = _bare_number(_drop_commas_in_numbers(strip_dimension_tokens(_normalize_digits(proposed, keep_commas=True))))
-        return v
-    return parse_money_jp(proposed)
+        return _bare_number(_NON_PRICE_NUMBER.sub(' ', _drop_commas_in_numbers(s)), last=True)
+    return None
 
 
 def proposal_number(change_type: str, proposed: Any, amount: Any = None) -> int | float:
-    """表の『金額(円)』欄に入れる初期値（見つからなければ 0）。中身は proposal_value と同じ。"""
+    """表の初期値（見つからなければ 0）。中身は proposal_value と同じ。"""
     v = proposal_value(change_type, proposed, amount)
     if v is None:
         return 0
     return int(v) if float(v).is_integer() else v
+
+
+def _num_or_none(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return None if (isinstance(value, float) and math.isnan(value)) else float(value)
+    try:
+        return float(_clean(value).replace(',', ''))
+    except ValueError:
+        return None
+
+
+def _user_amount(p: dict) -> Any:
+    """利用者が表で入れた数字（自動で入れた初期値のままなら None）"""
+    return None if p.get('amount_auto') else p.get('amount')
+
+
+def proposal_table_values(p: dict) -> dict:
+    """変更案の表の初期値。金額は『金額(円)』（整数）、数量は『数量』（小数のまま）に分けて入れる。
+
+    2026-11-12 反証: 数量も金額の列に整数で入れていたため 30.5m が 30 になっていた。
+    """
+    ctype = p.get('change_type', '')
+    if ctype == 'quantity':
+        uq = None if p.get('quantity_auto') else _num_or_none(p.get('quantity_value'))
+        q = uq if uq is not None else proposal_value('quantity', p.get('proposed'), _user_amount(p))
+        return {'金額(円)': 0, '数量': q}
+    v = proposal_value(ctype, p.get('proposed'), _user_amount(p))
+    return {'金額(円)': int(v) if v else 0, '数量': None}
+
+
+def _same_number(a: Any, b: Any) -> bool:
+    x, y = _num_or_none(a), _num_or_none(b)
+    if x is None or y is None:
+        return (x is None or x == 0) and (y is None or y == 0)
+    return abs(x - y) < 1e-9
+
+
+def proposal_from_row(p: dict, row: dict, label_to_ctype: dict) -> dict:
+    """表の1行から反映用の変更案を作る。
+
+    数字の列を利用者が触っていなければ、（直したかもしれない）変更後の内容と種類から読み直す。
+    触っていればその数字を使う。2026-11-12 反証: 内容だけ直しても古い初期値が使われていた。
+    """
+    ctype = label_to_ctype.get(_clean(row.get('変更の種類')), p.get('change_type') or 'spec')
+    proposed = _clean(row.get('変更後の内容'))
+    init = proposal_table_values(p)
+    if ctype == 'quantity':
+        val = _num_or_none(row.get('数量'))
+        init_val = init['数量'] if p.get('change_type') == 'quantity' else None
+    else:
+        val = _num_or_none(row.get('金額(円)'))
+        val = max(0, int(val)) if val is not None else 0
+        init_val = init['金額(円)'] if p.get('change_type') != 'quantity' else 0
+    if not _same_number(val, init_val):
+        amount = val
+    else:
+        amount = None
+        if proposal_value(ctype, proposed, None) is None and proposal_delta(ctype, proposed) is None and val:
+            amount = val
+    return {'category': _clean(row.get('工事種別')), 'item_name': _clean(row.get('品名')),
+            'change_type': ctype, 'proposed': proposed, 'amount': amount, 'reason': _clean(row.get('根拠'))}
 
 
 # フィードバックのステータス（2026-08-07 MTG で合意した3段階フロー）
@@ -789,6 +963,7 @@ def search_design_master(rows: list | None, query: Any, limit: int = 20) -> list
                         'category': _clean(r.get('category')), 'unit': _clean(r.get('unit')),
                         'estimate_price': int(r.get('estimate_price') or 0), 'order_price': int(r.get('order_price') or 0),
                         'code': _clean(r.get('code')), 'cost_kind': _clean(r.get('cost_kind')), 'score': 1.0,
+                        'group': _clean(r.get('group')), 'row_no': r.get('row_no'),
                         'reason': '品名に一致'})
             if len(out) >= limit:
                 break
@@ -821,7 +996,12 @@ def design_item_to_new_item(sg: dict, cat_no: int, quantity: Any, tanka_rows: li
 
 
 def _andpad_hint(sg: dict, tanka_rows: list | None, design_rows: list | None) -> dict:
-    """ANDPADの振り分けの手がかり。アプリの明細コード → 設計部の内訳①② → 材工区分 の順"""
+    """ANDPADの振り分けの手がかり。
+
+    順番: アプリの明細コードそのもの → 取付費・手間・工事費の行は「工」 → 設計部マスタの内訳①②（材・工）
+    → アプリの単価マスタで名称がほぼ同じ明細（0.9以上で、2番目と0.05以上の差・単位も一致）。
+    名称が近いだけの明細の振り分けを使うと、取付費が材料になることがあった（2026-11-12 反証）。
+    """
     try:
         from andpad_converter import VENDOR_MAPPING
     except Exception:  # noqa: BLE001
@@ -829,17 +1009,10 @@ def _andpad_hint(sg: dict, tanka_rows: list | None, design_rows: list | None) ->
     code = _clean(sg.get('code'))
     if code.isdigit() and int(code) in VENDOR_MAPPING:
         return {'andpad_code': int(code)}
-    if tanka_rows:
-        try:
-            import master_lookup
-            best = next(iter(master_lookup.suggest_similar(_clean(sg.get('name')), _clean(sg.get('summary')),
-                                                           tanka_rows, top_n=1)), None)
-        except Exception:  # noqa: BLE001
-            best = None
-        if best and best.get('score', 0) >= 0.8 and _clean(best.get('code')).isdigit() \
-                and int(best['code']) in VENDOR_MAPPING:
-            return {'andpad_code': int(best['code'])}
-    parts = design_breakdown_rows(design_rows, code) if design_rows else []
+    name = _clean(sg.get('name'))
+    if _clean(sg.get('cost_kind')) in ('工事費', '工') or re.search(r'取付費|取付け費|手間|施工費|工賃|設置費', name):
+        return {'andpad_mapping': {'vendor': '', 'kind': '工'}}
+    parts = design_breakdown_rows(design_rows, code) if (design_rows and code) else []
     if parts:
         def _amt(r):
             try:
@@ -854,8 +1027,22 @@ def _andpad_hint(sg: dict, tanka_rows: list | None, design_rows: list | None) ->
                                        'parts': [{'vendor': '', 'kind': '工', 'ratio': labor / total, 'note': '施工費分'}]}}
         if total > 0 and labor == total:
             return {'andpad_mapping': {'vendor': '', 'kind': '工'}}
-    if _clean(sg.get('cost_kind')) in ('工事費', '工'):
-        return {'andpad_mapping': {'vendor': '', 'kind': '工'}}
+    if tanka_rows:
+        try:
+            import master_lookup
+            cands = master_lookup.suggest_similar(name, _clean(sg.get('summary')), tanka_rows, top_n=2)
+        except Exception:  # noqa: BLE001
+            cands = []
+        if cands:
+            best = cands[0]
+            second = cands[1]['score'] if len(cands) > 1 else 0.0
+            unit_ok = (not _clean(sg.get('unit')) or not _clean(best.get('unit'))
+                       or unicodedata.normalize('NFKC', _clean(sg.get('unit')))
+                       == unicodedata.normalize('NFKC', _clean(best.get('unit'))))
+            bcode = _clean(best.get('code'))
+            if (best.get('score', 0) >= 0.9 and best['score'] - second >= 0.05 and unit_ok
+                    and bcode.isdigit() and int(bcode) in VENDOR_MAPPING):
+                return {'andpad_code': int(bcode)}
     return {}
 
 
@@ -871,9 +1058,16 @@ def validate_alias_pair(ai_name: Any, ai_summary: Any, actual_name: Any, actual_
 
 
 def special_note_key(category: Any, name: Any, summary: Any = '') -> str:
-    """案件特有・除外の登録キー。摘要があれば摘要まで含める（同じ品名の別の行に付かないように）"""
-    c, n, sm = _clean(category), _clean(name), _clean(summary)
-    return f"{c}|{n}|{sm}" if sm else f"{c}|{n}"
+    """差異理由・案件特有・除外の登録キー『工事種別|品名|摘要』（摘要が空でも区切りを付ける）。
+
+    旧形式『工事種別|品名』（品名だけ）と区別するため、摘要が空でも末尾の | を付ける（2026-11-12 反証）。
+    """
+    return f"{_clean(category)}|{_clean(name)}|{_clean(summary)}"
+
+
+def is_summary_note_key(key: Any) -> bool:
+    """摘要まで含む新しい形式のキーか（旧形式は品名だけ）"""
+    return _clean(key).count('|') >= 2
 
 
 def parse_special_note_key(key: Any) -> tuple[str, str, str]:
@@ -882,6 +1076,141 @@ def parse_special_note_key(key: Any) -> tuple[str, str, str]:
     while len(parts) < 3:
         parts.append('')
     return parts[0], parts[1], parts[2]
+
+
+def note_library_key(key: Any) -> str:
+    """案件の登録キー → 差異理由ライブラリ（他案件の参考）のキー『工事種別|品名』。
+
+    他の物件では摘要が変わることが多いので、ライブラリは品名で引く（2026-11-12 反証）。
+    """
+    c, n, _ = parse_special_note_key(key)
+    return f"{c}|{n}"
+
+
+def resolve_note_key(notes: dict | None, category: Any, name: Any, summaries) -> str:
+    """差異理由の表の1行が読む・書くキー。
+
+    1) 摘要付きで登録済みのキー（金額差の行は AI摘要・実績摘要のどちらでも）
+    2) 旧形式（品名だけ）で登録済みのキー
+    3) どちらも無ければ、1つ目の摘要での新しいキー
+    """
+    notes = notes or {}
+    sums = [_clean(x) for x in (summaries or [])] or ['']
+    for sm in sums:
+        k = special_note_key(category, name, sm)
+        if k in notes:
+            return k
+    legacy = f"{_clean(category)}|{_clean(name)}"
+    if legacy in notes:
+        return legacy
+    return special_note_key(category, name, sums[0])
+
+
+def library_keys_to_withdraw(withdrawn_keys, new_notes: dict | None) -> list[str]:
+    """取り下げる案件のキー → ライブラリから外すキー。
+
+    同じ品名で全案件共通の理由がまだ残っている行があれば、そのライブラリのキーは外さない。
+    """
+    still = set()
+    for k, v in (new_notes or {}).items():
+        if isinstance(v, dict) and _clean(v.get('reason')) and v.get('scope') != 'project':
+            still.add(note_library_key(k))
+    out = []
+    for k in withdrawn_keys or []:
+        lk = note_library_key(k)
+        if lk not in still and lk not in out:
+            out.append(lk)
+    return out
+
+
+def find_feedback_index(fbs: list | None, fb: dict) -> int | None:
+    """保存されている問い合わせの中から、画面のカードと同じものの位置を探す。
+
+    feedback_id があればそれで、無ければ 日時・カテゴリ・本文 の全部で照合する
+    （日時と本文だけだと、カテゴリ違いの別の問い合わせを消していた。2026-11-12 反証）。
+    """
+    fid = fb.get('feedback_id')
+    for i, x in enumerate(fbs or []):
+        if not isinstance(x, dict):
+            continue
+        if fid:
+            if x.get('feedback_id') == fid:
+                return i
+            continue
+        if (not x.get('feedback_id') and x.get('timestamp') == fb.get('timestamp')
+                and x.get('category') == fb.get('category')
+                and (x.get('body') or x.get('message')) == (fb.get('body') or fb.get('message'))
+                and x.get('status', '') == fb.get('status', '')):
+            return i
+    if not fid:
+        for i, x in enumerate(fbs or []):
+            if (isinstance(x, dict) and not x.get('feedback_id') and x.get('timestamp') == fb.get('timestamp')
+                    and x.get('category') == fb.get('category')
+                    and (x.get('body') or x.get('message')) == (fb.get('body') or fb.get('message'))):
+                return i
+    return None
+
+
+def clean_editor_records(rows: list | None, int_cols=()) -> list[dict]:
+    """表（data_editor）の結果を保存用に整える: NaN → None、整数の列で整数の値は int に戻す。
+
+    作り直したときに型が変わり（None→NaN、2→2.0）、『修正前の値で作った概算』と誤って出ていた（2026-11-12 反証）。
+    """
+    out = []
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        d = {}
+        for k, v in r.items():
+            if isinstance(v, float) and math.isnan(v):
+                v = None
+            elif k in int_cols and isinstance(v, float) and v.is_integer():
+                v = int(v)
+            elif hasattr(v, 'item') and not isinstance(v, (str, bytes)):
+                try:
+                    v = v.item()
+                    if isinstance(v, float) and math.isnan(v):
+                        v = None
+                    elif k in int_cols and isinstance(v, float) and v.is_integer():
+                        v = int(v)
+                except (AttributeError, ValueError):
+                    pass
+            d[k] = v
+        out.append(d)
+    return out
+
+
+def pdf_floor_areas(fa: dict | None) -> tuple[dict, list]:
+    """AIが読んだ階別床面積を『1階』『2階』『B1階』に揃える。合計・中2階などは外して返す。
+
+    最初の数字だけで階を決めていたため、『1・2階合計』が1階に足し込まれていた（2026-11-12 反証）。
+    """
+    try:
+        import pdf_estimate
+        norm = pdf_estimate.normalize_floor_label
+    except Exception:  # noqa: BLE001
+        norm = None
+    out: dict = {}
+    skipped: list = []
+    for k, v in (fa or {}).items():
+        label = unicodedata.normalize('NFKC', _clean(k))
+        try:
+            area = float(v)
+        except (TypeError, ValueError):
+            area = 0.0
+        if area <= 0 or math.isnan(area):
+            continue
+        digits = re.findall(r'\d+', label)
+        if (re.search(r'合計|計|延|全|中|ロフト|小屋|・|、|,|~|〜|-|＋|\+', label)
+                or len(digits) > 1 or norm is None):
+            skipped.append(_clean(k))
+            continue
+        lab = norm(label)
+        if not lab:
+            skipped.append(_clean(k))
+            continue
+        out[lab] = out.get(lab, 0.0) + area
+    return out, skipped
 
 
 def withdrawn_note_keys(old_notes: dict | None, new_notes: dict | None) -> list[str]:
@@ -905,17 +1234,31 @@ def withdrawn_note_keys(old_notes: dict | None, new_notes: dict | None) -> list[
 
 # 設計部マスタの「種別」（可動棚・キッチン・サッシ…）から見積の工事種別を決めるための対応
 _DESIGN_CATEGORY_HINTS = [
-    (('キッチン', 'UB', 'ユニットバス', 'ﾕﾆｯﾄﾊﾞｽ', 'トイレ', '洗面', '給湯', '住宅設備', 'カップボード'), '住宅設備'),
-    (('サッシ', '玄関', '窓', '外部建具', 'シャッター'), '外部建具'),
-    (('可動棚', '棚', 'カウンター', '収納', '内部建具', 'ドア', '建具', '枕棚', 'クローゼット'), '内部建具'),
-    (('クロス', '床', '内装', 'フローリング', 'タイル貼'), '内装'),
-    (('外壁', 'サイディング', '外装'), '外装'),
-    (('電気', '照明', 'コンセント'), '電気'),
-    (('給排水', '配管'), '給排水'),
-    (('基礎', '深基礎'), '基礎'),
-    (('造作', '大工', '木工', '下地'), '木工'),
-    (('左官', 'タイル'), '左官'),
-    (('デッキ', 'ウッドデッキ'), 'デッキ'),
+    # 品名・種別の手がかり → 工事種別名に含まれる語。上ほど優先（短い語が別の種別名に含まれる誤判定を避ける）
+    (('太陽光', 'ソーラー', 'ｿｰﾗｰ', 'パワコン'), '太陽光'),
+    (('蓄電池', 'ドアホン', 'ﾄﾞｱﾎﾝ', 'インターホン', 'ｲﾝﾀｰﾎﾝ', 'カメラ', 'ｶﾒﾗ', 'モニター', 'ﾓﾆﾀｰ', '電気', '照明',
+      'コンセント', 'ｺﾝｾﾝﾄ', 'スイッチ', 'ｽｲｯﾁ', 'LAN', 'テレビ', 'ﾃﾚﾋﾞ', '分電盤', 'EV充電'), '電気'),
+    (('エアコン', 'ｴｱｺﾝ'), 'エアコン'),
+    (('換気',), '換気'),
+    (('屋根', '瓦', '葺', 'ルーフィング', 'ﾙｰﾌｨﾝｸﾞ'), '屋根'),
+    (('樋', '板金', '水切'), '板金'),
+    (('畳', 'クロス', 'ｸﾛｽ', 'フローリング', 'ﾌﾛｰﾘﾝｸﾞ', 'クッションフロア', 'ｸｯｼｮﾝﾌﾛｱ', '内装'), '内装'),
+    (('キッチン', 'ｷｯﾁﾝ', 'UB', 'ユニットバス', 'ﾕﾆｯﾄﾊﾞｽ', 'トイレ', 'ﾄｲﾚ', '洗面', '給湯', 'エコキュート', 'ｴｺｷｭｰﾄ',
+      '住宅設備', 'カップボード', 'ｶｯﾌﾟﾎﾞｰﾄﾞ', '乾燥機', '食洗機', 'コンロ', 'ｺﾝﾛ', 'レンジフード'), '住宅設備'),
+    (('給排水', '配管', '洗濯パン', '洗濯ﾊﾟﾝ', '水栓', '散水'), '給排水'),
+    (('家具',), '造作家具'),
+    (('サッシ', 'ｻｯｼ', '玄関', '窓', '外部建具', 'シャッター', 'ｼｬｯﾀｰ', '網戸'), '外部建具'),
+    (('可動棚', '棚', 'カウンター', 'ｶｳﾝﾀｰ', '収納', '内部建具', 'ドア', 'ﾄﾞｱ', '建具', '引戸', '引込', '片開', '片引',
+      '折戸', 'クローゼット', 'ｸﾛｰｾﾞｯﾄ', 'アウトセット', 'ｱｳﾄｾｯﾄ'), '内部建具'),
+    (('外壁', 'サイディング', 'ｻｲﾃﾞｨﾝｸﾞ', '外装'), '外装'),
+    (('塗装',), '塗装'),
+    (('断熱',), '断熱'),
+    (('階段', '造作', '大工', '木工', '下地'), '木工'),
+    (('左官', 'モルタル', 'ﾓﾙﾀﾙ'), '左官'),
+    (('タイル', 'ﾀｲﾙ'), 'タイル'),
+    (('基礎',), '基礎'),
+    (('デッキ', 'ﾃﾞｯｷ', 'カーポート', 'ｶｰﾎﾟｰﾄ', '外構', 'フェンス', 'ﾌｪﾝｽ', '屋外'), '屋外付帯'),
+    (('仮設', '足場'), '仮設'),
 ]
 
 

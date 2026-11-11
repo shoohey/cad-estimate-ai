@@ -525,6 +525,8 @@ def suggest_similar(name: str, summary: str, master_rows: list[dict], top_n: int
             'estimate_price': price, 'score': round(score, 3), 'reason': reason,
             # 見積に追加するときに使う（設計原価・コード・材工区分）
             'order_price': cost, 'code': _cell_text(row.get('code')), 'cost_kind': _cell_text(row.get('cost_kind')),
+            # 追加先の工事種別を決める分類（設計部マスタの「4.内部建具工事」など）と元の行
+            'group': _cell_text(row.get('group')), 'row_no': row.get('row_no'),
         })
     return out
 

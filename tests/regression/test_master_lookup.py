@@ -182,7 +182,8 @@ MASTER = [
     _m('30001', '木工事', '1階床 無垢ﾌﾛｰﾘﾝｸﾞ（標準）', '北恵 ※施工費込', '坪', 31200),
     _m('130001', '内装工事', 'ｸﾛｽ工事(一般部)', '壁･天井 SP級(無地)', '㎡', 1300),
 ]
-RESULT_KEYS = {'name', 'summary', 'category', 'unit', 'estimate_price', 'score', 'reason', 'order_price', 'code', 'cost_kind'}  # 見積に追加するための設計原価・コード・材工区分（2026-11-12）
+RESULT_KEYS = {'name', 'summary', 'category', 'unit', 'estimate_price', 'score', 'reason', 'order_price', 'code', 'cost_kind',
+               'group', 'row_no'}  # 見積に追加するための設計原価・コード・材工区分・追加先を決める分類と元の行（2026-11-12）
 
 
 class TestSuggestSimilar:

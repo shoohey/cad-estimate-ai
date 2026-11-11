@@ -619,20 +619,20 @@ def item_alias_keys(item: dict) -> set[str]:
     return {k for k in _match_keys(item) if k}
 
 
-def is_alias_pair(ai: dict, ac: dict, aliases: set | None,
-                  ai_name_unique: bool = False, ac_name_unique: bool = False) -> bool:
+def is_alias_pair(ai: dict, ac: dict, aliases: set | None, name_fallback: bool = False) -> bool:
     """利用者が「同じ商品」と登録した組か。aliases は frozenset({key_a, key_b}) の集合。
 
     1) 明細の『名称＋摘要』キーどうしで登録と一致する（摘要が空なら名称キー）
-    2) 名称だけの組（~付き）が登録されていて、その種別に同じ名称の行が両側とも1つしか無い
+    2) 名称だけの組（~付き）が登録されている（name_fallback=True のときだけ）
     2) は、摘要が物件ごとに変わる建具などで、全案件共通の登録や対応表が他の物件でも効くようにするため。
-    同じ名称の行が複数あるときは 1) だけにして、チェックしていない別の行に効かないようにする（2026-11-12）。
+    呼び出し側は、同じ名称の行が両側とも1つだけで、しかも相手側に同じ名称の行が無いときにだけ
+    name_fallback=True にする（名称が完全に同じ行どうしの正しい突合を奪わない。2026-11-12 反証）。
     """
     if not aliases:
         return False
     if frozenset((_match_keys(ai)[1], _match_keys(ac)[1])) in aliases:
         return True
-    if ai_name_unique and ac_name_unique:
+    if name_fallback:
         if frozenset(('~' + _match_keys(ai)[0], '~' + _match_keys(ac)[0])) in aliases:
             return True
     return False
@@ -700,16 +700,24 @@ def _match_items(ai_items: list[dict], actual_items: list[dict],
     """
     scored = []
     alias_hits: set[tuple[int, int]] = set()
+    fallback_hits: set[tuple[int, int]] = set()   # 名称だけの組（順位の上乗せなし）
     from collections import Counter
     ai_name_counts = Counter(_match_keys(x)[0] for x in ai_items)
     ac_name_counts = Counter(_match_keys(x)[0] for x in actual_items)
     for i, ai in enumerate(ai_items):
+        an = _match_keys(ai)[0]
         for j, ac in enumerate(actual_items):
+            bn = _match_keys(ac)[0]
+            # 名称だけの組は、両側とも同じ名称が1行だけで、相手側に同じ名称の行が無いときだけ使う
+            fallback = (ai_name_counts.get(an, 0) == 1 and ac_name_counts.get(bn, 0) == 1
+                        and ac_name_counts.get(an, 0) == 0 and ai_name_counts.get(bn, 0) == 0)
             # 利用者が「同じ商品」と登録した組は、名称が似ていなくても最優先で突合する
-            if is_alias_pair(ai, ac, aliases, ai_name_counts.get(_match_keys(ai)[0], 0) == 1,
-                             ac_name_counts.get(_match_keys(ac)[0], 0) == 1):
+            if is_alias_pair(ai, ac, aliases):
                 score = 1.0
                 alias_hits.add((i, j))
+            elif is_alias_pair(ai, ac, aliases, name_fallback=fallback):
+                score = 1.0           # 名称だけの組: 突合はするが、順位の上乗せはしない
+                fallback_hits.add((i, j))
             else:
                 score = _item_similarity(ai, ac)
                 # 名称中の数字コード（サッシ呼称 16005 等）が両側にあり一致しない組は、
@@ -764,7 +772,7 @@ def _match_items(ai_items: list[dict], actual_items: list[dict],
             "actual_quantity": ac["quantity"],
             "unit": ai.get("unit") or ac.get("unit", ""),
             "ai_rows": ai.get("rows", 1),
-            "via_alias": (i, j) in alias_hits,
+            "via_alias": (i, j) in alias_hits or (i, j) in fallback_hits,
             "via_pseudo": bool(ac.get("pseudo", False)),
             "group": ac.get("group") or ai.get("group", ""),
         })
