@@ -24,6 +24,13 @@ def measure() -> dict:
         from ui_helpers import alias_pairs_from_library
         aliases = alias_pairs_from_library(json.load(open(alias_path, encoding="utf-8")))
         report["alias_entries"] = len(aliases)
+    # 「まとめて計上」の登録（複数行の合計が相手側の1行）も同様にローカルの一覧があれば反映する
+    merges = []
+    merge_path = os.path.join("projects", "item_merge_library.json")
+    if os.path.exists(merge_path):
+        from ui_helpers import merge_rules_from_library
+        merges = merge_rules_from_library(json.load(open(merge_path, encoding="utf-8")))
+        report["merge_entries"] = len(merges)
     tot_ac_n = tot_ac_matched_n = 0
     tot_ac_amt = tot_ac_matched_amt = 0
     for pair in iter_pairs():
@@ -33,7 +40,7 @@ def measure() -> dict:
             actual = excel_diff.parse_actual_estimate(f.read())
         solar = any("太陽光" in c["name"] for c in actual["categories"])
         est = calculate_estimate(cad, prices, include_solar=solar, safety_rate=DEFAULT_SAFETY_RATE)
-        diff = excel_diff.diff_estimates(est, actual, aliases)
+        diff = excel_diff.diff_estimates(est, actual, aliases, merges=merges)
         ac_n = ac_matched_n = ac_amt = ac_matched_amt = exact_n = 0
         unmatched = {}
         for cat, d in diff["item_diffs"].items():

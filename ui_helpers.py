@@ -646,7 +646,13 @@ PROJECT_SPECIFIC_CATEGORY = '案件特有（図面に表れない項目）'
 EXCLUDED_LABEL = '除外'               # AIが計上したが不要な項目（理由付き）
 EXCLUDED_CATEGORY = 'AI項目の除外（不要）'
 EXCLUSION_REASONS = ['家の構造の違い', '地域・条例の違い', '仕様に含まない（オプション外）', '図面上は不要', 'その他']
+MERGE_LABEL = 'まとめ'                # 複数行の合計が相手側の1行（「まとめて計上」で登録した組）
 NOTE_SCOPE_GLOBAL = '全案件共通'
+
+
+def merge_row_label(n_ai: int, n_actual: int) -> str:
+    """扱い列の表示。例: まとめ（AI 4行→実績 1行）"""
+    return f"{MERGE_LABEL}（AI {int(n_ai)}行→実績 {int(n_actual)}行）"
 NOTE_SCOPE_PROJECT = 'この案件のみ'
 
 
@@ -667,6 +673,7 @@ def category_detail_rows(item_diff: dict | None, special_names=None) -> list[dic
                 special[key] = _clean(v) or PROJECT_SPECIFIC_LABEL
     else:
         special = {_clean(n): PROJECT_SPECIFIC_LABEL for n in (special_names or set()) if _clean(n)}
+    merge_rows: set[int] = set()     # 「まとめて計上」で突き合わせた行（扱い列は「まとめ…」のまま）
     for m in d.get('matched', []) or []:
         if not isinstance(m, dict):
             continue
@@ -684,8 +691,13 @@ def category_detail_rows(item_diff: dict | None, special_names=None) -> list[dic
             '実績数量': _qty_text(m.get('actual_quantity'), m.get('unit')),
             '実績金額': ac_amt,
             '差額(AI−実績)': ai_amt - ac_amt,
-            '登録済': bool(m.get('via_alias')),
+            '登録済': bool(m.get('via_alias') or m.get('via_merge')),
         })
+        if m.get('via_merge'):
+            mg = m.get('merge') or {}
+            rows[-1]['扱い'] = merge_row_label(len(mg.get('ai_members') or []) or 1,
+                                             len(mg.get('actual_members') or []) or 1)
+            merge_rows.add(id(rows[-1]))
     for x in d.get('ai_only', []) or []:
         if not isinstance(x, dict):
             continue
@@ -705,6 +717,8 @@ def category_detail_rows(item_diff: dict | None, special_names=None) -> list[dic
                      '実績数量': _qty_text(x.get('quantity'), x.get('unit')), '実績金額': amt,
                      '差額(AI−実績)': -amt, '登録済': False})
     for r in rows:
+        if id(r) in merge_rows:
+            continue
         # 案件特有・除外は「AIにしかない／実績にしかない／金額が違う」行に登録するもの。
         # 同じ品名の「一致」行にまで付けない（2026-11-12 監査）
         if r['区分'] == DETAIL_KIND_SAME:
@@ -771,6 +785,7 @@ def detail_kind_counts(rows: list[dict]) -> dict[str, int]:
             counts[k] += 1
     counts[PROJECT_SPECIFIC_LABEL] = special_count(rows)
     counts[EXCLUDED_LABEL] = excluded_count(rows)
+    counts[MERGE_LABEL] = sum(1 for r in rows or [] if str(r.get('扱い') or '').startswith(MERGE_LABEL))
     return counts
 
 
@@ -788,6 +803,9 @@ def detail_header(cat: dict, counts: dict[str, int]) -> str:
     excluded = counts.get(EXCLUDED_LABEL, 0)
     if excluded:
         parts.append(f"{EXCLUDED_LABEL} {excluded}")
+    merged = counts.get(MERGE_LABEL, 0)
+    if merged:
+        parts.append(f"{MERGE_LABEL} {merged}")
     return (f"{_clean(cat.get('name'))}　AI {ai:,}円 / 実績 {ac:,}円 / 差額 {ai - ac:+,}円　"
             f"｜ {'・'.join(parts)}")
 
@@ -925,6 +943,262 @@ def alias_library_set_scope(latest: list | None, entry: dict, scope: str, projec
                  'project_id': _clean(e.get('project_id')) or _clean(project_id)}
         out.append(e)
     return out
+
+
+# ---------------------------------------------------------------- 実績比較: 「まとめて計上」の登録
+# 2026-11-13 打合せ: 実見積では 駐車場代・整地費用・基礎廻り養生シート をお客様に見せず安全対策費に含めている。
+# AI の複数行（または実績の複数行）の合計が相手側の1行に当たる、という「処理の形」を登録して、
+# 以後の実績比較ではまとめて突き合わせる。エントリ:
+#   {category, ai_members:[{name,summary}], actual_members:[{name,summary}], ai_keys, actual_keys,
+#    note（どう処理しているか・AIへの指示）, scope, project_id, property, at, by}
+
+def _member(name: Any, summary: Any) -> dict:
+    return {'name': _clean(name), 'summary': _clean(summary)}
+
+
+def _member_keys(members: list[dict]) -> list[str]:
+    from excel_diff import _normalize_name
+    return sorted({_normalize_name(_clean(m.get('name')) + _clean(m.get('summary')))
+                   for m in members or [] if isinstance(m, dict) and _clean(m.get('name'))})
+
+
+def _dedupe_members(members: list[dict]) -> list[dict]:
+    out, seen = [], set()
+    for m in members:
+        key = (m['name'], m['summary'])
+        if m['name'] and key not in seen:
+            seen.add(key)
+            out.append(m)
+    return out
+
+
+def validate_merge_selection(selected_rows: list[dict]) -> tuple[str | None, list[dict], list[dict]]:
+    """チェックした行から「まとめて計上」の (エラー, AI側の行, 実績側の行) を返す。
+
+    「金額が違う」行はAI側・実績側の両方に入る（例: AIの安全対策費 ⇔ 実績の安全対策費）。
+    合わせて3行以上（1行どうしは「同じ商品」）、AI側・実績側とも1行以上が必要。
+    """
+    rows = [r for r in selected_rows or [] if isinstance(r, dict)]
+    if not rows:
+        return 'まとめる行にチェックを付けてください', [], []
+    if any(r.get('区分') == DETAIL_KIND_SAME for r in rows):
+        return '「一致」している行はまとめられません', [], []
+    if any(str(r.get('扱い') or '').startswith(MERGE_LABEL) for r in rows):
+        return 'すでに「まとめ」として登録済みの行が含まれています（下の一覧で解除できます）', [], []
+    ai = _dedupe_members([_member(r.get('AI品名'), r.get('AI摘要')) for r in rows
+                          if r.get('区分') in (DETAIL_KIND_AI_ONLY, DETAIL_KIND_DIFF)])
+    ac = _dedupe_members([_member(r.get('実績品名'), r.get('実績摘要')) for r in rows
+                          if r.get('区分') in (DETAIL_KIND_ACTUAL_ONLY, DETAIL_KIND_DIFF)])
+    if not ai:
+        return 'AI側の行（「AIにしかない」か「金額が違う」）を1行以上チェックしてください', [], []
+    if not ac:
+        return '実績側の行（「実績にしかない」か「金額が違う」）を1行以上チェックしてください', [], []
+    if len(ai) + len(ac) < 3:
+        if len(rows) == 2:
+            return ('1行どうしの読み替えは「同じ商品」で登録してください'
+                    '（まとめて計上は、合わせて3行以上を選びます）'), [], []
+        return 'まとめて計上は、AI側と実績側を合わせて3行以上になるように選んでください', [], []
+    return None, ai, ac
+
+
+def make_merge_entry(ai_members: list[dict], actual_members: list[dict], category: str, property_name: str,
+                     at: str, scope: str = ALIAS_SCOPE_GLOBAL, project_id: str = '', note: str = '',
+                     by: str = '') -> dict:
+    ai = _dedupe_members([_member(m.get('name'), m.get('summary')) for m in ai_members or [] if isinstance(m, dict)])
+    ac = _dedupe_members([_member(m.get('name'), m.get('summary')) for m in actual_members or []
+                          if isinstance(m, dict)])
+    return {
+        'category': _clean(category),
+        'ai_members': ai, 'actual_members': ac,
+        'ai_keys': _member_keys(ai), 'actual_keys': _member_keys(ac),
+        'note': _clean(note),
+        'scope': scope if scope in ALIAS_SCOPE_LABEL else ALIAS_SCOPE_GLOBAL,
+        'project_id': _clean(project_id),
+        'property': _clean(property_name), 'at': _clean(at), 'by': _clean(by),
+    }
+
+
+def _same_merge(a: dict, b: dict) -> bool:
+    if not (isinstance(a, dict) and isinstance(b, dict)):
+        return False
+    from excel_diff import _normalize_name
+    return (_normalize_name(_clean(a.get('category'))) == _normalize_name(_clean(b.get('category')))
+            and _member_keys(a.get('ai_members')) == _member_keys(b.get('ai_members'))
+            and _member_keys(a.get('actual_members')) == _member_keys(b.get('actual_members')))
+
+
+def merge_library_add(latest: list | None, entry: dict) -> tuple[list, bool]:
+    """保存直前に読み直した最新の一覧へ1件足す（同じ組は二重に登録しない）"""
+    lib = [e for e in (latest or []) if isinstance(e, dict)]
+    if any(_same_merge(e, entry) for e in lib):
+        return lib, False
+    return lib + [entry], True
+
+
+def merge_library_remove(latest: list | None, entry: dict) -> list:
+    return [e for e in (latest or []) if isinstance(e, dict) and not _same_merge(e, entry)]
+
+
+def merge_library_set_scope(latest: list | None, entry: dict, scope: str, project_id: str) -> list:
+    out = []
+    for e in latest or []:
+        if not isinstance(e, dict):
+            continue
+        if _same_merge(e, entry):
+            e = {**e, 'scope': scope if scope in ALIAS_SCOPE_LABEL else ALIAS_SCOPE_GLOBAL,
+                 'project_id': _clean(e.get('project_id')) or _clean(project_id)}
+        out.append(e)
+    return out
+
+
+def merge_rules_from_library(lib: list | None, project_id: str | None = None) -> list[dict]:
+    """登録一覧 → 突合に渡すルール。この案件に当てるものだけ。この案件のみの登録を先に当てる。"""
+    proj, glob = [], []
+    for e in lib or []:
+        if not isinstance(e, dict) or not alias_applies(e, project_id):
+            continue
+        ai = [m for m in e.get('ai_members') or [] if isinstance(m, dict) and _clean(m.get('name'))]
+        ac = [m for m in e.get('actual_members') or [] if isinstance(m, dict) and _clean(m.get('name'))]
+        if not ai or not ac:
+            continue
+        rule = {'category': _clean(e.get('category')), 'ai': ai, 'actual': ac,
+                'note': _clean(e.get('note')), 'scope': e.get('scope', ALIAS_SCOPE_GLOBAL)}
+        (proj if e.get('scope') == ALIAS_SCOPE_PROJECT else glob).append(rule)
+    return proj + glob
+
+
+def merge_entry_text(e: dict) -> str:
+    """登録一覧の表示。例: 仮設工事: AI「安全対策費＋駐車場代」→ 実績「安全対策費」"""
+    def _side(ms):
+        return '＋'.join(_clean(m.get('name')) + (f"（{_clean(m.get('summary'))}）" if _clean(m.get('summary')) else '')
+                        for m in ms or [] if isinstance(m, dict))
+    return f"{_clean(e.get('category'))}: AI「{_side(e.get('ai_members'))}」→ 実績「{_side(e.get('actual_members'))}」"
+
+
+def merge_note_target(m: dict) -> tuple[str, str]:
+    """「まとめ」で突き合わせた行の差異理由を紐づける (品名, 摘要)。
+
+    1行側（例: 実績の安全対策費）に紐づける。解除して行が分かれても、その行から理由が見えて取り下げられる
+    （合成名『A ＋ B ＋ C』をキーにすると、解除後に誰も読まないキーが残っていた。2026-11-13 反証）。
+    両側とも複数行のときだけ合成名のまま。
+    """
+    mg = (m or {}).get('merge') or {}
+    ai_m, ac_m = mg.get('ai_members') or [], mg.get('actual_members') or []
+    if len(ac_m) == 1 and len(ai_m) != 1:
+        return _clean(ac_m[0].get('name')), _clean(ac_m[0].get('summary'))
+    if len(ai_m) == 1:
+        return _clean(ai_m[0].get('name')), _clean(ai_m[0].get('summary'))
+    return _clean(m.get('ai_name')), _clean(m.get('ai_summary'))
+
+
+def merge_selection_totals(selected_rows: list[dict]) -> tuple[int, int]:
+    """チェックした行を「まとめ」としたときの (AI側の合計, 実績側の合計)。画面の確認表示用"""
+    ai = ac = 0
+    for r in selected_rows or []:
+        if not isinstance(r, dict):
+            continue
+        if r.get('区分') in (DETAIL_KIND_AI_ONLY, DETAIL_KIND_DIFF):
+            ai += int(_num_or_zero(r.get('AI金額')))
+        if r.get('区分') in (DETAIL_KIND_ACTUAL_ONLY, DETAIL_KIND_DIFF):
+            ac += int(_num_or_zero(r.get('実績金額')))
+    return ai, ac
+
+
+def _num_or_zero(v: Any) -> float:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    return 0.0 if math.isnan(f) else f
+
+
+MERGE_SUGGEST_MAX_EXTRA = 3   # 突き合っている行に足す行の数の上限（安全対策費は＋3行）
+MERGE_SUGGEST_WINDOW = MERGE_SUGGEST_MAX_EXTRA + 1   # 突き合っている行から前後この行数以内だけを足す相手にする
+
+
+def suggest_merge_candidates(item_diff: dict | None, exclude: set | None = None, limit: int = 3) -> list[dict]:
+    """「合計が一致する組み合わせ」＝まとめて計上の候補。
+
+    偶然の一致を出さないため、次の3つがそろうときだけ候補にする（2026-11-13 校正8物件で確認:
+    条件を付けないと「笠木＋縦手摺＝小屋裏耐力面材」のような偶然の組が多数出た）。
+    1. 名前で突き合っている「金額が違う」行がある（例: AIの安全対策費 ⇔ 実績の安全対策費）
+    2. その差額が、片側にしかない行（AIにしかない行／実績にしかない行）の合計とぴったり一致する
+    3. まとめる行どうしが見積の中で隣り合っている（並び順の幅が行数＋1以内）
+    exclude: 候補に入れない行 {(名称, 摘要)}（案件特有・除外として登録済みの行など）
+    戻り値: [{'ai': [{name,summary,amount}], 'actual': [...], 'ai_total', 'actual_total'}]（行の少ない順）
+    """
+    from itertools import combinations
+    d = item_diff or {}
+    skip = {(_clean(n), _clean(sm)) for n, sm in (exclude or set())}
+
+    def _m(name, summary, amount, order):
+        return {'name': _clean(name), 'summary': _clean(summary), 'amount': int(_num_or_zero(amount)),
+                'order': order if isinstance(order, int) else None}
+
+    def _pool(items):
+        out = [_m(x.get('name'), x.get('summary'), x.get('amount'), x.get('order'))
+               for x in items or [] if isinstance(x, dict)]
+        return [x for x in out if x['name'] and x['amount'] and x['order'] is not None
+                and (x['name'], x['summary']) not in skip]
+
+    def _near(pool, anchor):
+        """突き合っている行の近く（前後 MERGE_SUGGEST_WINDOW 行）にある行だけ。金額の大きさでは切らない
+        （上位N行で切ると、小さい行を含む正しい組が候補に出なかった。2026-11-13 反証）"""
+        if anchor['order'] is None:
+            return []
+        return [x for x in pool if abs(x['order'] - anchor['order']) <= MERGE_SUGGEST_WINDOW]
+
+    def _adjacent(members):
+        orders = [m['order'] for m in members]
+        if any(o is None for o in orders):
+            return False
+        return max(orders) - min(orders) + 1 <= len(members) + 1
+
+    ai_pool = _pool(d.get('ai_only'))
+    ac_pool = _pool(d.get('actual_only'))
+
+    def _sums(pool):
+        sums: dict[int, list[tuple]] = {}
+        for k in range(1, MERGE_SUGGEST_MAX_EXTRA + 1):
+            for combo in combinations(range(len(pool)), k):
+                sums.setdefault(sum(pool[i]['amount'] for i in combo), []).append(combo)
+        return sums
+
+    out, seen = [], set()
+    for m in d.get('matched') or []:
+        if not isinstance(m, dict) or m.get('via_merge') or m.get('via_pseudo'):
+            continue
+        ai_amt, ac_amt = int(_num_or_zero(m.get('ai_amount'))), int(_num_or_zero(m.get('actual_amount')))
+        if ai_amt == ac_amt:
+            continue
+        ai_p = _m(m.get('ai_name'), m.get('ai_summary'), ai_amt, m.get('ai_order'))
+        ac_p = _m(m.get('actual_name'), m.get('actual_summary'), ac_amt, m.get('actual_order'))
+        if (ai_p['name'], ai_p['summary']) in skip or (ac_p['name'], ac_p['summary']) in skip:
+            continue
+        # AIの複数行 → 実績の1行（AI側が足りない）
+        near_ai = _near(ai_pool, ai_p)
+        for combo in _sums(near_ai).get(ac_amt - ai_amt, []):
+            members = [ai_p] + [near_ai[i] for i in combo]
+            if _adjacent(members):
+                out.append({'ai': members, 'actual': [ac_p]})
+        # AIの1行 → 実績の複数行（実績側が足りない）
+        near_ac = _near(ac_pool, ac_p)
+        for combo in _sums(near_ac).get(ai_amt - ac_amt, []):
+            members = [ac_p] + [near_ac[i] for i in combo]
+            if _adjacent(members):
+                out.append({'ai': [ai_p], 'actual': members})
+    uniq = []
+    for c in out:
+        key = (tuple(sorted((x['name'], x['summary']) for x in c['ai'])),
+               tuple(sorted((x['name'], x['summary']) for x in c['actual'])))
+        if key in seen:
+            continue
+        seen.add(key)
+        c['ai_total'] = sum(x['amount'] for x in c['ai'])
+        c['actual_total'] = sum(x['amount'] for x in c['actual'])
+        uniq.append(c)
+    uniq.sort(key=lambda c: (len(c['ai']) + len(c['actual'])))
+    return uniq[:limit]
 
 
 def diff_library_remove(lib: dict | None, keys, property_name: str) -> dict:

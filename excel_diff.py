@@ -599,7 +599,8 @@ def _ai_items_to_dicts(ai_items: list) -> list[dict]:
         "unit": _cell_str(getattr(it, "unit", "")),
         "amount": int(it.estimate_amount),
         "group": _cell_str(getattr(it, "category", "")),
-    } for it in ai_items]
+        "order": k,      # 見積の中での並び順（「まとめ」の候補で、隣り合う行かを見るのに使う）
+    } for k, it in enumerate(ai_items)]
 
 
 def _match_keys(item: dict, *extra_groups: str) -> tuple[str, str]:
@@ -680,6 +681,7 @@ def _rollup_items(items: list[dict]) -> list[dict]:
                 "rows": 1,
                 "group": _cell_str(it.get("group", "")),
                 "pseudo": bool(it.get("pseudo", False)),
+                "order": it.get("order"),
             }
             order.append(key)
         else:
@@ -775,6 +777,8 @@ def _match_items(ai_items: list[dict], actual_items: list[dict],
             "via_alias": (i, j) in alias_hits or (i, j) in fallback_hits,
             "via_pseudo": bool(ac.get("pseudo", False)),
             "group": ac.get("group") or ai.get("group", ""),
+            "ai_order": ai.get("order"),
+            "actual_order": ac.get("order"),
         })
         used_ai.add(i)
         used_actual.add(j)
@@ -783,7 +787,8 @@ def _match_items(ai_items: list[dict], actual_items: list[dict],
         return [{"name": it["name"], "amount": int(it["amount"]),
                  "summary": it.get("summary", ""),
                  "quantity": it["quantity"], "unit": it.get("unit", ""),
-                 "rows": it.get("rows", 1), "group": it.get("group", "")}
+                 "rows": it.get("rows", 1), "group": it.get("group", ""),
+                 "order": it.get("order")}
                 for k, it in enumerate(items) if k not in used]
 
     return {"matched": matched,
@@ -791,9 +796,131 @@ def _match_items(ai_items: list[dict], actual_items: list[dict],
             "actual_only": _side(actual_items, used_actual)}
 
 
+# --- 「まとめて計上」の登録（複数行の合計が相手側の1行） -------------------------
+#
+# 2026-11-13 打合せ: 実見積では 駐車場代・整地費用・基礎廻り養生シート をお客様に見せず
+# 安全対策費にまとめて計上している。AI はそれぞれを別の行で出すので、金額が違う1行と
+# AIにしかない3行に見えていた。利用者が登録した組（AIの行の集まり ⇔ 実績の行の集まり）は
+# 合計どうしで1行として突き合わせる。
+
+def _find_merge_rows(items: list[dict], spec: dict, consumed: set[int]) -> list[int]:
+    """登録した1行（名称＋摘要）に当たる明細の位置。
+
+    名称＋摘要が同じ行があればそれ（単位・group 違いで分かれた同じ項目はすべて）。
+    無ければ、同じ名称の行がその種別に1つだけのときに限りその行
+    （安全対策費の摘要「120㎡以下／180㎡以下」のように摘要が物件ごとに変わるため）。
+    """
+    name = _cell_str(spec.get("name"))
+    summary = _cell_str(spec.get("summary"))
+    nm = _normalize_name(name)
+    if not nm:
+        return []
+    full = _normalize_name(name + summary)
+    exact = [k for k, it in enumerate(items) if _match_keys(it)[1] == full]
+    if exact:
+        return [k for k in exact if k not in consumed]
+    same = [k for k, it in enumerate(items) if _match_keys(it)[0] == nm]
+    if len(same) == 1 and same[0] not in consumed:
+        return same
+    return []
+
+
+def _merge_label(rows: list[dict]) -> str:
+    return " ＋ ".join(_cell_str(r.get("name")) for r in rows)
+
+
+def _apply_merges(cat_names: set[str], ai_items: list[dict], actual_items: list[dict],
+                  rules: list | None) -> tuple[list[dict], list[dict], list[dict]]:
+    """登録された「まとめて計上」を当て、(まとめた突合, 残りのAI明細, 残りの実績明細) を返す。
+
+    当てないとき:
+    - 工事種別が違う／AI側・実績側のどちらかの行がこの見積に1つも無い
+    - 相手側がまとめた行を別の行として持っている（例: 実績に駐車場代の行がある）＝この見積はまとめていない。
+      全案件共通の登録で、内訳まで書いてある実績の正しい1対1を崩さないため
+    """
+    if not rules:
+        return [], ai_items, actual_items
+    merged: list[dict] = []
+    used_ai: set[int] = set()
+    used_ac: set[int] = set()
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        rc = _normalize_name(_cell_str(rule.get("category")))
+        if rc and rc not in cat_names:
+            continue
+        a_idx: list[int] = []
+        c_idx: list[int] = []
+        missing: list[str] = []
+        for spec in rule.get("ai") or []:
+            got = _find_merge_rows(ai_items, spec, used_ai | set(a_idx))
+            a_idx += [k for k in got if k not in a_idx]
+            if not got:
+                missing.append(_cell_str(spec.get("name")))
+        for spec in rule.get("actual") or []:
+            got = _find_merge_rows(actual_items, spec, used_ac | set(c_idx))
+            c_idx += [k for k in got if k not in c_idx]
+            if not got:
+                missing.append(_cell_str(spec.get("name")))
+        if not a_idx or not c_idx:
+            continue
+        a_names = {_match_keys(ai_items[k])[0] for k in a_idx}
+        c_names = {_match_keys(actual_items[k])[0] for k in c_idx}
+        # 登録の両側にある名称（例: 安全対策費）は判定から外す。AI側に同名の追加行があっても、
+        # 登録どおりの行でまとめ、余った行は AIにしかない に残す（2026-11-13 反証）
+        shared = a_names & c_names
+        if any(k not in c_idx and _match_keys(it)[0] in (a_names - shared) for k, it in enumerate(actual_items)):
+            continue
+        if any(k not in a_idx and _match_keys(it)[0] in (c_names - shared) for k, it in enumerate(ai_items)):
+            continue
+        ai_rows = [ai_items[k] for k in a_idx]
+        ac_rows = [actual_items[k] for k in c_idx]
+        ai_amt = sum(int(r["amount"]) for r in ai_rows)
+        ac_amt = sum(int(r["amount"]) for r in ac_rows)
+        if len(ai_rows) == 1:
+            unit = _cell_str(ai_rows[0].get("unit"))
+        elif len(ac_rows) == 1:
+            unit = _cell_str(ac_rows[0].get("unit"))
+        else:
+            unit = "式"
+        merged.append({
+            "ai_name": _merge_label(ai_rows),
+            "actual_name": _merge_label(ac_rows),
+            "ai_summary": _cell_str(ai_rows[0].get("summary")) if len(ai_rows) == 1 else "",
+            "actual_summary": _cell_str(ac_rows[0].get("summary")) if len(ac_rows) == 1 else "",
+            "ai_amount": ai_amt,
+            "actual_amount": ac_amt,
+            "diff": ai_amt - ac_amt,
+            # 複数行を合わせた側の数量は単位がそろわないので出さない
+            "ai_quantity": _to_float(ai_rows[0].get("quantity")) if len(ai_rows) == 1 else 0.0,
+            "actual_quantity": _to_float(ac_rows[0].get("quantity")) if len(ac_rows) == 1 else 0.0,
+            "unit": unit,
+            "ai_rows": sum(int(r.get("rows", 1)) for r in ai_rows),
+            "via_alias": False,
+            "via_merge": True,
+            "via_pseudo": False,
+            "group": "",
+            "merge": {
+                "note": _cell_str(rule.get("note")),
+                "scope": _cell_str(rule.get("scope")),
+                "ai_members": [{"name": r["name"], "summary": _cell_str(r.get("summary")),
+                                "amount": int(r["amount"])} for r in ai_rows],
+                "actual_members": [{"name": r["name"], "summary": _cell_str(r.get("summary")),
+                                    "amount": int(r["amount"])} for r in ac_rows],
+                "missing": [m for m in missing if m],
+            },
+        })
+        used_ai |= set(a_idx)
+        used_ac |= set(c_idx)
+    rest_ai = [it for k, it in enumerate(ai_items) if k not in used_ai]
+    rest_ac = [it for k, it in enumerate(actual_items) if k not in used_ac]
+    return merged, rest_ai, rest_ac
+
+
 # --- 公開 API: 差分計算 ---------------------------------------------------
 
-def diff_estimates(estimate, actual: dict, aliases: set | None = None) -> dict:
+def diff_estimates(estimate, actual: dict, aliases: set | None = None,
+                   merges: list | None = None) -> dict:
     """AI概算見積と実績見積パース結果の差分を計算する。
 
     Args:
@@ -801,6 +928,8 @@ def diff_estimates(estimate, actual: dict, aliases: set | None = None) -> dict:
         actual: parse_actual_estimate() の戻り値（実績見積）。
         aliases: 利用者が登録した「同じ商品」の組（frozenset({key_a, key_b}) の集合）。
             名称が似ていなくてもこの組は突合する。
+        merges: 利用者が登録した「まとめて計上」（ui_helpers.merge_rules_from_library の戻り値）。
+            AIの複数行（または実績の複数行）の合計を相手側の1行と突き合わせる。
 
     Returns:
         dict: JSONシリアライズ可能な差分構造。
@@ -852,9 +981,15 @@ def diff_estimates(estimate, actual: dict, aliases: set | None = None) -> dict:
             actual_raw = [{"name": actual_cat["name"], "summary": "", "quantity": 1.0, "unit": "式",
                            "price": int(actual_cat["total"]), "amount": int(actual_cat["total"]),
                            "pseudo": True}]
-        actual_items = _rollup_items(actual_raw)
+        actual_items = _rollup_items([{**it, "order": k} for k, it in enumerate(actual_raw)])
         if ai_items or actual_items:
-            item_diffs[cat_name] = _match_items(ai_items, actual_items, aliases)
+            cat_names = {_normalize_name(c) for c in (
+                ai_cat.name if ai_cat is not None else "",
+                actual_cat["name"] if actual_cat is not None else "") if c}
+            merged, ai_items, actual_items = _apply_merges(cat_names, ai_items, actual_items, merges)
+            result = _match_items(ai_items, actual_items, aliases)
+            result["matched"] = merged + result["matched"]
+            item_diffs[cat_name] = result
 
     category_diffs.sort(key=lambda d: d["no"])
 

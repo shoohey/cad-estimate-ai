@@ -53,7 +53,10 @@ from ui_helpers import (proposal_number,
                         PROJECT_SPECIFIC_LABEL, PROJECT_SPECIFIC_CATEGORY, NOTE_SCOPE_GLOBAL,
                         NOTE_SCOPE_PROJECT, validate_special_selection, special_note_name,
                         EXCLUDED_LABEL, EXCLUDED_CATEGORY, EXCLUSION_REASONS, validate_exclusion_selection,
-                        FB_STATUS_WIP)
+                        FB_STATUS_WIP, MERGE_LABEL, validate_merge_selection, make_merge_entry,
+                        merge_rules_from_library, merge_library_add, merge_library_remove,
+                        merge_library_set_scope, merge_entry_text, merge_selection_totals,
+                        suggest_merge_candidates, merge_note_target)
 
 # ページ設定
 st.set_page_config(
@@ -2145,6 +2148,71 @@ def save_item_alias_library(lib: list):
             _warn_cloud_error(exc)
 
 
+ITEM_MERGE_KEY = "item_merge_library"   # 「まとめて計上」の登録（複数行の合計が相手側の1行。2026-11-13）
+
+# 実績比較でチェックした行の登録の種類（2026-11-13 打合せ: 二択しか選べず、実見積での扱いを登録できなかった）
+def _clean_pid(v) -> str:
+    return str(v or '').strip()
+
+
+REG_KIND_MERGE = "まとめて計上（複数の行が実見積では1行）"
+REG_KIND_ALIAS = "同じ商品（名前の書き方が違うだけ）"
+REG_KIND_SPECIAL = "この案件特有（図面に表れない項目）"
+REG_KIND_EXCLUDE = "不要（AIが計上したが要らない）"
+REG_KINDS = [REG_KIND_MERGE, REG_KIND_ALIAS, REG_KIND_SPECIAL, REG_KIND_EXCLUDE]
+REG_KIND_CAPTIONS = {
+    REG_KIND_MERGE: "AIの複数の行が、実見積では1行にまとめてある（例: 駐車場代・整地費用・基礎廻り養生シートを"
+                    "安全対策費に含めている）。「金額が違う」行と「AIにしかない」行をチェック。逆向きも登録できます",
+    REG_KIND_ALIAS: "「AIにしかない」1行と「実績にしかない」1行が同じもの",
+    REG_KIND_SPECIAL: "この物件だけの項目。他の案件の参考には出しません",
+    REG_KIND_EXCLUDE: "「AIにしかない」「金額が違う」行のうち不要なもの。理由を選びます",
+}
+REG_KIND_PLACEHOLDERS = {
+    REG_KIND_MERGE: "例: お客様に見せないため、安全対策費に含めて計上している",
+    REG_KIND_ALIAS: "例: 同じ製品の型番違い",
+    REG_KIND_SPECIAL: "例: 施主支給のため / 敷地条件で追加",
+    REG_KIND_EXCLUDE: "例: 平屋のため2階分は不要",
+}
+
+
+def load_item_merge_library(fresh: bool = False) -> list:
+    """「まとめて計上」の登録一覧を読み込む（全案件共通／この案件のみ の両方が同居）"""
+    if fresh:
+        st.session_state.pop('_merge_lib', None)
+    if '_merge_lib' in st.session_state:
+        return st.session_state['_merge_lib']
+    result = None
+    if _cloud_ok():
+        try:
+            result = cloud_store.get(ITEM_MERGE_KEY)
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
+    if result is None:
+        path = os.path.join(PROJECTS_DIR, "item_merge_library.json")
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                result = json.load(f)
+        else:
+            result = []
+    if not isinstance(result, list):
+        result = []
+    st.session_state['_merge_lib'] = result
+    return result
+
+
+def save_item_merge_library(lib: list):
+    """「まとめて計上」の登録一覧を保存（ローカル＋クラウド）"""
+    path = os.path.join(PROJECTS_DIR, "item_merge_library.json")
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(lib, f, ensure_ascii=False, indent=2)
+    st.session_state['_merge_lib'] = lib
+    if _cloud_ok():
+        try:
+            cloud_store.put(ITEM_MERGE_KEY, lib)
+        except cloud_store.CloudStoreError as exc:
+            _warn_cloud_error(exc)
+
+
 DESIGN_MASTER_KEY = "design_price_master"   # 設計部の単価マスタ（類似候補の語彙に使う）
 
 
@@ -2263,6 +2331,7 @@ def append_hidden_judgment_log(entries: list):
 def recompute_hidden_stats(projects: dict, prices: dict) -> dict:
     """実績見積を取り込んだ全案件から「実績にはあるがAI概算に無い項目」を集計する"""
     alias_lib = load_item_alias_library()
+    merge_lib = load_item_merge_library()
     samples = []
     for pid, pinfo in projects.items():
         actual = load_project_actual(pid)
@@ -2273,7 +2342,8 @@ def recompute_hidden_stats(projects: dict, prices: dict) -> dict:
             continue
         solar = any('太陽光' in c.get('name', '') and c.get('total', 0) > 0 for c in actual.get('categories', []))
         est = calculate_estimate(cad, prices, include_solar=solar, safety_rate=DEFAULT_SAFETY_RATE_PCT / 100.0)
-        diff = excel_diff.diff_estimates(est, actual, alias_pairs_from_library(alias_lib, pid))
+        diff = excel_diff.diff_estimates(est, actual, alias_pairs_from_library(alias_lib, pid),
+                                         merges=merge_rules_from_library(merge_lib, pid))
         notes = load_project_diff_notes(pid) or {}
         actual_only = []
         for cat_name, d in diff.get('item_diffs', {}).items():
@@ -2908,7 +2978,7 @@ def main():
             st.caption("💾 データ保存: クラウド永続化 有効")
         else:
             st.caption("⚠️ データ保存: 一時保存（再起動で消える場合があります）")
-        st.caption("build 2026-11-12.1")
+        st.caption("build 2026-11-13.1")
 
     # 単価マスタ読み込み
     csv_path = os.path.join(base_dir, "tankamaster_updated.csv")
@@ -4036,7 +4106,7 @@ def main():
             if st.button("最新の内容に更新", key="reload_actual",
                          help="他の担当者が保存した実績見積・差異理由をサーバーから読み直します"):
                 for cache_key in ('_actual_cache', '_diffnote_cache', '_fb_cache', '_alias_lib', '_design_master',
-                                  '_diff_lib', '_actual_file_cache'):
+                                  '_diff_lib', '_actual_file_cache', '_merge_lib'):
                     st.session_state.pop(cache_key, None)
                 for cache_key in [k for k in st.session_state.keys() if str(k).startswith('_store_')]:
                     st.session_state.pop(cache_key, None)
@@ -4072,8 +4142,10 @@ def main():
                         for warn in actual_warnings:
                             st.markdown(f"- {warn}")
                 alias_lib = load_item_alias_library()
+                merge_lib = load_item_merge_library()
                 diff = excel_diff.diff_estimates(
-                    estimate, actual, alias_pairs_from_library(alias_lib, current_pid))
+                    estimate, actual, alias_pairs_from_library(alias_lib, current_pid),
+                    merges=merge_rules_from_library(merge_lib, current_pid))
                 alias_prop_name = st.session_state['projects'].get(current_pid, {}).get('name', '')
                 ai_total = diff['total_ai']
                 act_total = diff['total_actual']
@@ -4176,51 +4248,200 @@ def main():
                                 .format({'AI金額': '{:,}', '実績金額': '{:,}', '差額(AI−実績)': '{:+,}'}),
                                 use_container_width=True, hide_index=True,
                                 height=min(60 + 35 * len(detail_rows), 520))
+                            # 「まとめて計上」で突き合わせた行は、何をまとめたかを表の下に出す
+                            for m_mg in (item_diffs.get(cd['name']) or {}).get('matched', []):
+                                if not m_mg.get('via_merge'):
+                                    continue
+                                mg = m_mg.get('merge') or {}
+                                ai_txt = '＋'.join(f"{x['name']} {int(x['amount']):,}円" for x in mg.get('ai_members', []))
+                                ac_txt = '＋'.join(f"{x['name']} {int(x['amount']):,}円" for x in mg.get('actual_members', []))
+                                line = (f"{MERGE_LABEL}: AI「{ai_txt}」＝{int(m_mg['ai_amount']):,}円 → "
+                                        f"実績「{ac_txt}」＝{int(m_mg['actual_amount']):,}円")
+                                if mg.get('missing'):
+                                    line += f"（この物件に無い行: {'・'.join(mg['missing'])}）"
+                                if mg.get('note'):
+                                    line += f"　補足: {mg['note']}"
+                                st.caption(line)
+                            # 登録できる行: 金額が違う／AIにしかない／実績にしかない（「まとめ」済みの行は下の一覧で解除）
                             reg_rows = [r for r in detail_rows
-                                        if r['区分'] in (DETAIL_KIND_AI_ONLY, DETAIL_KIND_ACTUAL_ONLY)]
+                                        if r['区分'] in (DETAIL_KIND_DIFF, DETAIL_KIND_AI_ONLY, DETAIL_KIND_ACTUAL_ONLY)
+                                        and not str(r.get('扱い') or '').startswith(MERGE_LABEL)]
                             if reg_rows:
+                                reg_gen = st.session_state.get(f'_reg_gen_{ci}', 0)   # 登録した工事種別だけ表と補足を作り直す
                                 st.markdown(
-                                    "**同じ商品の登録**: 下の表で「AIにしかない」1件と「実績にしかない」1件に"
-                                    "チェックして登録すると、次回から自動で突き合わせます。")
+                                    "**チェックした行の登録**: 下の表で行にチェックを付け、実見積での扱い方を選んで"
+                                    "登録すると、次回から自動で突き合わせます。")
                                 reg_cols = ('区分', '扱い', 'AI品名', 'AI摘要', 'AI金額', '実績品名', '実績摘要', '実績金額',
                                             '差額(AI−実績)')
                                 reg_df = pd.DataFrame([{'選択': False, **{k: r[k] for k in reg_cols}}
                                                        for r in reg_rows])
                                 edited_reg = st.data_editor(
                                     reg_df, hide_index=True, use_container_width=True,
-                                    key=f"alias_editor_{current_pid}_{ci}_{len(alias_lib)}",
+                                    key=f"alias_editor_{current_pid}_{ci}_{reg_gen}",
                                     disabled=list(reg_cols),
                                     column_config={'選択': st.column_config.CheckboxColumn('選択', width='small')})
-                                rc1, rc2, rc3 = st.columns([2, 1, 1])
-                                scope_label = rc1.radio(
-                                    "この読み替えは", ["全案件共通（普遍的な表記ゆれ）", "この案件のみ（この案件特有）"],
-                                    horizontal=True, key=f"alias_scope_{current_pid}_{ci}",
-                                    help="日本住建で常に同じ意味なら「全案件共通」、この物件だけの読み替えなら「この案件のみ」。後から一覧で変更できます")
-                                if rc2.button("チェックした2件を同じ商品として登録",
-                                              key=f"alias_reg_{current_pid}_{ci}", type="primary"):
-                                    selected = [r for r in edited_reg.to_dict('records') if r.get('選択')]
-                                    err, ai_row, ac_row = validate_alias_selection(selected)
-                                    if err:
-                                        st.error(err)
+                                selected = [r for r in edited_reg.to_dict('records') if r.get('選択')]
+                                reg_kind = st.radio(
+                                    "実見積での扱い（登録の種類）", REG_KINDS, key=f"reg_kind_{current_pid}_{ci}",
+                                    captions=[REG_KIND_CAPTIONS[k] for k in REG_KINDS])
+                                rk1, rk2 = st.columns([1, 2])
+                                scope_label = rk1.radio(
+                                    "適用範囲", ["全案件共通", "この案件のみ"], horizontal=True,
+                                    key=f"alias_scope_{current_pid}_{ci}",
+                                    disabled=(reg_kind == REG_KIND_SPECIAL),
+                                    help="日本住建で常に同じ扱いなら「全案件共通」、この物件だけなら「この案件のみ」。"
+                                         "後から一覧で変更できます（「この案件特有」は常にこの案件のみ）")
+                                reg_note = rk2.text_input(
+                                    "補足・どう処理しているか（任意）", key=f"reg_note_{current_pid}_{ci}_{reg_gen}",
+                                    placeholder=REG_KIND_PLACEHOLDERS[reg_kind])
+                                ex_reason = ''
+                                if reg_kind == REG_KIND_EXCLUDE:
+                                    ex_reason = st.selectbox("不要の理由", EXCLUSION_REASONS,
+                                                             key=f"excl_reason_{current_pid}_{ci}")
+                                if reg_kind == REG_KIND_MERGE and selected:
+                                    ai_t, ac_t = merge_selection_totals(selected)
+                                    msg = f"AI側 {ai_t:,}円 ／ 実績側 {ac_t:,}円（差 {ai_t - ac_t:+,}円）"
+                                    if ai_t == ac_t:
+                                        st.success("チェックした行をまとめると合計が一致します: " + msg)
                                     else:
-                                        scope = (ALIAS_SCOPE_PROJECT if scope_label.startswith("この案件")
-                                                 else ALIAS_SCOPE_GLOBAL)
-                                        entry = make_alias_entry(
-                                            ai_row, ac_row, cd['name'], alias_prop_name,
-                                            now_jst().strftime('%Y-%m-%d %H:%M'), scope=scope,
-                                            project_id=current_pid)
-                                        latest_lib, added = alias_library_add(load_item_alias_library(fresh=True), entry)
-                                        if not added:
-                                            _flash("この組み合わせは登録済みです。", "info")
+                                        st.caption("チェックした行をまとめたときの合計: " + msg)
+
+                                def _register_merge(ai_m, ac_m, _cat=cd['name'], _note=reg_note, _scope=scope_label):
+                                    scope = ALIAS_SCOPE_PROJECT if _scope.startswith("この案件") else ALIAS_SCOPE_GLOBAL
+                                    entry = make_merge_entry(ai_m, ac_m, _cat, alias_prop_name,
+                                                             now_jst().strftime('%Y-%m-%d %H:%M'), scope=scope,
+                                                             project_id=current_pid, note=_note)
+                                    latest_m, added_m = merge_library_add(load_item_merge_library(fresh=True), entry)
+                                    if not added_m:
+                                        _flash("この組み合わせは「まとめて計上」として登録済みです。", "info")
+                                    else:
+                                        save_item_merge_library(latest_m)
+                                        append_project_changelog(
+                                            current_pid, '実績取込',
+                                            f"まとめて計上として登録: {merge_entry_text(entry)}（{ALIAS_SCOPE_LABEL[scope]}）"
+                                            + (f" 補足: {entry['note']}" if entry['note'] else ''))
+                                        _flash(f"「まとめて計上」として登録しました（{ALIAS_SCOPE_LABEL[scope]}）: "
+                                               f"{merge_entry_text(entry)}")
+                                    st.session_state[f'_reg_gen_{ci}'] = reg_gen + 1
+                                    st.rerun()
+
+                                if st.button("チェックした行を登録", key=f"reg_btn_{current_pid}_{ci}", type="primary"):
+                                    if reg_kind == REG_KIND_MERGE:
+                                        err, ai_m, ac_m = validate_merge_selection(selected)
+                                        if err:
+                                            st.error(err)
                                         else:
-                                            save_item_alias_library(latest_lib)
+                                            _register_merge(ai_m, ac_m)
+                                    elif reg_kind == REG_KIND_ALIAS:
+                                        err, ai_row, ac_row = validate_alias_selection(selected)
+                                        if err:
+                                            st.error(err)
+                                        else:
+                                            scope = (ALIAS_SCOPE_PROJECT if scope_label.startswith("この案件")
+                                                     else ALIAS_SCOPE_GLOBAL)
+                                            entry = make_alias_entry(
+                                                ai_row, ac_row, cd['name'], alias_prop_name,
+                                                now_jst().strftime('%Y-%m-%d %H:%M'), scope=scope,
+                                                project_id=current_pid)
+                                            entry['note'] = reg_note.strip()
+                                            latest_lib, added = alias_library_add(load_item_alias_library(fresh=True), entry)
+                                            if not added:
+                                                _flash("この組み合わせは登録済みです。", "info")
+                                            else:
+                                                save_item_alias_library(latest_lib)
+                                                append_project_changelog(
+                                                    current_pid, '実績取込',
+                                                    f"同じ商品として登録: {entry['ai_name']} ⇔ {entry['actual_name']}"
+                                                    f"（{ALIAS_SCOPE_LABEL[scope]}）"
+                                                    + (f" 補足: {entry['note']}" if entry['note'] else ''))
+                                                _flash(f"「{entry['ai_name']}」と「{entry['actual_name']}」を同じ商品として"
+                                                       f"登録しました（{ALIAS_SCOPE_LABEL[scope]}）。")
+                                            st.session_state[f'_reg_gen_{ci}'] = reg_gen + 1
+                                            st.rerun()
+                                    elif reg_kind == REG_KIND_SPECIAL:
+                                        err, rows_sel = validate_special_selection(selected)
+                                        if err:
+                                            st.error(err)
+                                        else:
+                                            new_notes = dict(proj_notes)
+                                            lib_entries = []
+                                            for r in rows_sel:
+                                                # 旧形式（品名だけ）の理由は同じ品名の各行へ移してから登録する（書いた理由を引き継ぐ・
+                                                # 見えない旧キーが残って取り下げが止まるのを防ぐ。2026-11-12 反証）
+                                                new_notes = split_legacy_for_rows(new_notes, cd['name'], r, detail_rows)
+                                                nm, sm = detail_row_note_target(r)   # 差異理由の表と同じキー（AI側があればAI側）
+                                                key = special_note_key(cd['name'], nm, sm)
+                                                prev = new_notes.get(key, {})
+                                                new_notes[key] = {
+                                                    'category': PROJECT_SPECIFIC_CATEGORY,
+                                                    'reason': (reg_note.strip() or prev.get('reason')
+                                                               or '図面に表れない物件固有の項目'),
+                                                    'scope': 'project',
+                                                    'diff': int(r.get('差額(AI−実績)') or 0),
+                                                    'updated_at': now_jst().strftime('%Y-%m-%d %H:%M'),
+                                                }
+                                                lib_entries.append({
+                                                    'key': note_library_key(key), 'item': nm,
+                                                    'category': PROJECT_SPECIFIC_CATEGORY,
+                                                    'reason': new_notes[key]['reason'],
+                                                    'property': alias_prop_name,
+                                                    'diff': new_notes[key]['diff'], 'scope': 'project',
+                                                })
+                                            save_project_diff_notes(current_pid, new_notes)
+                                            update_diff_reason_library(lib_entries)
                                             append_project_changelog(
                                                 current_pid, '実績取込',
-                                                f"同じ商品として登録: {entry['ai_name']} ⇔ {entry['actual_name']}"
-                                                f"（{ALIAS_SCOPE_LABEL[scope]}）")
-                                            _flash(f"「{entry['ai_name']}」と「{entry['actual_name']}」を同じ商品として"
-                                                   f"登録しました（{ALIAS_SCOPE_LABEL[scope]}）。")
-                                        st.rerun()
+                                                f"案件特有として登録: " + " / ".join(e['item'] for e in lib_entries))
+                                            _flash(f"{len(rows_sel)}件を「この案件特有（全案件には該当しない）」として登録しました。")
+                                            st.session_state[f'_reg_gen_{ci}'] = reg_gen + 1
+                                            st.rerun()
+                                    else:   # 不要（除外）: 理由（構造・条例など）付きで登録し、学習の材料にする
+                                        err, rows_sel = validate_exclusion_selection(selected, ex_reason)
+                                        if err:
+                                            st.error(err)
+                                        else:
+                                            scope = ('project' if scope_label.startswith("この案件") else 'global')
+                                            reason_text = ex_reason + (f"：{reg_note.strip()}" if reg_note.strip() else "")
+                                            new_notes = dict(proj_notes)
+                                            lib_entries = []
+                                            for r in rows_sel:
+                                                new_notes = split_legacy_for_rows(new_notes, cd['name'], r, detail_rows)
+                                                nm, sm = detail_row_note_target(r)
+                                                key = special_note_key(cd['name'], nm, sm)
+                                                new_notes[key] = {
+                                                    'category': EXCLUDED_CATEGORY, 'reason': reason_text, 'scope': scope,
+                                                    'diff': int(r.get('差額(AI−実績)') or 0),
+                                                    'updated_at': now_jst().strftime('%Y-%m-%d %H:%M'),
+                                                }
+                                                lib_entries.append({'key': note_library_key(key), 'item': nm,
+                                                                    'category': EXCLUDED_CATEGORY,
+                                                                    'reason': reason_text, 'property': alias_prop_name,
+                                                                    'diff': new_notes[key]['diff'], 'scope': scope})
+                                            save_project_diff_notes(current_pid, new_notes)
+                                            update_diff_reason_library(lib_entries)
+                                            append_project_changelog(
+                                                current_pid, '実績取込',
+                                                f"不要（除外）として登録: " + " / ".join(e['item'] for e in lib_entries)
+                                                + f"（{reason_text}・{'この案件のみ' if scope == 'project' else '全案件共通'}）")
+                                            _flash(f"{len(rows_sel)}件を「不要（除外）」として登録しました（{reason_text}）。")
+                                            st.session_state[f'_reg_gen_{ci}'] = reg_gen + 1
+                                            st.rerun()
+                                # 合計が一致する組み合わせ（まとめの候補）: チェックしなくてもワンクリックで登録できる
+                                if reg_kind == REG_KIND_MERGE:
+                                    # 案件特有・除外として登録済みの行は候補に入れない
+                                    labeled = {(r['AI品名'], r['AI摘要']) for r in detail_rows if r.get('扱い')} | \
+                                              {(r['実績品名'], r['実績摘要']) for r in detail_rows if r.get('扱い')}
+                                    for si, sg in enumerate(suggest_merge_candidates(item_diffs.get(cd['name']), labeled)):
+                                        if si == 0:
+                                            st.markdown("**合計が一致する組み合わせ（まとめの候補）**")
+                                        sc1, sc2 = st.columns([5, 1.4])
+                                        sc1.caption(
+                                            "AI「" + "＋".join(f"{m['name']} {m['amount']:,}" for m in sg['ai'])
+                                            + f"」＝{sg['ai_total']:,}円 → 実績「"
+                                            + "＋".join(f"{m['name']} {m['amount']:,}" for m in sg['actual'])
+                                            + f"」＝{sg['actual_total']:,}円")
+                                        if sc2.button("この組をまとめて登録", key=f"merge_sugg_{current_pid}_{ci}_{si}"):
+                                            _register_merge(sg['ai'], sg['actual'])
                                 # 単価マスタから類似候補を拾う。重いので要求時のみ計算（2026-11-12 監査で作り直し）
                                 #  - 設計部マスタ（無ければアプリの単価マスタ）の項目は「見積に追加」する
                                 #  - 「同じ商品」の登録先は、AI見積が実際に出す名称（AIにしかない行・アプリの単価マスタ）から選ぶ
@@ -4346,84 +4567,6 @@ def main():
                                                         _flash(f"「{entry['ai_name']}」と「{entry['actual_name']}」を同じ商品として"
                                                                f"登録しました（{ALIAS_SCOPE_LABEL[scope]}）。")
                                                     st.rerun()
-                                if rc3.button("チェックした行を「この案件特有」として登録",
-                                              key=f"special_reg_{current_pid}_{ci}",
-                                              help="図面に表れない物件固有の項目など、全案件には該当しないもの。"
-                                                   "差異理由に「案件特有」として記録し、他案件の参考には出しません"):
-                                    selected = [r for r in edited_reg.to_dict('records') if r.get('選択')]
-                                    err, rows_sel = validate_special_selection(selected)
-                                    if err:
-                                        st.error(err)
-                                    else:
-                                        new_notes = dict(proj_notes)
-                                        lib_entries = []
-                                        for r in rows_sel:
-                                            # 旧形式（品名だけ）の理由は同じ品名の各行へ移してから登録する（書いた理由を引き継ぐ・
-                                            # 見えない旧キーが残って取り下げが止まるのを防ぐ。2026-11-12 反証）
-                                            new_notes = split_legacy_for_rows(new_notes, cd['name'], r, detail_rows)
-                                            nm, sm = detail_row_note_target(r)   # 差異理由の表と同じキー（AI側があればAI側）
-                                            key = special_note_key(cd['name'], nm, sm)
-                                            prev = new_notes.get(key, {})
-                                            new_notes[key] = {
-                                                'category': PROJECT_SPECIFIC_CATEGORY,
-                                                'reason': prev.get('reason') or '図面に表れない物件固有の項目',
-                                                'scope': 'project',
-                                                'diff': int(r.get('差額(AI−実績)') or 0),
-                                                'updated_at': now_jst().strftime('%Y-%m-%d %H:%M'),
-                                            }
-                                            lib_entries.append({
-                                                'key': note_library_key(key), 'item': nm,
-                                                'category': PROJECT_SPECIFIC_CATEGORY,
-                                                'reason': new_notes[key]['reason'],
-                                                'property': alias_prop_name,
-                                                'diff': new_notes[key]['diff'], 'scope': 'project',
-                                            })
-                                        save_project_diff_notes(current_pid, new_notes)
-                                        update_diff_reason_library(lib_entries)
-                                        append_project_changelog(
-                                            current_pid, '実績取込',
-                                            f"案件特有として登録: " + " / ".join(e['item'] for e in lib_entries))
-                                        _flash(f"{len(rows_sel)}件を「この案件特有（全案件には該当しない）」として登録しました。")
-                                        st.rerun()
-                                # AIが計上したが不要な項目: 理由（構造・条例など）付きで登録し、学習の材料にする
-                                ex1, ex2, ex3 = st.columns([1.2, 1.8, 1])
-                                ex_reason = ex1.selectbox("不要の理由", EXCLUSION_REASONS,
-                                                          key=f"excl_reason_{current_pid}_{ci}")
-                                ex_note = ex2.text_input("補足（任意。例: 平屋のため2階分は不要／○○市は△△が条例で必須）",
-                                                         key=f"excl_note_{current_pid}_{ci}")
-                                if ex3.button("チェックした行を「不要（除外）」として登録",
-                                              key=f"excl_reg_{current_pid}_{ci}",
-                                              help="AIにしかない／金額が違う行が対象。適用範囲は上の「この読み替えは」の選択に従います"):
-                                    selected = [r for r in edited_reg.to_dict('records') if r.get('選択')]
-                                    err, rows_sel = validate_exclusion_selection(selected, ex_reason)
-                                    if err:
-                                        st.error(err)
-                                    else:
-                                        scope = ('project' if scope_label.startswith("この案件") else 'global')
-                                        reason_text = ex_reason + (f"：{ex_note.strip()}" if ex_note.strip() else "")
-                                        new_notes = dict(proj_notes)
-                                        lib_entries = []
-                                        for r in rows_sel:
-                                            new_notes = split_legacy_for_rows(new_notes, cd['name'], r, detail_rows)
-                                            nm, sm = detail_row_note_target(r)
-                                            key = special_note_key(cd['name'], nm, sm)
-                                            new_notes[key] = {
-                                                'category': EXCLUDED_CATEGORY, 'reason': reason_text, 'scope': scope,
-                                                'diff': int(r.get('差額(AI−実績)') or 0),
-                                                'updated_at': now_jst().strftime('%Y-%m-%d %H:%M'),
-                                            }
-                                            lib_entries.append({'key': note_library_key(key), 'item': nm, 'category': EXCLUDED_CATEGORY,
-                                                                'reason': reason_text, 'property': alias_prop_name,
-                                                                'diff': new_notes[key]['diff'], 'scope': scope})
-                                        save_project_diff_notes(current_pid, new_notes)
-                                        update_diff_reason_library(lib_entries)
-                                        append_project_changelog(
-                                            current_pid, '実績取込',
-                                            f"不要（除外）として登録: " + " / ".join(e['item'] for e in lib_entries)
-                                            + f"（{reason_text}・{'この案件のみ' if scope == 'project' else '全案件共通'}）")
-                                        _flash(f"{len(rows_sel)}件を「不要（除外）」として登録しました（{reason_text}）。")
-                                        st.rerun()
-
                 # ===== 登録済みの「同じ商品」一覧（適用範囲の変更・解除） =====
                 visible_aliases = [(i, e) for i, e in enumerate(alias_lib) if alias_applies(e, current_pid)]
                 other_project_aliases = len(alias_lib) - len(visible_aliases)
@@ -4440,8 +4583,13 @@ def main():
                             f"AI「{_html.escape(ai_txt)}」 ⇔ 実績「{_html.escape(ac_txt)}」　"
                             f"<span style='font-size:0.8rem;color:#4a5568;'>{_html.escape(e.get('category', ''))}・"
                             f"<b>{ALIAS_SCOPE_LABEL.get(e.get('scope'), '全案件共通')}</b>・{e.get('at', '')}・"
-                            f"登録元: {_html.escape(e.get('property', ''))}</span>", unsafe_allow_html=True)
-                        if ac2.button("全案件共通に変更" if is_project else "この案件のみに変更",
+                            f"登録元: {_html.escape(e.get('property', ''))}</span>"
+                            + (f"<br><span style='font-size:0.85rem;color:#4a5568;'>補足: {_html.escape(e['note'])}</span>"
+                               if e.get('note') else ''), unsafe_allow_html=True)
+                        # 「この案件のみ」は登録元の案件に限る、の意味。別の案件から見たときは文言で示す（2026-11-13 反証）
+                        own = (_clean_pid(e.get('project_id')) or current_pid) == current_pid
+                        if ac2.button("全案件共通に変更" if is_project
+                                      else ("この案件のみに変更" if own else "登録元の案件のみに変更"),
                                       key=f"alias_scope_toggle_{i}"):
                             save_item_alias_library(alias_library_set_scope(
                                 load_item_alias_library(fresh=True), e,
@@ -4452,6 +4600,38 @@ def main():
                             # 並び順ではなく中身で特定して消す（その間に他の登録が増えても別の組を消さない）
                             save_item_alias_library(alias_library_remove(load_item_alias_library(fresh=True), e))
                             _flash("同じ商品の登録を解除しました。")
+                            st.rerun()
+
+                # ===== 登録済みの「まとめて計上」一覧（適用範囲の変更・解除） =====
+                visible_merges = [(i, e) for i, e in enumerate(merge_lib) if alias_applies(e, current_pid)]
+                other_project_merges = len(merge_lib) - len(visible_merges)
+                with st.expander(f"登録済みの「まとめて計上」（この案件に適用 {len(visible_merges)}件"
+                                 f"{'・他案件特有 ' + str(other_project_merges) + '件は非表示' if other_project_merges else ''}）"):
+                    if not visible_merges:
+                        st.caption("まだ登録がありません。各工事種別を開き、行にチェックして「まとめて計上」で登録できます。")
+                    for i, e in visible_merges:
+                        is_project = e.get('scope') == ALIAS_SCOPE_PROJECT
+                        mc1, mc2, mc3 = st.columns([5, 1.6, 0.8])
+                        mc1.markdown(
+                            f"{_html.escape(merge_entry_text(e))}　"
+                            f"<span style='font-size:0.8rem;color:#4a5568;'>"
+                            f"<b>{ALIAS_SCOPE_LABEL.get(e.get('scope'), '全案件共通')}</b>・{_html.escape(e.get('at', ''))}・"
+                            f"登録元: {_html.escape(e.get('property', ''))}</span>"
+                            + (f"<br><span style='font-size:0.85rem;color:#4a5568;'>補足: {_html.escape(e['note'])}</span>"
+                               if e.get('note') else ''), unsafe_allow_html=True)
+                        own = (_clean_pid(e.get('project_id')) or current_pid) == current_pid
+                        if mc2.button("全案件共通に変更" if is_project
+                                      else ("この案件のみに変更" if own else "登録元の案件のみに変更"),
+                                      key=f"merge_scope_toggle_{i}"):
+                            save_item_merge_library(merge_library_set_scope(
+                                load_item_merge_library(fresh=True), e,
+                                ALIAS_SCOPE_GLOBAL if is_project else ALIAS_SCOPE_PROJECT, current_pid))
+                            _flash("適用範囲を変更しました。")
+                            st.rerun()
+                        if mc3.button("解除", key=f"merge_del_{i}"):
+                            save_item_merge_library(merge_library_remove(load_item_merge_library(fresh=True), e))
+                            append_project_changelog(current_pid, '実績取込', f"まとめて計上を解除: {merge_entry_text(e)}")
+                            _flash("「まとめて計上」の登録を解除しました。")
                             st.rerun()
 
                 # ===== 差異の理由を記入して学習させる =====
@@ -4471,10 +4651,14 @@ def main():
                     for m in d.get('matched', []):
                         if m['diff'] == 0:
                             continue
+                        # 「まとめ」で突き合わせた行は、理由を1行側（実績の安全対策費など）に紐づける
+                        nt_name, nt_sum = merge_note_target(m) if m.get('via_merge') else (m['ai_name'], None)
                         note_rows.append({
-                            '_摘要候補': [m.get('ai_summary', ''), m.get('actual_summary', '')],
-                            '工事種別': cat_name, '区分': '金額差', '品名': m['ai_name'],
-                            '摘要': m.get('actual_summary') or m.get('ai_summary', ''),
+                            '_摘要候補': ([nt_sum] if nt_sum is not None
+                                      else [m.get('ai_summary', ''), m.get('actual_summary', '')]),
+                            '工事種別': cat_name, '区分': 'まとめ' if m.get('via_merge') else '金額差', '品名': nt_name,
+                            '摘要': (nt_sum if nt_sum is not None
+                                   else (m.get('actual_summary') or m.get('ai_summary', ''))),
                             'AI数量': m.get('ai_quantity', 0), '実績数量': m.get('actual_quantity', 0),
                             '単位': m.get('unit', ''),
                             'AI金額': m['ai_amount'], '実績金額': m['actual_amount'],
